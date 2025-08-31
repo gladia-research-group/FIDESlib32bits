@@ -6,7 +6,7 @@
 /**
  * Presupuesto de niveles para el bootstrapping.
  */
-const std::vector<uint32_t> level_budget = {1, 1};
+const std::vector<uint32_t> level_budget = {3, 3};
 /** 
  * Dimensión del anillo utilizdo 
  */
