@@ -92,6 +92,12 @@ Context::Context(Parameters param, const std::vector<int>& devs, const int secBi
       limbGPUid(generateLimbGPUid(meta, L)),
       GPUrank(GPUid.size(), -1) {
 
+    if (L+1+K > MAXP) {
+        std::cerr << "Error: too many limbs are needed (" << L + 1 + K <<  "), a maximum of " << MAXP << " is set at FIDESlib's compilation time, aborting."
+         << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
     SetupConstants<Parameters>(prime, meta, specialPrime, specialMeta, decompMeta, digitMeta, digitGPUid, GPUid, N,
                                param);
     // PrepareNCCLCommunication();
@@ -117,6 +123,11 @@ int Context::computeLogQ(const int L, std::vector<PrimeRecord>& primes) {
 }
 
 int Context::validateDnum(const std::vector<int>& GPUid, const int dnum) {
+    if (dnum > MAXD) {
+        std::cerr << "Error: dnum/num_large_digits is set too high (" << dnum << "), a maximum of " << MAXD << " is set at FIDESlib's compilation time, aborting."
+         << std::endl;
+        exit(EXIT_FAILURE);
+    }
     return dnum;
 }
 
