@@ -5,13 +5,15 @@
 #include <benchmark/benchmark.h>
 
 #include "Benchmark.cuh"
+#include "CKKS/Context.cuh"
+
 namespace FIDESlib::Benchmarks {
 BENCHMARK_DEFINE_F(FIDESlibFixture, ContextCreation)(benchmark::State& state) {
     for (auto _ : state) {
-        FIDESlib::CKKS::Context c(fideslibParams, {0});
+        FIDESlib::CKKS::Context c = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, {0});
     }
 }
 
-BENCHMARK_REGISTER_F(FIDESlibFixture, ContextCreation)->ArgsProduct({{2, 3, 4, 5}});
+BENCHMARK_REGISTER_F(FIDESlibFixture, ContextCreation)->ArgsProduct({PARAMETERS});
 
 }  // namespace FIDESlib::Benchmarks

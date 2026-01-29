@@ -8,7 +8,6 @@
 #include "CKKS/Limb.cuh"
 #include "ModMult.cuh"
 #include "NTT.cuh"
-#include "NTTdynamicParallelism.cuh"
 #include "Rotation.cuh"
 
 namespace FIDESlib::CKKS {
@@ -22,29 +21,22 @@ Limb<T>::~Limb() noexcept {
     aux.free(stream);
 }
 
-static Stream StartStream(int primeid, int LK) {
-    Stream s;
-    s.init(primeid, LK);
-    assert("Add parameter for creation only when its a main limb" == nullptr);
-    return s;
-}
-
 template <typename T>
-Limb<T>::Limb(Context& context, const int device, Stream& stream, const int primeid)
+Limb<T>::Limb(ContextData& context, const int id, Stream& stream, const int primeid, bool constant)
     : cc(context),
       primeid(primeid),
       stream(stream /*StartStream(primeid, cc.L + cc.K + 1)*/),
-      v(stream, context.N, device),
-      aux(stream, context.N, device),
-      id(-1),
+      v(stream, context.N, cc.GPUid[id]),
+      aux(stream, constant ? 0 : context.N, cc.GPUid[id]),
+      id(id),
       raw(!cc.isValidPrimeId(primeid)) {
     // TODO: CryptoContext limb tracking.
     //id = cc.generateId(this);
     if (raw) {
         assert(primeid == -1);
     }
-    assert(stream.ptr != nullptr);
-    assert(stream.ev != nullptr);
+    // assert(stream.ptr() != nullptr);
+    // assert(stream.ev != nullptr);
     int dev;
     cudaGetDevice(&dev);
     assert(this->v.size == cc.N);
@@ -52,26 +44,26 @@ Limb<T>::Limb(Context& context, const int device, Stream& stream, const int prim
 }
 
 /**
-     * Caution! Auxiliar vector is not managed and operations line INTT and NTT shouldn't be used on this.
+     * Caution! Auxiliar vector is not managed and operations like INTT and NTT shouldn't be used on this.
      * TODO add assertions for correct use.
      */
 template <typename T>
-Limb<T>::Limb(Context& context, T* data, const int offset, const int device, Stream& stream, const int primeid,
+Limb<T>::Limb(ContextData& context, T* data, const int offset, const int id, Stream& stream, const int primeid,
               T* data_aux, const int offset_aux)
     : cc(context),
       primeid(primeid),
       stream(stream /*StartStream(primeid, cc.L + cc.K + 1)*/),
-      v(data, context.N, device, offset),
-      aux(data_aux ? data_aux : data, context.N, device, data_aux ? offset_aux : offset),
-      id(-1),
+      v(data, context.N, cc.GPUid[id], offset),
+      aux(data_aux ? data_aux : data, context.N, cc.GPUid[id], data_aux ? offset_aux : offset),
+      id(id),
       raw(!cc.isValidPrimeId(primeid)) {
     // TODO: CryptoContext limb tracking.
     //id = cc.generateId(this);
     if (raw) {
         assert(primeid == -1);
     }
-    assert(stream.ptr != nullptr);
-    assert(stream.ev != nullptr);
+    // assert(stream.ptr() != nullptr);
+    // assert(stream.ev != nullptr);
 
     int dev;
     cudaGetDevice(&dev);
@@ -80,14 +72,19 @@ Limb<T>::Limb(Context& context, T* data, const int offset, const int device, Str
 }
 
 template <typename T>
+Global::Globals* Limb<T>::getGlobals() {
+    return cc.precom.globals->globals[id];
+}
+
+template <typename T>
 void Limb<T>::store(std::vector<T>& dat) const {
     dat.resize(v.size);
 
     //cudaHostRegister((void*)dat.data(), dat.size() * sizeof(T), cudaHostRegisterDefault);
-    cudaDeviceSynchronize();
-    //cudaMemcpyAsync((void *) dat.data(), v.data, dat.size() * sizeof(T), cudaMemcpyDeviceToHost, stream.ptr);
+    //cudaMemcpyAsync((void *) dat.data(), v.data, dat.size() * sizeof(T), cudaMemcpyDeviceToHost, stream.ptr());
 
-    cudaMemcpyAsync((void*)dat.data(), v.data, dat.size() * sizeof(T), cudaMemcpyDeviceToHost, 0);
+    cudaMemcpyAsync((void*)dat.data(), v.data, dat.size() * sizeof(T), cudaMemcpyDeviceToHost, stream.ptr());
+    cudaStreamSynchronize(stream.ptr());
     //cudaDeviceSynchronize();
     //cudaHostUnregister((void*)dat.data());
 }
@@ -96,7 +93,9 @@ template <typename T>
 template <typename Q>
 void Limb<T>::load(const std::vector<Q>& dat_) {
     assert(dat_.size() <= v.size);
-
+    int device = -1;
+    cudaGetDevice(&device);
+    // std::cout << v.device << " " << device << ",";
     std::vector<T> dat;
     if constexpr (!std::is_same<T, Q>().value) {
         dat.assign(v.size, 0);
@@ -109,7 +108,7 @@ void Limb<T>::load(const std::vector<Q>& dat_) {
 
     //cudaHostRegister((void *) dat.data(), dat.size() * sizeof(T), cudaHostRegisterDefault);
     //cudaDeviceSynchronize();
-    cudaMemcpyAsync(v.data, dat.data(), dat.size() * sizeof(T), cudaMemcpyHostToDevice, stream.ptr);
+    cudaMemcpyAsync(v.data, dat.data(), dat.size() * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
     //cudaDeviceSynchronize();
     //cudaHostUnregister((void *) dat.data());
 }
@@ -124,7 +123,7 @@ template void Limb<uint64_t>::load<uint64_t>(const std::vector<uint64_t>& dat_);
 
 template <typename T>
 void Limb<T>::load(const VectorGPU<T>& dat) {
-    cudaMemcpyAsync(v.data, dat.data, v.size, cudaMemcpyDeviceToDevice, stream.ptr);
+    cudaMemcpyAsync(v.data, dat.data, v.size, cudaMemcpyDeviceToDevice, stream.ptr());
 }
 
 template <typename T>
@@ -178,7 +177,7 @@ void Limb<uint64_t>::add(const Limb<uint64_t>& l) {
     //stream.wait(l.stream);
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
-    add_<uint64_t><<<gridDim, blockDim, 0, stream.ptr>>>(v.data, l.v.data, primeid);
+    add_<uint64_t><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, l.v.data, primeid);
 }
 
 template <>
@@ -196,7 +195,7 @@ void Limb<uint32_t>::add(const Limb<uint32_t>& l) {
     //stream.wait(l.stream);
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
-    add_<uint32_t><<<gridDim, blockDim, 0, stream.ptr>>>(v.data, l.v.data, primeid);
+    add_<uint32_t><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, l.v.data, primeid);
 }
 
 template <typename T>
@@ -216,7 +215,7 @@ void Limb<uint32_t>::sub(const Limb<uint32_t>& l) {
     stream.wait(l.stream);
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
-    sub_<uint32_t><<<gridDim, blockDim, 0, stream.ptr>>>(v.data, l.v.data, primeid);
+    sub_<uint32_t><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, l.v.data, primeid);
 }
 
 template <>
@@ -234,7 +233,7 @@ void Limb<uint64_t>::sub(const Limb<uint64_t>& l) {
     stream.wait(l.stream);
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
-    sub_<uint64_t><<<gridDim, blockDim, 0, stream.ptr>>>(v.data, l.v.data, primeid);
+    sub_<uint64_t><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, l.v.data, primeid);
 }
 
 template <typename T>
@@ -257,7 +256,7 @@ void Limb<uint64_t>::mult(const Limb<uint32_t>& l) {
 template <>
 void Limb<uint32_t>::mult(const Limb<uint32_t>& l) {
     assert(v.size == l.v.size);
-    mult_<uint32_t, ALGO_BARRETT><<<v.size / block, block, 0, stream.ptr>>>(v.data, l.v.data, primeid);
+    mult_<uint32_t, ALGO_BARRETT><<<v.size / block, block, 0, stream.ptr()>>>(v.data, l.v.data, primeid);
 }
 
 template <>
@@ -268,7 +267,7 @@ void Limb<uint32_t>::mult(const Limb<uint64_t>& l) {
 template <>
 void Limb<uint64_t>::mult(const Limb<uint64_t>& l) {
     assert(v.size == l.v.size);
-    mult_<uint64_t, ALGO_BARRETT><<<v.size / block, block, 0, stream.ptr>>>(v.data, l.v.data, primeid);
+    mult_<uint64_t, ALGO_BARRETT><<<v.size / block, block, 0, stream.ptr()>>>(v.data, l.v.data, primeid);
 }
 
 template <>
@@ -280,7 +279,7 @@ void Limb<uint64_t>::mult(const LimbImpl& _l1, const LimbImpl& _l2, const bool i
     const Limb<T>& l2 = std::get<U64>(_l2);
 
     mult_<T, ALGO_BARRETT>
-        <<<v.size / block, block, 0, stream.ptr>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
+        <<<v.size / block, block, 0, stream.ptr()>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
 }
 
 template <>
@@ -292,7 +291,7 @@ void Limb<uint32_t>::mult(const LimbImpl& _l1, const LimbImpl& _l2, const bool i
     const Limb<T>& l2 = std::get<U32>(_l2);
 
     mult_<T, ALGO_BARRETT>
-        <<<v.size / block, block, 0, stream.ptr>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
+        <<<v.size / block, block, 0, stream.ptr()>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
 }
 
 template <typename T>
@@ -306,17 +305,13 @@ void Limb<T>::INTT() {
         dim3 gridDim{v.size / blockDim.x / 2 / M};
         int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        INTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(v.data, primeid, aux.data);
+        INTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), v.data, primeid, aux.data);
 
         blockDim = (1 << ((cc.logN + 1) / 2 - 1));
         gridDim = {v.size / blockDim.x / 2 / M};
         bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        INTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data);
-
-    } else {
-
-        device_launch_INTT<T, algo><<<1, 1, 0, stream.ptr>>>(cc.logN, primeid, v.data, aux.data, v.data);
+        INTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data);
     }
 }
 
@@ -337,9 +332,9 @@ void Limb<T>::NTT() {
         //T *psi_arr_middle_scale = (T *) G_::psi_middle_scale[primeid];
 
         int primeid_ = primeid;
-        void* args[5] = {&v.data, (void*)&primeid_, &aux.data, (void*)&primeid_, (void*)&primeid_};
+        void* args[6] = {getGlobals(), &v.data, (void*)&primeid_, &aux.data, (void*)&primeid_, (void*)&primeid_};
         cudaLaunchCooperativeKernel(get_NTT_reference(false) /*(void *) test_kernel*/ /*(void *) NTT_<T, false, algo>*/,
-                                    gridDim, blockDim, args, bytes, stream.ptr);
+                                    gridDim, blockDim, args, bytes, stream.ptr());
         //CudaCheckErrorModNoSync;
     } else if constexpr (1) {
         static std::map<int, cudaGraphExec_t> exec;
@@ -352,21 +347,19 @@ void Limb<T>::NTT() {
             dim3 gridDim{v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            NTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(v.data, primeid, aux.data);
+            NTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), v.data, primeid, aux.data);
 
             {
                 blockDim = dim3{(uint32_t)(1 << ((cc.logN + (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
                 gridDim = {v.size / blockDim.x / 2 / M};
                 bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-                NTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data);
+                NTT_<T, true, algo>
+                    <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data);
             }
         });
 
         //aux.free(stream);
-    } else {
-        device_launch_NTT<T, algo, NTT_NONE>
-            <<<1, 1, 0, stream.ptr>>>(cc.logN, primeid, v.data, aux.data, v.data, 0, nullptr, 0);
     }
 }
 
@@ -385,13 +378,13 @@ void Limb<uint64_t>::NTT_rescale_fused(const Limb<uint64_t>& l) {
     int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
     NTT_<T, false, algo, NTT_RESCALE>
-        <<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, aux.data, nullptr, l.primeid);
+        <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, aux.data, nullptr, l.primeid);
     blockDim = (1 << ((cc.logN) / 2 - 1));
     gridDim = {v.size / blockDim.x / 2 / M};
     bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
     NTT_<T, true, algo, NTT_RESCALE>
-        <<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data, nullptr, l.primeid);
+        <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data, nullptr, l.primeid);
 }
 
 template <>
@@ -437,12 +430,14 @@ void Limb<uint64_t>::NTT_moddown_fused(const LimbImpl& _l) {
         dim3 gridDim{v.size / blockDim.x / 2 / M};
         int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        NTT_<T, false, algo, NTT_MODDOWN><<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, aux.data);
+        NTT_<T, false, algo, NTT_MODDOWN>
+            <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, aux.data);
         blockDim = (1 << ((cc.logN) / 2 - 1));
         gridDim = {v.size / blockDim.x / 2 / M};
         bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        NTT_<T, true, algo, NTT_MODDOWN><<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data);
+        NTT_<T, true, algo, NTT_MODDOWN>
+            <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data);
     }
 }
 
@@ -461,12 +456,14 @@ void Limb<uint32_t>::NTT_moddown_fused(const LimbImpl& _l) {
         dim3 gridDim{v.size / blockDim.x / 2 / M};
         int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        NTT_<T, false, algo, NTT_MODDOWN><<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, aux.data);
+        NTT_<T, false, algo, NTT_MODDOWN>
+            <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, aux.data);
         blockDim = (1 << ((cc.logN) / 2 - 1));
         gridDim = {v.size / blockDim.x / 2 / M};
         bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        NTT_<T, true, algo, NTT_MODDOWN><<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data);
+        NTT_<T, true, algo, NTT_MODDOWN>
+            <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data);
     }
 }
 
@@ -492,13 +489,13 @@ void Limb<uint64_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
         int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
         NTT_<T, false, algo, NTT_MULTPT>
-            <<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, aux.data, nullptr, l.primeid);
+            <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, aux.data, nullptr, l.primeid);
         blockDim = (1 << ((cc.logN) / 2 - 1));
         gridDim = {v.size / blockDim.x / 2 / M};
         bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
         NTT_<T, true, algo, NTT_MULTPT>
-            <<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data, pt.v.data, l.primeid);
+            <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data, pt.v.data, l.primeid);
     }
     //);
 }
@@ -520,13 +517,13 @@ void Limb<uint32_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
     int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
     NTT_<T, false, algo, NTT_MULTPT>
-        <<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, aux.data, nullptr, l.primeid);
+        <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, aux.data, nullptr, l.primeid);
     blockDim = (1 << ((cc.logN) / 2 - 1));
     gridDim = {v.size / blockDim.x / 2 / M};
     bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
     NTT_<T, true, algo, NTT_MULTPT>
-        <<<gridDim, blockDim, bytes, stream.ptr>>>(aux.data, primeid, v.data, pt.v.data, l.primeid);
+        <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), aux.data, primeid, v.data, pt.v.data, l.primeid);
 }
 
 template <typename T>
@@ -535,7 +532,7 @@ Limb<T> Limb<T>::clone() {
 
     stream.wait(res.stream);
 
-    cudaMemcpyAsync(res.v.data, v.data, v.size * sizeof(T), cudaMemcpyDeviceToDevice, stream.ptr);
+    cudaMemcpyAsync(res.v.data, v.data, v.size * sizeof(T), cudaMemcpyDeviceToDevice, stream.ptr());
 
     res.stream.wait(stream);
 
@@ -557,13 +554,13 @@ void Limb<T>::copyV(const LimbImpl& l) {
 template <>
 void Limb<uint32_t>::copyV(const Limb<uint32_t>& l) {
     //stream.wait(l.stream);
-    cudaMemcpyAsync(v.data, l.v.data, sizeof(uint32_t) * v.size, cudaMemcpyDefault, stream.ptr);
+    cudaMemcpyAsync(v.data, l.v.data, sizeof(uint32_t) * v.size, cudaMemcpyDefault, stream.ptr());
 }
 
 template <>
 void Limb<uint64_t>::copyV(const Limb<uint64_t>& l) {
     //stream.wait(l.stream);
-    cudaMemcpyAsync(v.data, l.v.data, sizeof(uint64_t) * v.size, cudaMemcpyDefault, stream.ptr);
+    cudaMemcpyAsync(v.data, l.v.data, sizeof(uint64_t) * v.size, cudaMemcpyDefault, stream.ptr());
 }
 
 template <>
@@ -592,12 +589,12 @@ void Limb<uint64_t>::INTT_from(LimbImpl& _l) {
         dim3 gridDim{v.size / blockDim.x / 2 / M};
         int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        INTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, l.aux.data);
+        INTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, l.aux.data);
         blockDim = (1 << ((cc.logN) / 2 - 1));
         gridDim = {v.size / blockDim.x / 2 / M};
         bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        INTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(l.aux.data, primeid, v.data);
+        INTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.aux.data, primeid, v.data);
     }
 }
 
@@ -616,12 +613,12 @@ void Limb<uint32_t>::INTT_from(LimbImpl& _l) {
         dim3 gridDim{v.size / blockDim.x / 2 / M};
         int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        INTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(l.v.data, primeid, l.aux.data);
+        INTT_<T, false, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.v.data, primeid, l.aux.data);
         blockDim = (1 << ((cc.logN) / 2 - 1));
         gridDim = {v.size / blockDim.x / 2 / M};
         bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-        INTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr>>>(l.aux.data, primeid, v.data);
+        INTT_<T, true, algo><<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), l.aux.data, primeid, v.data);
     }
 }
 
@@ -633,7 +630,7 @@ void Limb<uint64_t>::addMult(const LimbImpl& _l1, const LimbImpl& _l2, const boo
 
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
-    addMult_<T><<<gridDim, blockDim, 0, stream.ptr>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
+    addMult_<T><<<gridDim, blockDim, 0, stream.ptr()>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
 }
 
 template <>
@@ -644,14 +641,14 @@ void Limb<uint32_t>::addMult(const LimbImpl& _l1, const LimbImpl& _l2, const boo
 
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
-    addMult_<T><<<gridDim, blockDim, 0, stream.ptr>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
+    addMult_<T><<<gridDim, blockDim, 0, stream.ptr()>>>(inplace ? aux.data : v.data, l1.v.data, l2.v.data, primeid);
 }
 
 template <typename T>
 void Limb<T>::printThisLimb(int num) const {
     std::vector<T> cpu(v.size);
     store(cpu);
-    std::cout << "(" << hC_.primes[primeid] << ", ";
+    std::cout << "(" << cc.precom.constants[id].primes[primeid] << ", ";
     for (int i = 0; i < num; ++i) {
         std::cout << cpu[i] << ((i == num - 1) ? ") " : " ");
     }
@@ -680,9 +677,9 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
             dim3 gridDim{v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_SAVE><<<gridDim, blockDim, bytes, stream.ptr>>>(
-                c1.v.data, primeid, c1.aux.data, c1tilde.v.data, res0.v.data, res1.v.data, kska.v.data, kskb.v.data,
-                c0.v.data, c0tilde.v.data);
+            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_SAVE><<<gridDim, blockDim, bytes, stream.ptr()>>>(
+                getGlobals(), c1.v.data, primeid, c1.aux.data, c1tilde.v.data, res0.v.data, res1.v.data, kska.v.data,
+                kskb.v.data, c0.v.data, c0tilde.v.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
@@ -690,7 +687,7 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             INTT_<T, true, algo, INTT_MODE::INTT_NONE>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(c1.aux.data, primeid, v.data);
+                <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), c1.aux.data, primeid, v.data);
         }
     } else {
         Limb<T>& res0 = std::get<U32>(res0_);
@@ -709,9 +706,9 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
             dim3 gridDim{v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_SAVE><<<gridDim, blockDim, bytes, stream.ptr>>>(
-                c1.v.data, primeid, c1.aux.data, c1tilde.v.data, res0.v.data, res1.v.data, kska.v.data, kskb.v.data,
-                c0.v.data, c0tilde.v.data);
+            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_SAVE><<<gridDim, blockDim, bytes, stream.ptr()>>>(
+                getGlobals(), c1.v.data, primeid, c1.aux.data, c1tilde.v.data, res0.v.data, res1.v.data, kska.v.data,
+                kskb.v.data, c0.v.data, c0tilde.v.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
@@ -719,7 +716,7 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             INTT_<T, true, algo, INTT_MODE::INTT_NONE>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(c1.aux.data, primeid, v.data);
+                <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), c1.aux.data, primeid, v.data);
         }
     }
 }
@@ -747,9 +744,9 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
             dim3 gridDim{v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_ACC>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(c1.v.data, primeid, c1.aux.data, nullptr, res0.v.data,
-                                                           res1.v.data, kska.v.data, kskb.v.data, c0.v.data, nullptr);
+            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_ACC><<<gridDim, blockDim, bytes, stream.ptr()>>>(
+                getGlobals(), c1.v.data, primeid, c1.aux.data, nullptr, res0.v.data, res1.v.data, kska.v.data,
+                kskb.v.data, c0.v.data, nullptr);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
@@ -757,7 +754,7 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             INTT_<T, true, algo, INTT_MODE::INTT_NONE>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(c1.aux.data, primeid, v.data);
+                <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), c1.aux.data, primeid, v.data);
         }
     } else {
         Limb<T>& res0 = std::get<U32>(res0_);
@@ -776,9 +773,9 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
             dim3 gridDim{v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_ACC><<<gridDim, blockDim, bytes, stream.ptr>>>(
-                c1.v.data, primeid, c1.aux.data, c1tilde.v.data, res0.v.data, res1.v.data, kska.v.data, kskb.v.data,
-                c0.v.data, c0tilde.v.data);
+            INTT_<T, false, algo, INTT_MODE::INTT_MULT_AND_ACC><<<gridDim, blockDim, bytes, stream.ptr()>>>(
+                getGlobals(), c1.v.data, primeid, c1.aux.data, c1tilde.v.data, res0.v.data, res1.v.data, kska.v.data,
+                kskb.v.data, c0.v.data, c0tilde.v.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
@@ -786,7 +783,7 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             INTT_<T, true, algo, INTT_MODE::INTT_NONE>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(c1.aux.data, primeid, v.data);
+                <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), c1.aux.data, primeid, v.data);
         }
     }
 }
@@ -809,15 +806,15 @@ void Limb<T>::NTT_and_ksk_dot(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& 
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             NTT_<T, false, algo, NTT_MODE::NTT_NONE>
-                <<<gridDim, blockDim, bytes, res0.stream.ptr>>>(v.data, primeid, res0.aux.data);
+                <<<gridDim, blockDim, bytes, res0.stream.ptr()>>>(getGlobals(), v.data, primeid, res0.aux.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
             dim3 gridDim = {v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT><<<gridDim, blockDim, bytes, res0.stream.ptr>>>(
-                res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
+            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT><<<gridDim, blockDim, bytes, res0.stream.ptr()>>>(
+                getGlobals(), res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
         }
     } else {
         Limb<T>& res0 = std::get<U32>(res0_);
@@ -833,15 +830,15 @@ void Limb<T>::NTT_and_ksk_dot(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& 
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             NTT_<T, false, algo, NTT_MODE::NTT_NONE>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(v.data, primeid, res0.aux.data);
+                <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), v.data, primeid, res0.aux.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
             dim3 gridDim = {v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT><<<gridDim, blockDim, bytes, stream.ptr>>>(
-                res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
+            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT><<<gridDim, blockDim, bytes, stream.ptr()>>>(
+                getGlobals(), res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
         }
     }
 }
@@ -864,15 +861,15 @@ void Limb<T>::NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbIm
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             NTT_<T, false, algo, NTT_MODE::NTT_NONE>
-                <<<gridDim, blockDim, bytes, res0.stream.ptr>>>(v.data, primeid, res0.aux.data);
+                <<<gridDim, blockDim, bytes, res0.stream.ptr()>>>(getGlobals(), v.data, primeid, res0.aux.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
             dim3 gridDim = {v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT_ACC><<<gridDim, blockDim, bytes, res0.stream.ptr>>>(
-                res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
+            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT_ACC><<<gridDim, blockDim, bytes, res0.stream.ptr()>>>(
+                getGlobals(), res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
         }
     } else {
         Limb<T>& res0 = std::get<U32>(res0_);
@@ -888,15 +885,15 @@ void Limb<T>::NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbIm
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             NTT_<T, false, algo, NTT_MODE::NTT_NONE>
-                <<<gridDim, blockDim, bytes, stream.ptr>>>(v.data, primeid, res0.aux.data);
+                <<<gridDim, blockDim, bytes, stream.ptr()>>>(getGlobals(), v.data, primeid, res0.aux.data);
         }
         {
             dim3 blockDim = (1 << ((cc.logN) / 2 - 1));
             dim3 gridDim = {v.size / blockDim.x / 2 / M};
             int bytes = sizeof(T) * blockDim.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT_ACC><<<gridDim, blockDim, bytes, stream.ptr>>>(
-                res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
+            NTT_<T, true, algo, NTT_MODE::NTT_KSK_DOT_ACC><<<gridDim, blockDim, bytes, stream.ptr()>>>(
+                getGlobals(), res0.aux.data, primeid, res0.v.data, kska.v.data, 0, res1.v.data, kskb.v.data);
         }
     }
 }
@@ -907,7 +904,7 @@ void Limb<T>::automorph(const int index, const int br) {
     dim3 blockDim{block};
     dim3 gridDim{(uint32_t)(cc.N) / block};
 
-    automorph_<T><<<gridDim, blockDim, 0, stream.ptr>>>(v.data, aux.data, index, br);
+    automorph_<T><<<gridDim, blockDim, 0, stream.ptr()>>>(v.data, aux.data, index, br);
 
     std::swap(v.data, aux.data);
 }

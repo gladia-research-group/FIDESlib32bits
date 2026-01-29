@@ -15,16 +15,16 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyModUp)(benchmark::State& state) {
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_limbs"] = state.range(1);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
 
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
@@ -45,11 +45,11 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyModUpContextLimbCount)(benchmark::Sta
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
 
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
@@ -73,19 +73,19 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyStandardModDown)(benchmark::State& st
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_NATIVE>(state.range(1));
         CudaCheckErrorMod;
@@ -105,14 +105,14 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyStandardModDownContextLimbCount)(benc
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_NATIVE>(state.range(1));
         CudaCheckErrorMod;
@@ -132,20 +132,20 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyStandardModUpModDown)(benchmark::Stat
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         a.moddown<FIDESlib::ALGO_NATIVE>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
@@ -163,15 +163,15 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyStandardModUpModDownContextLimbCount)
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         a.moddown<FIDESlib::ALGO_NATIVE>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
@@ -202,19 +202,19 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyNoneModDown)(benchmark::State& state)
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_NONE>(state.range(1));
         CudaCheckErrorMod;
@@ -233,14 +233,14 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyNoneModDownContextLimbCount)(benchmar
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_NONE>(state.range(1));
         CudaCheckErrorMod;
@@ -259,20 +259,20 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyNoneModUpModDown)(benchmark::State& s
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         a.moddown<FIDESlib::ALGO_NONE>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
@@ -290,15 +290,15 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyNoneModUpModDownContextLimbCount)(ben
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         a.moddown<FIDESlib::ALGO_NONE>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
@@ -329,19 +329,19 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyShoupNoRedModDown)(benchmark::State& 
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_SHOUP>(state.range(1));
         CudaCheckErrorMod;
@@ -360,14 +360,14 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyShoupNoRedModDownContextLimbCount)(be
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_SHOUP>(state.range(1));
         CudaCheckErrorMod;
@@ -386,20 +386,20 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyShoupNoRedModUpModDown)(benchmark::St
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         a.moddown<FIDESlib::ALGO_SHOUP>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
@@ -417,15 +417,15 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyShoupNoRedModUpModDownContextLimbCoun
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         auto start = std::chrono::high_resolution_clock::now();
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         a.moddown<FIDESlib::ALGO_SHOUP>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
@@ -456,19 +456,19 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyBarretModDown)(benchmark::State& stat
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     state.counters["p_limbs"] = state.range(2);
     for (auto _ : state) {
-        if (cc.L <= state.range(2)) {
+        if (cc->L <= state.range(2)) {
             state.SkipWithMessage("cc.L <= initial levels");
             break;
         }
-        FIDESlib::CKKS::RNSPoly a(cc, state.range(2));
+        FIDESlib::CKKS::RNSPoly a(*cc, state.range(2));
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         a.moddown<FIDESlib::ALGO_BARRETT>(state.range(1));
         CudaCheckErrorMod;
@@ -487,16 +487,16 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, RNSPolyBarretModDownContextLimbCount)(benchm
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     state.counters["p_ntt"] = state.range(1);
     for (auto _ : state) {
-        FIDESlib::CKKS::RNSPoly a(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly a(*cc, cc->L);
         a.modup();
-        a.generateSpecialLimbs();
+        a.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
-        a.moddown<FIDESlib::ALGO_BARRETT>(  state.range(1));
+        a.moddown<FIDESlib::ALGO_BARRETT>(state.range(1));
         CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);

@@ -4,43 +4,21 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
-#include <execution>
 #include "ConstantsGPU.cuh"
 #include "CudaUtils.cuh"
 #include "Math.cuh"
 
 #include "CKKS/Parameters.cuh"
+#include "parallel_for.hpp"
 
 namespace FIDESlib {
 
 __constant__ Constants constants;
-namespace Globals {
-__device__ void* psi[MAXP];
-__device__ void* inv_psi[MAXP];
-__device__ void* psi_middle_scale[MAXP];
-__device__ void* inv_psi_middle_scale[MAXP];
-__device__ void* psi_no[MAXP];
-__device__ void* inv_psi_no[MAXP];
-__device__ void* psi_shoup[MAXP];
-__device__ void* inv_psi_shoup[MAXP];
 
-//__device__ uint64_t q_[MAXP][MAXP];
-//__device__ uint64_t Q_[MAXP][MAXP];
-__device__ uint64_t q_inv[MAXP * MAXP];
-__device__ uint64_t QlQlInvModqlDivqlModq[MAXP * MAXP];
-
-__device__ uint64_t ModDown_pre_scale[MAXP];
-__device__ uint64_t ModDown_pre_scale_shoup[MAXP];
-__device__ uint64_t ModDown_matrix[MAXP * MAXP];
-__device__ uint64_t ModDown_matrix_shoup[MAXP * MAXP];
-
-__device__ uint64_t DecompAndModUp_pre_scale[MAXD * MAXP * MAXP];
-__device__ uint64_t DecompAndModUp_pre_scale_shoup[MAXD * MAXP * MAXP];
-__device__ uint64_t DecompAndModUp_matrix[MAXP * MAXD * MAXP * MAXP];
-__device__ uint64_t DecompAndModUp_matrix_shoup[MAXP * MAXD * MAXP * MAXP];
-}  // namespace Globals
-Constants host_constants;
-Global host_global;
+// namespace Globals
+// Constants host_constants;
+// Constants host_constants_per_gpu[8];
+// Global host_global;
 
 template <typename Scheme>
 __global__ void printConstants() {
@@ -90,33 +68,34 @@ uint64_t unity_root(const uint64_t q, const uint64_t order) {
     return res;
 }
 
-uint64_t shoup_precomp(uint64_t val, int primeid) {
+uint64_t shoup_precomp(uint64_t val, int primeid, Constants& host_constants_) {
+    Constants& host_constants = host_constants_;
     return (__uint128_t)((val) << 1) * (1ul << 63) / hC_.primes[primeid];
 }
 
-#define freegpu(name)                                \
-    do {                                             \
-        for (int j = 0; j < MAXD; ++j) {             \
-            if (host_global.name[j][i] != nullptr) { \
-                cudaFree(host_global.name[j][i]);    \
-                host_global.name[j][i] = nullptr;    \
-            }                                        \
-        }                                            \
+#define freegpu(name)                    \
+    do {                                 \
+        for (int j = 0; j < MAXD; ++j) { \
+            if (name[j][i] != nullptr) { \
+                cudaFree(name[j][i]);    \
+                name[j][i] = nullptr;    \
+            }                            \
+        }                                \
     } while (false)
 
-#define free(name)                                     \
-    do {                                               \
-        if (host_global.name[i] != nullptr) {          \
-            if (HISU64(i)) {                           \
-                delete (uint64_t*)host_global.name[i]; \
-            } else {                                   \
-                delete (uint32_t*)host_global.name[i]; \
-            }                                          \
-            host_global.name[i] = nullptr;             \
-        }                                              \
+#define free(name)                         \
+    do {                                   \
+        if (name[i] != nullptr) {          \
+            if (type & (1 << i)) {         \
+                delete (uint64_t*)name[i]; \
+            } else {                       \
+                delete (uint32_t*)name[i]; \
+            }                              \
+            name[i] = nullptr;             \
+        }                                  \
     } while (false)
 
-void cleanUpPrevious() {
+Global::~Global() {
     for (int i = 0; i < MAXP; ++i) {
         free(psi);
         free(inv_psi);
@@ -133,21 +112,31 @@ void cleanUpPrevious() {
         freegpu(inv_psi_middle_scale_ptr);
         freegpu(psi_no_ptr);
         freegpu(inv_psi_no_ptr);
-        freegpu(psi_barrett_ptr);
-        freegpu(inv_psi_barrett_ptr);
+        freegpu(psi_shoup_ptr);
+        freegpu(inv_psi_shoup_ptr);
+    }
+    for (int i = 0; i < MAXD; ++i) {
+        if (this->globals[i] != nullptr) {
+            cudaFree((void*)this->globals[i]);
+            globals[i] = nullptr;
+        }
     }
 }
 
 template <typename Scheme>
-void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::vector<LimbRecord>>& meta,
-                    const std::vector<PrimeRecord>& p, const std::vector<LimbRecord>& smeta,
-                    const std::vector<std::vector<std::vector<LimbRecord>>>& DECOMPmeta,
-                    const std::vector<std::vector<std::vector<LimbRecord>>>& DIGITmeta,
-                    const std::vector<std::vector<int>>& digitGPUid, const std::vector<int>& GPUid, const int N,
-                    const Scheme& parameters) {
+std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
+    const std::vector<PrimeRecord>& q, const std::vector<std::vector<LimbRecord>>& meta,
+    const std::vector<PrimeRecord>& p, const std::vector<LimbRecord>& smeta,
+    const std::vector<std::vector<std::vector<LimbRecord>>>& DECOMPmeta,
+    const std::vector<std::vector<std::vector<LimbRecord>>>& DIGITmeta, const std::vector<std::vector<int>>& digitGPUid,
+    const std::vector<int>& GPUid, const int N, const Scheme& parameters) {
     CudaCheckErrorMod;
 
-    cleanUpPrevious();
+    initGPUprop();
+
+    Constants host_constants = {};
+    std::unique_ptr<Global> host_global_{std::make_unique<Global>()};
+    Global& host_global = *host_global_;
 
     for (int id : GPUid) {
         cudaSetDevice(id);
@@ -168,14 +157,16 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
             if (j.type == U64) {
                 hC_.type |= (((uint64_t)1) << j.id);
             }
+
+        hG_.type = hC_.type;
     }
 
     {
         for (size_t i = 0; i < q.size(); ++i) {
             hC_.primes[i] = q[i].p;
-            hC_.N_shoup[i] = shoup_precomp(hC_.N, i);
+            hC_.N_shoup[i] = shoup_precomp(hC_.N, i, host_constants);
             hC_.N_inv[i] = modinv(hC_.N, q[i].p);
-            hC_.N_inv_shoup[i] = shoup_precomp(hC_.N_inv[i], i);
+            hC_.N_inv_shoup[i] = shoup_precomp(hC_.N_inv[i], i, host_constants);
 
             hC_.prime_better_barret_mu[i] = mu_new(q[i].p, q[i].bits);
             hC_.prime_bits[i] = q[i].bits;
@@ -184,9 +175,9 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
         for (size_t i = 0; i < p.size(); ++i) {
             hC_.primes[hC_.L + i] = p[i].p;
 
-            hC_.N_shoup[hC_.L + i] = shoup_precomp(hC_.N, hC_.L + i);
+            hC_.N_shoup[hC_.L + i] = shoup_precomp(hC_.N, hC_.L + i, host_constants);
             hC_.N_inv[hC_.L + i] = modinv(N, hC_.primes[hC_.L + i]);
-            hC_.N_inv_shoup[hC_.L + i] = shoup_precomp(hC_.N_inv[hC_.L + i], hC_.L + i);
+            hC_.N_inv_shoup[hC_.L + i] = shoup_precomp(hC_.N_inv[hC_.L + i], hC_.L + i, host_constants);
             ;
 
             hC_.prime_better_barret_mu[hC_.L + i] = mu_new(hC_.primes[hC_.L + i], p[i].bits);
@@ -196,12 +187,10 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
 
     {
 
-        std::vector<int> index(hC_.L + hC_.K);
-        std::iota(index.begin(), index.end(), 0);
-        std::for_each(/*std::execution::par_unseq,*/ index.begin(), index.end(), [&](int i) {
+        auto work = [&](int i) -> void const {
             if (std::is_same_v<CKKS::Parameters, Scheme>) {
                 auto param = static_cast<CKKS::Parameters>(parameters);
-                if (param.raw != nullptr) {
+                if (param.raw) {
                     if (i < hC_.L) {
                         hG_.root[i] = param.raw->root_of_unity[i];
                         //hG_.root[i] = modpow(hG_.root[i], param.raw->cyclotomic_order[i] / (N), hC_.primes[i]);
@@ -219,9 +208,9 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
             hG_.inv_root[i] = modinv(hG_.root[i], hC_.primes[i]);
 
             hC_.root[i] = hG_.root[i];
-            hC_.root_shoup[i] = shoup_precomp(hG_.root[i], i);
+            hC_.root_shoup[i] = shoup_precomp(hG_.root[i], i, host_constants);
             hC_.inv_root[i] = hG_.inv_root[i];
-            hC_.inv_root_shoup[i] = shoup_precomp(hG_.inv_root[i], i);
+            hC_.inv_root_shoup[i] = shoup_precomp(hG_.inv_root[i], i, host_constants);
 
             //std::swap(hG_.root[i], hG_.inv_root[i]);
             assert(modpow(hG_.root[i], 2 * N, hC_.primes[i]) == 1);
@@ -264,7 +253,8 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
 
             for (int j = 0; j < N; ++j) {
                 int pow = 1 << (std::bit_width((uint32_t)j));
-
+                pow++;
+                pow--;
                 if (!HISU64(i)) {
                     ((uint32_t*)hG_.psi[i])[j] = ((uint32_t*)hG_.psi_no[i])[bit_reverse(j, hC_.logN)];
                     ((uint32_t*)hG_.inv_psi[i])[j] = ((uint32_t*)hG_.inv_psi_no[i])[bit_reverse(j, hC_.logN)];
@@ -331,12 +321,13 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
                         (__uint128_t)(((uint64_t*)hG_.inv_psi[i])[j] << 1) * (1ul << 63) / hC_.primes[i];
                 }
             }
-        });
+        };
+        parallel_for(0, hC_.L + hC_.K, 1, work);
     }
 
     if (std::is_same_v<CKKS::Parameters, Scheme>) {
         auto param = static_cast<CKKS::Parameters>(parameters);
-        if (param.raw != nullptr) {
+        if (param.raw) {
             for (size_t i = 0; i < q.size(); ++i) {
                 for (int k = 0; k < N; ++k) {
                     assert(param.raw->psi[i][k] == ((uint64_t*)hG_.psi[i])[k]);
@@ -348,8 +339,9 @@ void SetupConstants(const std::vector<PrimeRecord>& q, const std::vector<std::ve
     }
 
     for (size_t i = 0; i < GPUid.size(); ++i) {
-        cudaSetDevice(0/*GPUid.at(i)*/);
-CudaCheckErrorMod;
+        cudaSetDevice(GPUid.at(i));
+
+        CudaCheckErrorMod;
         for (int j = 0; j < hC_.L + hC_.K; ++j) {
             int bytes = hC_.N * ((HISU64(j)) ? sizeof(uint64_t) : sizeof(uint32_t));
 
@@ -359,8 +351,8 @@ CudaCheckErrorMod;
             cudaMalloc(&(hG_.inv_psi_no_ptr[i][j]), 2 * bytes);
             cudaMalloc(&(hG_.psi_middle_scale_ptr[i][j]), bytes);
             cudaMalloc(&(hG_.inv_psi_middle_scale_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.psi_barrett_ptr[i][j]), bytes);
-            cudaMalloc(&(hG_.inv_psi_barrett_ptr[i][j]), bytes);
+            cudaMalloc(&(hG_.psi_shoup_ptr[i][j]), bytes);
+            cudaMalloc(&(hG_.inv_psi_shoup_ptr[i][j]), bytes);
             CudaCheckErrorMod;
             cudaMemcpy(hG_.psi_ptr[i][j], hG_.psi[j], bytes, cudaMemcpyHostToDevice);
             cudaMemcpy(hG_.inv_psi_ptr[i][j], hG_.inv_psi[j], bytes, cudaMemcpyHostToDevice);
@@ -368,32 +360,67 @@ CudaCheckErrorMod;
             cudaMemcpy(hG_.inv_psi_no_ptr[i][j], hG_.inv_psi_no[j], 2 * bytes, cudaMemcpyHostToDevice);
             cudaMemcpy(hG_.psi_middle_scale_ptr[i][j], hG_.psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
             cudaMemcpy(hG_.inv_psi_middle_scale_ptr[i][j], hG_.inv_psi_middle_scale[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.psi_barrett_ptr[i][j], hG_.psi_shoup[j], bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(hG_.inv_psi_barrett_ptr[i][j], hG_.inv_psi_shoup[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.psi_shoup_ptr[i][j], hG_.psi_shoup[j], bytes, cudaMemcpyHostToDevice);
+            cudaMemcpy(hG_.inv_psi_shoup_ptr[i][j], hG_.inv_psi_shoup[j], bytes, cudaMemcpyHostToDevice);
             CudaCheckErrorMod;
         }
 
-        cudaMemcpyToSymbol(Globals::psi, hG_.psi_ptr[i], sizeof(Globals::psi), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_no, hG_.psi_no_ptr[i], sizeof(hG_.psi_no_ptr[i]), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_middle_scale, hG_.psi_middle_scale_ptr[i], sizeof(hG_.psi_middle_scale_ptr[i]), 0,
+        cudaMalloc(&hG_.globals[i], sizeof(Global::Globals));
+        CudaCheckErrorMod;
+        /*
+        cudaMemcpyToSymbol(hG_.globals[i], hG_.psi_ptr[i], sizeof(hG_.globals[i]->psi), offsetof(Global::Globals, psi),
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi, hG_.inv_psi_ptr[i], sizeof(hG_.inv_psi_ptr[i]), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_no, hG_.inv_psi_no_ptr[i], sizeof(hG_.inv_psi_no_ptr[i]), 0,
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i]->psi_no, hG_.psi_no_ptr[i], sizeof(hG_.psi_no_ptr[i]), 0,
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_middle_scale, hG_.inv_psi_middle_scale_ptr[i],
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i]->psi_middle_scale, hG_.psi_middle_scale_ptr[i],
+                           sizeof(hG_.psi_middle_scale_ptr[i]), 0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i]->inv_psi, hG_.inv_psi_ptr[i], sizeof(hG_.inv_psi_ptr[i]), 0,
+                           cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i].inv_psi_no, hG_.inv_psi_no_ptr[i], sizeof(hG_.inv_psi_no_ptr[i]), 0,
+                           cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i].inv_psi_middle_scale, hG_.inv_psi_middle_scale_ptr[i],
                            sizeof(hG_.inv_psi_middle_scale_ptr[i]), 0, cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::psi_shoup, hG_.psi_barrett_ptr[i], sizeof(hG_.psi_barrett_ptr[i]), 0,
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i].psi_shoup, hG_.psi_barrett_ptr[i], sizeof(hG_.psi_barrett_ptr[i]), 0,
                            cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
-        cudaMemcpyToSymbol(G_::inv_psi_shoup, hG_.inv_psi_barrett_ptr[i], sizeof(hG_.inv_psi_barrett_ptr[i]), 0,
-                           cudaMemcpyHostToDevice);
-CudaCheckErrorMod;
+        CudaCheckErrorMod;
+        cudaMemcpyToSymbol(hG_.globals[i].inv_psi_shoup, hG_.inv_psi_barrett_ptr[i], sizeof(hG_.inv_psi_barrett_ptr[i]),
+                           0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        */
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, psi), hG_.psi_ptr[i],
+                   sizeof(hG_.globals[i]->psi), cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, psi_no), hG_.psi_no_ptr[i],
+                   sizeof(hG_.globals[i]->psi_no), cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, psi_middle_scale), hG_.psi_middle_scale_ptr[i],
+                   sizeof(hG_.globals[i]->psi_middle_scale), cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, inv_psi), hG_.inv_psi_ptr[i],
+                   sizeof(hG_.globals[i]->inv_psi), cudaMemcpyHostToDevice);
+
+        CudaCheckErrorMod;
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, inv_psi_no), hG_.inv_psi_no_ptr[i],
+                   sizeof(hG_.globals[i]->inv_psi_no), cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, inv_psi_middle_scale),
+                   hG_.inv_psi_middle_scale_ptr[i], sizeof(hG_.globals[i]->inv_psi_middle_scale),
+                   cudaMemcpyHostToDevice);
+
+        CudaCheckErrorMod;
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, psi_shoup), hG_.psi_shoup_ptr[i],
+                   sizeof(hG_.globals[i]->psi_shoup), cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, inv_psi_shoup), hG_.inv_psi_shoup_ptr[i],
+                   sizeof(hG_.globals[i]->inv_psi_shoup), cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
     }
 
     {
@@ -412,51 +439,19 @@ CudaCheckErrorMod;
         }
         constexpr int bytes = sizeof(Global::q_inv);
 
-        for (int id : GPUid) {
-            cudaSetDevice(id);
-            cudaMemcpyToSymbol(Globals::q_inv, hG_.q_inv, bytes, 0, cudaMemcpyHostToDevice);
+        for (int i = 0; i < GPUid.size(); ++i) {
+            cudaSetDevice(GPUid[i]);
+            //cudaMemcpyToSymbol(hG_.globals[i].q_inv, hG_.q_inv, bytes, 0, cudaMemcpyHostToDevice);
+            cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, q_inv), hG_.q_inv, bytes,
+                       cudaMemcpyHostToDevice);
             CudaCheckErrorMod;
         }
-    }for (size_t j = 0; j < smeta.size(); ++j) {
-                hC_.primeid_special_partition[j] = smeta[j].id;
-             //   hC_.primeid_flattened[SPECIAL(0, j)] = smeta[j].id;
-            }
+    }
 
-            for (size_t i = 0; i < GPUid.size(); ++i) {
-                for (size_t j = 0; j < meta[i].size(); ++j) {
-                    hC_.primeid_partition[i][j] = meta[i][j].id;
-                   // hC_.primeid_flattened[PARTITION(i, j)] = meta[i][j].id;
-                }
-
-                for (size_t j = 0; j < digitGPUid[i].size(); ++j) {
-                    for (int k = 0; k < hC_.L; ++k) {
-                        {
-                            int num = 0;
-                            for (auto& l : DECOMPmeta.at(i).at(j))
-                                if (l.id <= k) {
-                                    hC_.primeid_digit_from[digitGPUid.at(i).at(j)][num] = l.id;
-                                  //  hC_.primeid_flattened[DECOMP(digitGPUid.at(i).at(j), num)] = l.id;
-                                    num++;
-                                }
-                            hC_.num_primeid_digit_from[digitGPUid.at(i).at(j)][k] = num;
-                        }
-
-                        {
-                            int num = 0;
-                            for (auto& l : DIGITmeta.at(i).at(j))
-                                if (l.id <= k || l.id >= hC_.L) {
-                                    hC_.primeid_digit_to[digitGPUid.at(i).at(j)][num] = l.id;
-                                 //   hC_.primeid_flattened[DIGIT(digitGPUid.at(i).at(j), num)] = l.id;
-                                    num++;
-                                }
-                            hC_.num_primeid_digit_to[digitGPUid.at(i).at(j)][k] = num;
-                        }
-                    }
-                }
-            }
-
-
-
+    for (size_t j = 0; j < smeta.size(); ++j) {
+        hC_.primeid_special_partition[j] = smeta[j].id;
+        //   hC_.primeid_flattened[SPECIAL(0, j)] = smeta[j].id;
+    }
 
     if constexpr (std::is_same_v<Scheme, CKKS::Parameters>) {
         auto param = static_cast<CKKS::Parameters>(parameters);
@@ -472,10 +467,12 @@ CudaCheckErrorMod;
 
                 constexpr int bytes = sizeof(Global::QlQlInvModqlDivqlModq);
 
-                for (int id : GPUid) {
-                    cudaSetDevice(id);
-                    cudaMemcpyToSymbol(G_::QlQlInvModqlDivqlModq, hG_.QlQlInvModqlDivqlModq, bytes, 0,
-                                       cudaMemcpyHostToDevice);
+                for (int i = 0; i < GPUid.size(); ++i) {
+                    cudaSetDevice(GPUid[i]);
+                    //cudaMemcpyToSymbol(hG_.globals[i].QlQlInvModqlDivqlModq, hG_.QlQlInvModqlDivqlModq, bytes, 0,
+                    //                   cudaMemcpyHostToDevice);
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, QlQlInvModqlDivqlModq),
+                               hG_.QlQlInvModqlDivqlModq, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
                 }
             }
@@ -487,28 +484,34 @@ CudaCheckErrorMod;
                 auto& src = param.raw->PInvModq;
                 for (size_t i = 0; i < src.size(); ++i) {
                     hC_.P_inv[i] = src[i];
-                    hC_.P_inv_shoup[i] = shoup_precomp(hC_.P_inv[i], i);
+                    hC_.P_inv_shoup[i] = shoup_precomp(hC_.P_inv[i], i, host_constants);
                     hC_.P[i] = modinv(src[i], hC_.primes[i]);
-                    hC_.P_shoup[i] = shoup_precomp(hC_.P[i], i);
+                    hC_.P_shoup[i] = shoup_precomp(hC_.P[i], i, host_constants);
                 }
             }
-
-            
 
             {
                 auto& src = param.raw->PHatInvModp;
 
                 for (size_t k = 0; k < src.size(); ++k) {
                     hG_.ModDown_pre_scale[hC_.L + k] = src[k];
-                    hG_.ModDown_pre_scale_shoup[hC_.L + k] = shoup_precomp(hG_.ModDown_pre_scale[hC_.L + k], hC_.L + k);
+                    hG_.ModDown_pre_scale_shoup[hC_.L + k] =
+                        shoup_precomp(hG_.ModDown_pre_scale[hC_.L + k], hC_.L + k, host_constants);
                 }
 
                 constexpr int bytes = sizeof(Global::ModDown_pre_scale);
-                for (int id : GPUid) {
-                    cudaSetDevice(id);
-                    cudaMemcpyToSymbol(G_::ModDown_pre_scale, hG_.ModDown_pre_scale, bytes, 0, cudaMemcpyHostToDevice);
-                    cudaMemcpyToSymbol(G_::ModDown_pre_scale_shoup, hG_.ModDown_pre_scale_shoup, bytes, 0,
+                for (int i = 0; i < GPUid.size(); ++i) {
+                    cudaSetDevice(GPUid[i]);
+                    /*
+                    cudaMemcpyToSymbol(hG_.globals[i].ModDown_pre_scale, hG_.ModDown_pre_scale, bytes, 0,
                                        cudaMemcpyHostToDevice);
+                    cudaMemcpyToSymbol(hG_.globals[i].ModDown_pre_scale_shoup, hG_.ModDown_pre_scale_shoup, bytes, 0,
+                                       cudaMemcpyHostToDevice);
+                                       */
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, ModDown_pre_scale),
+                               hG_.ModDown_pre_scale, bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, ModDown_pre_scale_shoup),
+                               hG_.ModDown_pre_scale_shoup, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
                 }
             }
@@ -519,16 +522,23 @@ CudaCheckErrorMod;
                 for (size_t k = 0; k < src.size(); ++k) {
                     for (size_t i = 0; i < src[k].size(); ++i) {
                         hG_.ModDown_matrix[k][i] = src[k][i];
-                        hG_.ModDown_matrix_shoup[k][i] = shoup_precomp(hG_.ModDown_matrix[k][i], i);
+                        hG_.ModDown_matrix_shoup[k][i] = shoup_precomp(hG_.ModDown_matrix[k][i], i, host_constants);
                     }
                 }
 
                 constexpr int bytes = sizeof(Global::ModDown_matrix);
-                for (int id : GPUid) {
-                    cudaSetDevice(id);
-                    cudaMemcpyToSymbol(G_::ModDown_matrix, hG_.ModDown_matrix, bytes, 0, cudaMemcpyHostToDevice);
-                    cudaMemcpyToSymbol(G_::ModDown_matrix_shoup, hG_.ModDown_matrix_shoup, bytes, 0,
+                for (int i = 0; i < GPUid.size(); ++i) {
+                    cudaSetDevice(GPUid[i]);
+                    /*
+                    cudaMemcpyToSymbol(hG_.globals[i].ModDown_matrix, hG_.ModDown_matrix, bytes, 0,
                                        cudaMemcpyHostToDevice);
+                    cudaMemcpyToSymbol(hG_.globals[i].ModDown_matrix_shoup, hG_.ModDown_matrix_shoup, bytes, 0,
+                                       cudaMemcpyHostToDevice);
+                                       */
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, ModDown_matrix), hG_.ModDown_matrix,
+                               bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, ModDown_matrix_shoup),
+                               hG_.ModDown_matrix_shoup, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
                 }
             }
@@ -541,8 +551,8 @@ CudaCheckErrorMod;
                         for (size_t j = 0; j < src[k][i].size(); ++j) {
                             assert(src[k][i][j] != 0);
                             hG_.DecompAndModUp_pre_scale[k][i][init_primeid + j] = src[k][i][j];
-                            hG_.DecompAndModUp_pre_scale_shoup[k][i][init_primeid + j] =
-                                shoup_precomp(hG_.DecompAndModUp_pre_scale[k][i][init_primeid + j], init_primeid + j);
+                            hG_.DecompAndModUp_pre_scale_shoup[k][i][init_primeid + j] = shoup_precomp(
+                                hG_.DecompAndModUp_pre_scale[k][i][init_primeid + j], init_primeid + j, host_constants);
                         }
                     }
                     init_primeid += src[k].size();
@@ -550,12 +560,18 @@ CudaCheckErrorMod;
 
                 constexpr int bytes = sizeof(Global::DecompAndModUp_pre_scale);
                 assert(bytes == 8 * 64 * 64 * 8);
-                for (int id : GPUid) {
-                    cudaSetDevice(id);
-                    cudaMemcpyToSymbol(G_::DecompAndModUp_pre_scale, hG_.DecompAndModUp_pre_scale, bytes, 0,
+                for (int i = 0; i < GPUid.size(); ++i) {
+                    cudaSetDevice(GPUid[i]);
+                    /*
+                    cudaMemcpyToSymbol(hG_.globals[i].DecompAndModUp_pre_scale, hG_.DecompAndModUp_pre_scale, bytes, 0,
                                        cudaMemcpyHostToDevice);
-                    cudaMemcpyToSymbol(G_::DecompAndModUp_pre_scale_shoup, hG_.DecompAndModUp_pre_scale_shoup, bytes, 0,
-                                       cudaMemcpyHostToDevice);
+                    cudaMemcpyToSymbol(hG_.globals[i].DecompAndModUp_pre_scale_shoup,
+                                       hG_.DecompAndModUp_pre_scale_shoup, bytes, 0, cudaMemcpyHostToDevice);
+                                       */
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_pre_scale),
+                               hG_.DecompAndModUp_pre_scale, bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_pre_scale_shoup),
+                               hG_.DecompAndModUp_pre_scale_shoup, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
                 }
             }
@@ -565,7 +581,9 @@ CudaCheckErrorMod;
                 auto& src = param.raw->PartQlHatModp;
 
                 for (size_t k = 0; k < src.size(); ++k) {
+                    int input_primeid = 0;
                     for (size_t i = 0; i < src[k].size(); ++i) {
+                        /*
                         size_t gpu = 0;
                         size_t gpu_d = 0;
                         for (; gpu < digitGPUid.size(); ++gpu) {
@@ -577,55 +595,123 @@ CudaCheckErrorMod;
                             }
                         }
                     out:
+                         */
+
                         for (size_t j = 0; j < src[k][i].size(); ++j) {
                             for (size_t l = 0; l < src[k][i][j].size(); ++l) {
                                 assert(src[k][i][j][l] != 0);
-                                int DIGITmeta_primeid =
-                                    l >= src[k][i][j].size() - hC_.K
-                                        ? DIGITmeta.at(gpu).at(gpu_d).at(l - src[k][i][j].size() + hC_.K).id
-                                        : DIGITmeta.at(gpu).at(gpu_d).at(l + hC_.K).id;
-                                hG_.DecompAndModUp_matrix[k][i][j][DIGITmeta_primeid] = src[k][i][j][l];
-                                hG_.DecompAndModUp_matrix_shoup[k][i][j][DIGITmeta_primeid] =
-                                    shoup_precomp(src[k][i][j][l], DIGITmeta_primeid);
+                                int added_decomp =
+                                    DECOMPmeta.at(0).at(i).at(0).id <= l ? DECOMPmeta.at(0).at(i).size() : 0;
+                                int predicted_primeid = l >= src[k][i][j].size() - hC_.K
+                                                            ? hC_.L + l - src[k][i][j].size() + hC_.K
+                                                            : l + added_decomp;  // TODO: add possible decomp offset
+                                //  int DIGITmeta_primeid =
+                                //      l >= src[k][i][j].size() - hC_.K
+                                //          ? DIGITmeta.at(gpu).at(gpu_d).at(l - src[k][i][j].size() + hC_.K).id
+                                //         : DIGITmeta.at(gpu).at(gpu_d).at(l + hC_.K).id;
+
+                                hG_.DecompAndModUp_matrix[k][i][input_primeid][predicted_primeid] = src[k][i][j][l];
+                                hG_.DecompAndModUp_matrix_shoup[k][i][input_primeid][predicted_primeid] =
+                                    shoup_precomp(src[k][i][j][l], predicted_primeid, host_constants);
                             }
+                            input_primeid++;
                         }
                     }
                 }
 
                 constexpr int bytes = sizeof(Global::DecompAndModUp_matrix);
                 assert(bytes == 8 * 64 * 64 * 64 * 8);
-                for (int id : GPUid) {
-                    cudaSetDevice(id);
-                    cudaMemcpyToSymbol(G_::DecompAndModUp_matrix, hG_.DecompAndModUp_matrix, bytes, 0,
+                for (int i = 0; i < GPUid.size(); ++i) {
+                    cudaSetDevice(GPUid[i]);
+                    /*
+                    cudaMemcpyToSymbol(hG_.globals[i].DecompAndModUp_matrix, hG_.DecompAndModUp_matrix, bytes, 0,
                                        cudaMemcpyHostToDevice);
-                    cudaMemcpyToSymbol(G_::DecompAndModUp_matrix_shoup, hG_.DecompAndModUp_matrix_shoup, bytes, 0,
-                                       cudaMemcpyHostToDevice);
+                    cudaMemcpyToSymbol(hG_.globals[i].DecompAndModUp_matrix_shoup, hG_.DecompAndModUp_matrix_shoup,
+                                       bytes, 0, cudaMemcpyHostToDevice);
+                                       */
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_matrix),
+                               hG_.DecompAndModUp_matrix, bytes, cudaMemcpyHostToDevice);
+                    cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_matrix_shoup),
+                               hG_.DecompAndModUp_matrix_shoup, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
-
-                    cudaMemcpyFromSymbol(hG_.DecompAndModUp_matrix, G_::DecompAndModUp_matrix, bytes, 0,
+                    /*
+                    cudaMemcpyFromSymbol(hG_.DecompAndModUp_matrix, hG_.globals[i].DecompAndModUp_matrix, bytes, 0,
                                          cudaMemcpyDeviceToHost);
-                    cudaMemcpyFromSymbol(hG_.DecompAndModUp_matrix_shoup, G_::DecompAndModUp_matrix_shoup, bytes, 0,
+                    cudaMemcpyFromSymbol(hG_.DecompAndModUp_matrix_shoup, hG_.globals[i].DecompAndModUp_matrix_shoup, bytes, 0,
                                          cudaMemcpyDeviceToHost);
+                                         */
                 }
             }
         }
     }
 
     CudaCheckErrorMod;
+    for (size_t i = 0; i < GPUid.size(); ++i) {
+        for (size_t j = 0; j < meta[i].size(); ++j) {
+            hC_.primeid_partition[i][j] = meta[i][j].id;
+            hC_.primeid_digit[meta[i][j].id] = meta[i][j].digit;
+            // hC_.primeid_flattened[PARTITION(i, j)] = meta[i][j].id;
+        }
+
+        for (size_t j = 0; j < smeta.size(); ++j) {
+            //hC_.primeid_partition[i][j] = smeta[j].id;
+            hC_.primeid_digit[smeta[j].id] = smeta[j].digit;
+            // hC_.primeid_flattened[PARTITION(i, j)] = meta[i][j].id;
+        }
+    }
+
+    std::vector<Constants> host_constants_per_gpu(GPUid.size());
+    for (size_t i = 0; i < GPUid.size(); ++i) {
+        for (size_t j = 0; j < digitGPUid[i].size(); ++j) {
+            for (int k = 0; k < hC_.L; ++k) {
+                {
+                    int num = 0;
+                    for (auto& l : DECOMPmeta.at(i).at(j))
+                        if (l.id <= k) {
+                            hC_.primeid_digit_from[digitGPUid.at(i).at(j)][num] = l.id;
+                            //  hC_.primeid_flattened[DECOMP(GPUdigits.at(i).at(j), num)] = l.id;
+                            hC_.pos_in_digit[digitGPUid.at(i).at(j)][l.id] = num;
+
+                            num++;
+                        }
+                    hC_.num_primeid_digit_from[digitGPUid.at(i).at(j)][k] = num;
+                }
+
+                {
+                    int num = 0;
+                    for (auto& l : DIGITmeta.at(i).at(j))
+                        if (l.id <= k || l.id >= hC_.L) {
+                            hC_.primeid_digit_to[digitGPUid.at(i).at(j)][num] = l.id;
+                            //   hC_.primeid_flattened[DIGIT(GPUdigits.at(i).at(j), num)] = l.id;
+                            hC_.pos_in_digit[digitGPUid.at(i).at(j)][l.id] = num;
+                            num++;
+                        }
+                    hC_.num_primeid_digit_to[digitGPUid.at(i).at(j)][k] = num;
+                }
+            }
+        }
+
+        cudaSetDevice(GPUid[i]);
+        cudaMemcpyToSymbol(constants, &host_constants, sizeof(Constants), 0, cudaMemcpyHostToDevice);
+        CudaCheckErrorMod;
+        host_constants_per_gpu[i] = host_constants;
+    }
+    /*
+    CudaCheckErrorMod;
     for (int id : GPUid) {
         cudaSetDevice(id);
         cudaMemcpyToSymbol(constants, &host_constants, sizeof(Constants), 0, cudaMemcpyHostToDevice);
         CudaCheckErrorMod;
     }
+    */
+    return {host_constants_per_gpu, std::move(host_global_)};
 }
 
-template void SetupConstants<CKKS::Parameters>(const std::vector<PrimeRecord>& q,
-                                               const std::vector<std::vector<LimbRecord>>& meta,
-                                               const std::vector<PrimeRecord>& p, const std::vector<LimbRecord>& smeta,
-                                               const std::vector<std::vector<std::vector<LimbRecord>>>& DECOMPmeta,
-                                               const std::vector<std::vector<std::vector<LimbRecord>>>& DIGITmeta,
-                                               const std::vector<std::vector<int>>& digitGPUid,
-                                               const std::vector<int>& GPUid, const int N,
-                                               const CKKS::Parameters& parameters);
+template std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants<CKKS::Parameters>(
+    const std::vector<PrimeRecord>& q, const std::vector<std::vector<LimbRecord>>& meta,
+    const std::vector<PrimeRecord>& p, const std::vector<LimbRecord>& smeta,
+    const std::vector<std::vector<std::vector<LimbRecord>>>& DECOMPmeta,
+    const std::vector<std::vector<std::vector<LimbRecord>>>& DIGITmeta, const std::vector<std::vector<int>>& digitGPUid,
+    const std::vector<int>& GPUid, const int N, const CKKS::Parameters& parameters);
 
 }  // namespace FIDESlib

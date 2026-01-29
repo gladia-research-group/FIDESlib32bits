@@ -17,10 +17,14 @@ extern std::vector<FIDESlib::PrimeRecord> p32;
 extern std::vector<FIDESlib::PrimeRecord> p64;
 extern std::vector<FIDESlib::PrimeRecord> sp64;
 
-#define BATCH_CONFIG {1, 2, 3, 4, 6, 8, 12 /*, 16, 100*/}
+#define BATCH_CONFIG {100}
 
 #define LEVEL_CONFIG \
     {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30}
+
+#define PARAMETERS {3, 4, 5, 6}
+
+constexpr bool SYNC = false;
 
 struct GeneralBenchParams {
     uint64_t multDepth;
@@ -92,9 +96,22 @@ class GeneralFixture : public benchmark::Fixture {
     }
 
     void SetUp(const benchmark::State& state) override {
+        CudaCheckErrorMod;
         fideslibParams = fideslib_bench_params[state.range(1)];
         generalTestParams = general_bench_params[state.range(0)];
 
+        char* res = getenv("FIDESLIB_USE_NUM_GPUS");
+
+        if (res && !(0 == std::strcmp(res, ""))) {
+            int num_dev = atoi(res);
+            if (num_dev > 0) {
+                std::vector<int> dev;
+                for (int i = 0; i < num_dev; ++i) {
+                    dev.push_back(i);
+                }
+                generalTestParams.GPUs = dev;
+            }
+        }
         // Caché OpenFHE context.
         if (!context_map.contains(state.range(0))) {
             lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> parameters;
@@ -113,10 +130,12 @@ class GeneralFixture : public benchmark::Fixture {
             context_map[state.range(0)]->Enable(lbcrypto::FHE);
             key_map[state.range(0)] = context_map[state.range(0)]->KeyGen();
             context_map[state.range(0)]->EvalMultKeyGen(key_map[state.range(0)].secretKey);
-            context_map[state.range(0)]->EvalRotateKeyGen(key_map[state.range(0)].secretKey, {1, 2, 3, 4, 1});
+            context_map[state.range(0)]->EvalRotateKeyGen(key_map[state.range(0)].secretKey, {1, 2, 3, 4});
         }
         keys = key_map[state.range(0)];
         cc = context_map[state.range(0)];
+
+        CudaCheckErrorMod;
     }
     void SetUp(benchmark::State& state) override { SetUp(const_cast<const benchmark::State&>(state)); }
 

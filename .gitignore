@@ -4,6 +4,7 @@
 *.ptx
 *.cubin
 *.fatbin
+*.json
 
 bench/plots/figures/
 
@@ -14,3 +15,7 @@ build/
 
 .vscode/
 .idea/
+
+deps/openfhe-install/
+
+.cache/

@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 14/03/24.
 //
+#include <errno.h>
 #include <iomanip>
 
 #include <gtest/gtest.h>
@@ -41,7 +42,7 @@ TEST_P(BaseTest, ConstructVectorGPU) {
         s2.init();
         FIDESlib::VectorGPU<int> gpuvec(s, 1, i);
 
-        cudaStreamSynchronize(s.ptr);
+        cudaStreamSynchronize(s.ptr());
 
         gpuvec.free(s2);
         // implicit destruction expected now
@@ -80,10 +81,12 @@ TEST_P(BaseTest, ConstructLimb) {
     cudaGetDeviceCount(&devcount);
 
     std::vector<int> GPUs;
-    for (int i = 0; i < devcount; ++i)
+    for (int i = 0; i < devcount; ++i) {
         GPUs.push_back(i);
-
-    FIDESlib::CKKS::Context cc(fideslibParams, GPUs);
+    }
+    CudaCheckErrorMod;
+    //CKKS::ContextData data(fideslibParams, GPUs);
+    FIDESlib::CKKS::Context cc = CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     // Constructor memoria automática:
     for (int i = 0; i < devcount; ++i) {
@@ -91,10 +94,10 @@ TEST_P(BaseTest, ConstructLimb) {
         FIDESlib::Stream s;
         s.init();
 
-        FIDESlib::CKKS::Limb<uint32_t> limb(cc, i, s);
-        FIDESlib::CKKS::Limb<uint64_t> limb2(cc, i, s);
-        FIDESlib::CKKS::Limb<uint32_t> limb3(cc, i, s, 0);
-        FIDESlib::CKKS::Limb<uint64_t> limb4(cc, i, s, 1);
+        FIDESlib::CKKS::Limb<uint32_t> limb(*cc, i, s);
+        FIDESlib::CKKS::Limb<uint64_t> limb2(*cc, i, s);
+        FIDESlib::CKKS::Limb<uint32_t> limb3(*cc, i, s, 0);
+        FIDESlib::CKKS::Limb<uint64_t> limb4(*cc, i, s, 1);
 
         // implicit destruction expected now
     }
@@ -129,10 +132,10 @@ TEST_P(BaseTest, ConstructRNSPoly) {
     int devcount = -1;
     cudaGetDeviceCount(&devcount);
 
-    std::vector<int> GPUs{0};
+    std::vector<int> GPUs = devices;
     //for (int i = 0; i < devcount; ++i) GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     FIDESlib::Stream s;
@@ -143,17 +146,17 @@ TEST_P(BaseTest, ConstructRNSPoly) {
     FIDESlib::Stream s4;
 
     {
-        FIDESlib::CKKS::RNSPoly poly(cc);
+        FIDESlib::CKKS::RNSPoly poly(*cc);
         // destructor implícito
     }
 
     {
-        FIDESlib::CKKS::RNSPoly poly(cc, 2);
+        FIDESlib::CKKS::RNSPoly poly(*cc, 2);
         // destructor implícito
     }
 
     {
-        FIDESlib::CKKS::RNSPoly poly(cc, cc.L);
+        FIDESlib::CKKS::RNSPoly poly(*cc, cc->L);
         // destructor implícito
     }
 
@@ -164,17 +167,18 @@ TEST_P(BaseTest, ConstructRNSPolySimulateMultiGPU) {
 
     std::vector<int> GPUs{0, 0};
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
+    ;
 
     CudaCheckErrorMod;
 
     {
-        FIDESlib::CKKS::RNSPoly poly(cc);
+        FIDESlib::CKKS::RNSPoly poly(*cc);
         // destructor implícito
     }
 
     {
-        FIDESlib::CKKS::RNSPoly poly(cc, 2);
+        FIDESlib::CKKS::RNSPoly poly(*cc, 2);
         // destructor implícito
     }
 
@@ -182,15 +186,9 @@ TEST_P(BaseTest, ConstructRNSPolySimulateMultiGPU) {
 }
 
 TEST_P(BaseTest, ConstructCiphertext) {
+    std::vector<int> GPUs = devices;
 
-    int devcount = -1;
-    cudaGetDeviceCount(&devcount);
-
-    std::vector<int> GPUs;
-    for (int i = 0; i < devcount; ++i)
-        GPUs.push_back(i);
-
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
 

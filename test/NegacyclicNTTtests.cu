@@ -2,7 +2,6 @@
 // Created by carlosad on 12/09/24.
 //
 #include <cassert>
-#include <execution>
 #include <iomanip>
 
 #include <gtest/gtest.h>
@@ -18,6 +17,8 @@
 #include "cpuNTT.hpp"
 #include "cpuNTT_nega.hpp"
 
+constexpr bool VERBOSE = false;
+
 namespace FIDESlib::Testing {
 class NegacyclicNTTTest : public FIDESlibParametrizedTest {};
 
@@ -25,17 +26,16 @@ TEST_P(NegacyclicNTTTest, TestCpuNTT) {
     int devcount = -1;
     cudaGetDeviceCount(&devcount);
 
-    std::vector<int> GPUs;
-    for (int i = 0; i < devcount; ++i)
-        GPUs.push_back(i);
+    std::vector<int> GPUs = devices;
 
     FIDESlib::CKKS::Parameters custom = fideslibParams;
     custom.logN = 3;
     custom.primes[0].p = 17;
     custom.L = 0;
     custom.primes[0].type = FIDESlib::TYPE::U64;
-    FIDESlib::CKKS::Context cc{custom, GPUs};
-
+    CudaCheckErrorMod;
+    FIDESlib::CKKS::Context cc_ = CKKS::GenCryptoContextGPU(custom, GPUs);
+    FIDESlib::CKKS::ContextData& cc = *cc_;
     CudaCheckErrorMod;
 
     for (int l : {0}) {
@@ -72,7 +72,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTT) {
         //std::sort(res_gpu.begin(), res_gpu.end());
         //std::sort(res_cpu.begin(), res_cpu.end());
 
-        std::cout << "Polynomial multiplication\n";
+        if constexpr (VERBOSE)
+            std::cout << "Polynomial multiplication\n";
 
         std::vector<uint64_t> res(8, primeid);
 
@@ -136,7 +137,10 @@ TEST_P(NegacyclicNTTTest, TestCpuNTT_adapt_cyclic) {
     custom.primes[0].p = 17;
     custom.L = 0;
     custom.primes[0].type = FIDESlib::TYPE::U64;
-    FIDESlib::CKKS::Context cc{custom, GPUs};
+    FIDESlib::CKKS::Context cc_ = CKKS::GenCryptoContextGPU(custom, GPUs);
+    FIDESlib::CKKS::ContextData& cc = *cc_;
+    FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+    FIDESlib::Global& host_global = *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
 
     CudaCheckErrorMod;
 
@@ -187,7 +191,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTT_adapt_cyclic) {
         //std::sort(res_gpu.begin(), res_gpu.end());
         //std::sort(res_cpu.begin(), res_cpu.end());
 
-        std::cout << "Polynomial multiplication\n";
+        if constexpr (VERBOSE)
+            std::cout << "Polynomial multiplication\n";
 
         std::vector<uint64_t> res(8, 0);
 
@@ -251,7 +256,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTT2) {
     custom.primes[0].p = 97;
     custom.primes[0].type = FIDESlib::U64;
     custom.L = 0;
-    FIDESlib::CKKS::Context cc{custom, GPUs};
+    FIDESlib::CKKS::Context cc_ = CKKS::GenCryptoContextGPU(custom, GPUs);
+    FIDESlib::CKKS::ContextData& cc = *cc_;
 
     CudaCheckErrorMod;
 
@@ -286,7 +292,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTT2) {
         //std::sort(res_gpu.begin(), res_gpu.end());
         //std::sort(res_cpu.begin(), res_cpu.end());
 
-        std::cout << "Polynomial multiplication\n";
+        if constexpr (VERBOSE)
+            std::cout << "Polynomial multiplication\n";
 
         std::vector<uint64_t> res(N, 0);
 
@@ -350,7 +357,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTTBigMod) {
     custom.primes[0].p = params32_15.primes[0].p;
     custom.primes[0].type = FIDESlib::U64;
     custom.L = 0;
-    FIDESlib::CKKS::Context cc{custom, GPUs};
+    FIDESlib::CKKS::Context cc_ = CKKS::GenCryptoContextGPU(custom, GPUs);
+    FIDESlib::CKKS::ContextData& cc = *cc_;
 
     CudaCheckErrorMod;
 
@@ -388,7 +396,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTTBigMod) {
         //std::sort(res_gpu.begin(), res_gpu.end());
         //std::sort(res_cpu.begin(), res_cpu.end());
 
-        std::cout << "Polynomial multiplication\n";
+        if constexpr (VERBOSE)
+            std::cout << "Polynomial multiplication\n";
 
         std::vector<uint64_t> res(N, 0);
 
@@ -450,7 +459,8 @@ TEST_P(NegacyclicNTTTest, TestCpuNTTindependentOfN) {
     FIDESlib::CKKS::Parameters custom = fideslibParams;
     custom.logN = 16;
     custom.L = 0;
-    FIDESlib::CKKS::Context cc{custom, GPUs};
+    FIDESlib::CKKS::Context cc_ = CKKS::GenCryptoContextGPU(custom, GPUs);
+    FIDESlib::CKKS::ContextData& cc = *cc_;
 
     CudaCheckErrorMod;
 

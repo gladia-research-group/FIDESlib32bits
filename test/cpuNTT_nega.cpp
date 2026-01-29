@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <iostream>
 
+#include "CKKS/Context.cuh"
 #include "ConstantsGPU.cuh"
 #include "Math.cuh"
 #include "cpuNTT.hpp"
@@ -50,11 +51,11 @@ void FIDESlib::Testing::nega_fft(std::vector<uint64_t>& a, bool invert, const ui
                 omega = rootOfUnityTable[indexOmega];
                 for (indexLo = j1; indexLo < j2; ++indexLo) {
                     indexHi = indexLo + t;
-
+                    /*
                     if (n < 1000)
                         printf("CPU: m: %d, j1: %d, j2: %d, psi: %lu, psi_id: %d, a1: %lu, a2: %lu\n", m, indexLo,
                                indexHi, omega, indexOmega, a[indexLo], a[indexHi]);
-
+*/
                     loVal = (element)[indexLo];
                     omegaFactor = (element)[indexHi];
 
@@ -72,10 +73,11 @@ void FIDESlib::Testing::nega_fft(std::vector<uint64_t>& a, bool invert, const ui
 
                     (element)[indexLo] = hiVal;
                     (element)[indexHi] = loVal;
-
+                    /*
                     if (n < 1000)
                         printf("CPU: m: %d, j1: %d, j2: %d, psi: %lu, psi_id: %d, a1: %lu, a2: %lu\n", m, indexLo,
                                indexHi, omega, indexOmega, a[indexLo], a[indexHi]);
+*/
                 }
             }
             t >>= 1;
@@ -262,17 +264,27 @@ void FIDESlib::Testing::nega_fft2(std::vector<uint64_t>& a, bool invert, const u
 }
 
 void FIDESlib::Testing::nega_fft_forPrime(std::vector<uint64_t>& a, bool invert, int primeid, int its) {
+    /*
     std::cout << "N: " << a.size() << (invert ? "INTT" : "NTT")
               << " w: " << ((uint64_t*)hG_.psi[primeid])[a.size() >> 1]
               << " w^-1: " << ((uint64_t*)hG_.inv_psi[primeid])[a.size() >> 1] << " p: " << hC_.primes[primeid]
               << std::endl;
+   */
+    FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+    FIDESlib::Global& host_global = *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
+
     nega_fft(a, invert, ((uint64_t*)hG_.psi[primeid]), ((uint64_t*)hG_.inv_psi[primeid]), hC_.primes[primeid], its);
 }
 
 void FIDESlib::Testing::nega_fft2_forPrime(std::vector<uint64_t>& a, bool invert, int primeid, int its) {
+    /*
     std::cout << "N: " << a.size() << (invert ? "INTT" : "NTT")
               << " w: " << ((uint64_t*)hG_.psi[primeid])[a.size() >> 1]
               << " w^-1: " << ((uint64_t*)hG_.inv_psi[primeid])[a.size() >> 1] << " p: " << hC_.primes[primeid]
               << std::endl;
+    */
+    FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+    FIDESlib::Global& host_global = *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
+
     nega_fft2(a, invert, ((uint64_t*)hG_.psi[primeid]), ((uint64_t*)hG_.inv_psi[primeid]), hC_.primes[primeid], its);
 }

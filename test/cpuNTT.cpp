@@ -9,6 +9,8 @@
 #include "Math.cuh"
 #include "cpuNTT.hpp"
 
+#include "CKKS/Context.cuh"
+
 void FIDESlib::Testing::fft(std::vector<uint64_t>& a, bool invert, uint64_t root, uint64_t root_1, uint64_t mod,
                             int its) {
     int n = a.size();
@@ -49,10 +51,15 @@ void FIDESlib::Testing::fft(std::vector<uint64_t>& a, bool invert, uint64_t root
 }
 
 void FIDESlib::Testing::fft_forPrime(std::vector<uint64_t>& a, bool invert, int primeid, int its) {
-    std::cout << "N: " << a.size() << (invert ? "INTT" : "NTT")
+    /* std::cout << "N: " << a.size() << (invert ? "INTT" : "NTT")
               << " w: " << ((uint64_t*)hG_.psi[primeid])[a.size() >> 2]
               << " w^-1: " << ((uint64_t*)hG_.inv_psi[primeid])[a.size() >> 2] << " p: " << hC_.primes[primeid]
               << std::endl;
+    */
+
+    FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+    FIDESlib::Global& host_global = *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
+
     fft(a, invert, /*hG_.root[primeid]*/ ((uint64_t*)hG_.psi[primeid])[a.size() >> 2],
         /*hG_.inv_root[primeid]*/ ((uint64_t*)hG_.inv_psi[primeid])[a.size() >> 2], hC_.primes[primeid], its);
 }
@@ -64,14 +71,16 @@ void FIDESlib::Testing::fft_forPrime(std::vector<uint64_t>& a, bool invert, int 
 #define OFFSET_2T(i) ((blockDim * M) * blockIdx + blockDim * (i) + tid)
 
 void CT_butterfly(uint64_t& a, uint64_t& b, uint64_t psiaux, int primeid) {
-    uint64_t c = FIDESlib::modprod(b, psiaux, FIDESlib::host_constants.primes[primeid]);
+    uint64_t c = FIDESlib::modprod(b, psiaux, FIDESlib::CKKS::GetCurrentContext()->precom.constants[0].primes[primeid]);
     uint64_t d = a;
-    a = FIDESlib::modadd(c, d, FIDESlib::host_constants.primes[primeid]);
-    b = FIDESlib::modsub(c, d, FIDESlib::host_constants.primes[primeid]);
+    a = FIDESlib::modadd(c, d, FIDESlib::CKKS::GetCurrentContext()->precom.constants[0].primes[primeid]);
+    b = FIDESlib::modsub(c, d, FIDESlib::CKKS::GetCurrentContext()->precom.constants[0].primes[primeid]);
 }
 
 template <typename T>
 void FIDESlib::Testing::fft_2d(std::vector<T>& a, int sqrtN, int primeid) {
+    FIDESlib::Constants& host_constants = FIDESlib::CKKS::GetCurrentContext()->precom.constants[0];
+    FIDESlib::Global& host_global = *FIDESlib::CKKS::GetCurrentContext()->precom.globals;
     T* dat = a.data();
     std::vector<T> res_aux(a.size());
     T* res = res_aux.data();
@@ -120,15 +129,17 @@ void FIDESlib::Testing::fft_2d(std::vector<T>& a, int sqrtN, int primeid) {
                     T aux[2];
                     aux[0] = A[i][tid];
                     aux[1] = A[i][tid + m];
-                    A[i][tid] = modadd(aux[0], aux[1], FIDESlib::host_constants.primes[primeid]);
-                    A[i][tid + m] = modsub(aux[0], aux[1], FIDESlib::host_constants.primes[primeid]);
+                    A[i][tid] = modadd(aux[0], aux[1], hC_.primes[primeid]);
+                    A[i][tid + m] = modsub(aux[0], aux[1], hC_.primes[primeid]);
                 }
             }
         }
 
         m >>= 1;
         maskPsi |= (maskPsi >> 1);
-        int log_psi = std::bit_width((uint32_t)blockDim) - 2;  // Ojo al logaritmo.
+        // int log_psi = std::bit_width((uint32_t)blockDim) - 2;  // Ojo al logaritmo.
+        int log_psi = 32 - __builtin_clz((uint32_t)blockDim) - 2;
+
         //if(blockIdx.x == 0 && threadIdx.x == 0) printf("log_psi: %d", log_psi);
 
         for (; m >= 1; m >>= 1, log_psi--, maskPsi |= (maskPsi >> 1)) {
@@ -162,9 +173,8 @@ void FIDESlib::Testing::fft_2d(std::vector<T>& a, int sqrtN, int primeid) {
                     for (int i = 0; i < M; ++i) {
                         T aux[2];
 
-                        aux[0] = modprod(A[i][j], full_psi[OFFSET_T(i)], FIDESlib::host_constants.primes[primeid]);
-                        aux[1] =
-                            modprod(A[i][j + 1], full_psi[OFFSET_T(i) + 1], FIDESlib::host_constants.primes[primeid]);
+                        aux[0] = modprod(A[i][j], full_psi[OFFSET_T(i)], hC_.primes[primeid]);
+                        aux[1] = modprod(A[i][j + 1], full_psi[OFFSET_T(i) + 1], hC_.primes[primeid]);
                         if constexpr (sizeof(T) == 8) {
                             res[OFFSET_T(i)] = aux[0];
                             res[OFFSET_T(i) + 1] = aux[1];

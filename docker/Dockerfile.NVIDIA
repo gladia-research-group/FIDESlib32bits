@@ -1,5 +1,5 @@
 # Base image.
-FROM nvidia/cuda:12.6.2-devel-ubuntu22.04
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04
 
 # Creating scratch space
 ENV WORKDIR /scatch
@@ -56,6 +56,18 @@ RUN apt-get update \
 # CMake
 RUN pip install cmake
 
+# Install keys for AMD.
+RUN wget https://repo.radeon.com/amdgpu-install/6.2.4/ubuntu/jammy/amdgpu-install_6.2.60204-1_all.deb && \
+    apt-get install ./amdgpu-install_6.2.60204-1_all.deb && \
+    apt-get update
+
+# Install HIP for development.
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends hip-runtime-nvidia hip-dev
+
+# Set environment.
+ENV ROCM_PATH=/opt/rocm
+ENV PATH="${ROCM_PATH}/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${ROCM_PATH}/lib:${LD_LIBRARY_PATH}"
 
 # Copy FIDESlib into the container.
 ADD . /root/fideslib

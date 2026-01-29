@@ -14,7 +14,7 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchAdd)(benchmark::State& state) {
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     int n = state.range(1);
@@ -24,18 +24,18 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchAdd)(benchmark::State& state) {
     FIDESlib::Stream s;
     s.init();
 
-    std::vector<uint32_t> v(cc.N, 10);
+    std::vector<uint32_t> v(cc->N, 10);
     for (auto& i : v)
         i = rand();
-    std::vector<uint64_t> v2(cc.N, 10);
+    std::vector<uint64_t> v2(cc->N, 10);
     for (auto& i : v2)
         i = rand();
 
     std::vector<std::pair<FIDESlib::CKKS::Limb<uint32_t>, FIDESlib::CKKS::Limb<uint32_t>>> limb32;
 
     for (int i = 0; i < n; ++i) {
-        limb32.emplace_back(FIDESlib::CKKS::Limb<uint32_t>(cc, GPUs[0], s, 0),
-                            FIDESlib::CKKS::Limb<uint32_t>(cc, GPUs[0], s, 0));
+        limb32.emplace_back(FIDESlib::CKKS::Limb<uint32_t>(*cc, GPUs[0], s, 0),
+                            FIDESlib::CKKS::Limb<uint32_t>(*cc, GPUs[0], s, 0));
         limb32.back().first.load(v);
         limb32.back().second.load(v);
     }
@@ -60,7 +60,7 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchAdd64)(benchmark::State& state) {
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     int n = state.range(1);
@@ -70,18 +70,18 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchAdd64)(benchmark::State& state) {
     FIDESlib::Stream s;
     s.init();
 
-    std::vector<uint32_t> v(cc.N, 10);
+    std::vector<uint32_t> v(cc->N, 10);
     for (auto& i : v)
         i = rand();
-    std::vector<uint64_t> v2(cc.N, 10);
+    std::vector<uint64_t> v2(cc->N, 10);
     for (auto& i : v2)
         i = rand();
 
     std::vector<std::pair<FIDESlib::CKKS::Limb<uint64_t>, FIDESlib::CKKS::Limb<uint64_t>>> limb64;
 
     for (int i = 0; i < n; ++i) {
-        limb64.emplace_back(FIDESlib::CKKS::Limb<uint64_t>(cc, GPUs[0], s, 0),
-                            FIDESlib::CKKS::Limb<uint64_t>(cc, GPUs[0], s, 0));
+        limb64.emplace_back(FIDESlib::CKKS::Limb<uint64_t>(*cc, GPUs[0], s, 0),
+                            FIDESlib::CKKS::Limb<uint64_t>(*cc, GPUs[0], s, 0));
         limb64.back().first.load(v2);
         limb64.back().second.load(v2);
     }
@@ -107,7 +107,7 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchSub)(benchmark::State& state) {
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     CudaCheckErrorMod;
     int n = state.range(1);
@@ -117,18 +117,18 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchSub)(benchmark::State& state) {
     FIDESlib::Stream s;
     s.init();
 
-    std::vector<uint32_t> v(cc.N, 10);
+    std::vector<uint32_t> v(cc->N, 10);
     for (auto& i : v)
         i = rand();
-    std::vector<uint64_t> v2(cc.N, 10);
+    std::vector<uint64_t> v2(cc->N, 10);
     for (auto& i : v2)
         i = rand();
 
     std::vector<std::pair<FIDESlib::CKKS::Limb<uint32_t>, FIDESlib::CKKS::Limb<uint32_t>>> limb32;
 
     for (int i = 0; i < n; ++i) {
-        limb32.emplace_back(FIDESlib::CKKS::Limb<uint32_t>(cc, GPUs[0], s, 0),
-                            FIDESlib::CKKS::Limb<uint32_t>(cc, GPUs[0], s, 0));
+        limb32.emplace_back(FIDESlib::CKKS::Limb<uint32_t>(*cc, GPUs[0], s, 0),
+                            FIDESlib::CKKS::Limb<uint32_t>(*cc, GPUs[0], s, 0));
         limb32.back().first.load(v);
         limb32.back().second.load(v);
     }
@@ -154,7 +154,7 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchSub64)(benchmark::State& state) {
     for (int i = 0; i < devcount; ++i)
         GPUs.push_back(i);
 
-    FIDESlib::CKKS::Context cc{fideslibParams, GPUs};
+    FIDESlib::CKKS::Context cc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams, GPUs);
 
     int n = state.range(1);
     state.counters["p_limbs"] = n;
@@ -163,18 +163,18 @@ BENCHMARK_DEFINE_F(FIDESlibFixture, LimbBatchSub64)(benchmark::State& state) {
     FIDESlib::Stream s;
     s.init();
 
-    std::vector<uint32_t> v(cc.N, 10);
+    std::vector<uint32_t> v(cc->N, 10);
     for (auto& i : v)
         i = rand();
-    std::vector<uint64_t> v2(cc.N, 10);
+    std::vector<uint64_t> v2(cc->N, 10);
     for (auto& i : v2)
         i = rand();
 
     std::vector<std::pair<FIDESlib::CKKS::Limb<uint64_t>, FIDESlib::CKKS::Limb<uint64_t>>> limb64;
 
     for (int i = 0; i < n; ++i) {
-        limb64.emplace_back(FIDESlib::CKKS::Limb<uint64_t>(cc, GPUs[0], s, 0),
-                            FIDESlib::CKKS::Limb<uint64_t>(cc, GPUs[0], s, 0));
+        limb64.emplace_back(FIDESlib::CKKS::Limb<uint64_t>(*cc, GPUs[0], s, 0),
+                            FIDESlib::CKKS::Limb<uint64_t>(*cc, GPUs[0], s, 0));
         limb64.back().first.load(v2);
         limb64.back().second.load(v2);
     }

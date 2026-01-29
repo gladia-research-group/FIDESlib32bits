@@ -61,7 +61,7 @@ constexpr int msb(int par) {
     return index;
 }
 
-GeneralBenchParams gparams64_13{.multDepth = 5,
+GeneralBenchParams gparams64_13{.multDepth = 25,
                                 .scaleModSize = 36,
                                 .batchSize = 8,
                                 .ringDim = 1 << 13,
@@ -89,15 +89,15 @@ GeneralBenchParams gparams64_16{.multDepth = 29,
                                 .dnum = 4,
                                 .GPUs = {0}};
 
-GeneralBenchParams gparams64_16_boot2{.multDepth = 34,
+GeneralBenchParams gparams64_16_boot2{.multDepth = 29,
                                       .scaleModSize = 59 /*35*/,
                                       .batchSize = 8,
                                       .ringDim = 1 << 16,
-                                      .dnum = 5,
+                                      .dnum = 6,
                                       .GPUs = {0}};
 
-GeneralBenchParams gparams64_16_boot1{.multDepth = 26,
-                                      .scaleModSize = 59 /*35*/,
+GeneralBenchParams gparams64_16_boot1{.multDepth = 23,
+                                      .scaleModSize = 55,
                                       .batchSize = 8,
                                       .ringDim = 1 << 16,
                                       .dnum = 4,
@@ -110,12 +110,14 @@ GeneralBenchParams gparams32_15{.multDepth = 27,
                                 .dnum = 4,
                                 .GPUs = {0}};
 
-GeneralBenchParams gparams64_17{.multDepth = 44,
-                                .scaleModSize = 59 /*35 fails*/,
-                                .batchSize = 8,
-                                .ringDim = 1 << 17,
-                                .dnum = 3,
-                                .GPUs = {0}};
+GeneralBenchParams gparams64_17{
+    .multDepth = 23,
+    .scaleModSize = 55,
+    .batchSize = 8,
+    .ringDim = 1 << 17,
+    .dnum = 4,
+    .GPUs = {0},
+};
 
 /**  FOR THE ADDITIONAL MODES*/
 
@@ -151,16 +153,16 @@ GeneralBenchParams gparams64_16_auto{.multDepth = 29,
                                      .GPUs = {0},
                                      .tech = lbcrypto::FIXEDAUTO};
 
-GeneralBenchParams gparams64_16_boot2_auto{.multDepth = 34,
+GeneralBenchParams gparams64_16_boot2_auto{.multDepth = 29,
                                            .scaleModSize = 59 /*35*/,
                                            .batchSize = 8,
                                            .ringDim = 1 << 16,
-                                           .dnum = 5,
+                                           .dnum = 6,
                                            .GPUs = {0},
                                            .tech = lbcrypto::FIXEDAUTO};
 
-GeneralBenchParams gparams64_16_boot1_auto{.multDepth = 26,
-                                           .scaleModSize = 59 /*35*/,
+GeneralBenchParams gparams64_16_boot1_auto{.multDepth = 23,
+                                           .scaleModSize = 55 /*35*/,
                                            .batchSize = 8,
                                            .ringDim = 1 << 16,
                                            .dnum = 4,
@@ -175,11 +177,11 @@ GeneralBenchParams gparams32_15_auto{.multDepth = 27,
                                      .GPUs = {0},
                                      .tech = lbcrypto::FIXEDAUTO};
 
-GeneralBenchParams gparams64_17_auto{.multDepth = 44,
-                                     .scaleModSize = 59 /*35 fails*/,
+GeneralBenchParams gparams64_17_auto{.multDepth = 23,
+                                     .scaleModSize = 55,
                                      .batchSize = 8,
                                      .ringDim = 1 << 17,
-                                     .dnum = 3,
+                                     .dnum = 4,
                                      .GPUs = {0},
                                      .tech = lbcrypto::FIXEDAUTO};
 
@@ -215,16 +217,16 @@ GeneralBenchParams gparams64_16_flex{.multDepth = 29,
                                      .GPUs = {0},
                                      .tech = lbcrypto::FLEXIBLEAUTO};
 
-GeneralBenchParams gparams64_16_boot2_flex{.multDepth = 34,
+GeneralBenchParams gparams64_16_boot2_flex{.multDepth = 29,
                                            .scaleModSize = 59 /*35*/,
                                            .batchSize = 8,
                                            .ringDim = 1 << 16,
-                                           .dnum = 5,
+                                           .dnum = 6,
                                            .GPUs = {0},
                                            .tech = lbcrypto::FLEXIBLEAUTO};
 
-GeneralBenchParams gparams64_16_boot1_flex{.multDepth = 26,
-                                           .scaleModSize = 59 /*35*/,
+GeneralBenchParams gparams64_16_boot1_flex{.multDepth = 23,
+                                           .scaleModSize = 55 /*35*/,
                                            .batchSize = 8,
                                            .ringDim = 1 << 16,
                                            .dnum = 4,
@@ -239,11 +241,11 @@ GeneralBenchParams gparams32_15_flex{.multDepth = 27,
                                      .GPUs = {0},
                                      .tech = lbcrypto::FLEXIBLEAUTO};
 
-GeneralBenchParams gparams64_17_flex{.multDepth = 44,
-                                     .scaleModSize = 59 /*35 fails*/,
+GeneralBenchParams gparams64_17_flex{.multDepth = 23,
+                                     .scaleModSize = 55,
                                      .batchSize = 8,
                                      .ringDim = 1 << 17,
-                                     .dnum = 3,
+                                     .dnum = 4,
                                      .GPUs = {0},
                                      .tech = lbcrypto::FLEXIBLEAUTO};
 
@@ -287,8 +289,8 @@ GeneralBenchParams gparams64_16_boot2_flexext{.multDepth = 34,
                                               .GPUs = {0},
                                               .tech = lbcrypto::FLEXIBLEAUTOEXT};
 
-GeneralBenchParams gparams64_16_boot1_flexext{.multDepth = 26,
-                                              .scaleModSize = 59 /*35*/,
+GeneralBenchParams gparams64_16_boot1_flexext{.multDepth = 23,
+                                              .scaleModSize = 55 /*35*/,
                                               .batchSize = 8,
                                               .ringDim = 1 << 16,
                                               .dnum = 4,
@@ -303,11 +305,11 @@ GeneralBenchParams gparams32_15_flexext{.multDepth = 27,
                                         .GPUs = {0},
                                         .tech = lbcrypto::FLEXIBLEAUTOEXT};
 
-GeneralBenchParams gparams64_17_flexext{.multDepth = 44,
-                                        .scaleModSize = 59 /*35 fails*/,
+GeneralBenchParams gparams64_17_flexext{.multDepth = 23,
+                                        .scaleModSize = 55,
                                         .batchSize = 8,
                                         .ringDim = 1 << 17,
-                                        .dnum = 3,
+                                        .dnum = 4,
                                         .GPUs = {0},
                                         .tech = lbcrypto::FLEXIBLEAUTOEXT};
 
@@ -315,8 +317,8 @@ GeneralBenchParams gen_bench_params1 = gparams64_13;
 GeneralBenchParams gen_bench_params2 = gparams64_14;
 GeneralBenchParams gen_bench_params3 = gparams64_15;
 GeneralBenchParams gen_bench_params4 = gparams64_16;
-GeneralBenchParams gen_bench_params5 = gparams64_16_boot1;
-GeneralBenchParams gen_bench_params6 = gparams64_16_boot2;
+GeneralBenchParams gen_bench_params5 = gparams64_16_boot2;
+GeneralBenchParams gen_bench_params6 = gparams64_16_boot1;
 GeneralBenchParams gen_bench_params7 = gparams64_17;
 
 FIDESlib::CKKS::Parameters gen_bench_params1_addpted{.logN = msb(static_cast<int>(gen_bench_params1.ringDim)),
@@ -346,25 +348,24 @@ FIDESlib::CKKS::Parameters gen_bench_params4_addpted{.logN = msb(static_cast<int
 std::array<FIDESlib::CKKS::Parameters, 9> fideslib_bench_params = {params32,
                                                                    params64_16,
                                                                    gen_bench_params1_addpted,
+                                                                   gen_bench_params4_addpted,
                                                                    gen_bench_params2_addpted,
                                                                    gen_bench_params3_addpted,
-                                                                   gen_bench_params4_addpted,
                                                                    params64_13,
                                                                    params64_14,
                                                                    params64_15};
 
 std::array<GeneralBenchParams, 28> general_bench_params = {
-    gen_bench_params1,       gen_bench_params2,          gen_bench_params3,          gen_bench_params4,
-    gen_bench_params5,       gen_bench_params6,          gen_bench_params7,          gparams64_13_auto,
-    gparams64_14_auto,       gparams64_15_auto,          gparams64_16_auto,          gparams64_16_boot1_auto,
-    gparams64_16_boot2_auto, gparams64_17_auto,          gparams64_13_flex,          gparams64_14_flex,
-    gparams64_15_flex,       gparams64_16_flex,          gparams64_16_boot1_flex,    gparams64_16_boot2_flex,
+    gen_bench_params1,       gen_bench_params2,          gen_bench_params3,          gen_bench_params4,        // 0
+    gen_bench_params5,       gen_bench_params6,          gen_bench_params7,          gparams64_13_auto,        // 4
+    gparams64_14_auto,       gparams64_15_auto,          gparams64_16_auto,          gparams64_16_boot1_auto,  // 8
+    gparams64_16_boot2_auto, gparams64_17_auto,          gparams64_13_flex,          gparams64_14_flex,        // 12
+    gparams64_15_flex,       gparams64_16_flex,          gparams64_16_boot1_flex,    gparams64_16_boot2_flex,  // 16
     gparams64_17_flex,       gparams64_13_flexext,       gparams64_14_flexext,       gparams64_15_flexext,
     gparams64_16_flexext,    gparams64_16_boot1_flexext, gparams64_16_boot2_flexext, gparams64_17_flexext,
 };
 
 }  // namespace FIDESlib::Benchmarks
-
 int main(int argc, char** argv) {
 
     FIDESlib::Benchmarks::GeneralFixture::SetContext();

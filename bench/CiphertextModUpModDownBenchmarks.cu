@@ -18,7 +18,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModUp)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
     lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
@@ -36,8 +36,8 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModUp)(benchmark::State& state) {
         auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
 
         state.SetIterationTime(elapsed.count());
-        GPUct1.c0.generateSpecialLimbs();
-        GPUct1.c1.generateSpecialLimbs();
+        GPUct1.c0.generateSpecialLimbs(false, false);
+        GPUct1.c1.generateSpecialLimbs(false, false);
         GPUct1.modDown();
     }
 
@@ -56,7 +56,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModDown)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
     lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
@@ -68,8 +68,8 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModDown)(benchmark::State& state) {
     state.counters["p_batch"] = state.range(2);
     for (auto _ : state) {
         GPUct1.modUp();
-        GPUct1.c0.generateSpecialLimbs();
-        GPUct1.c1.generateSpecialLimbs();
+        GPUct1.c0.generateSpecialLimbs(false, false);
+        GPUct1.c1.generateSpecialLimbs(false, false);
         auto start = std::chrono::high_resolution_clock::now();
         GPUct1.modDown();
         CudaCheckErrorMod;
@@ -93,7 +93,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModUpModDown)(benchmark::State& sta
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
     lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1);
@@ -104,8 +104,8 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModUpModDown)(benchmark::State& sta
 
     for (auto _ : state) {
         GPUct1.modUp();
-        GPUct1.c0.generateSpecialLimbs();
-        GPUct1.c1.generateSpecialLimbs();
+        GPUct1.c0.generateSpecialLimbs(false, false);
+        GPUct1.c1.generateSpecialLimbs(false, false);
         GPUct1.modDown();
         CudaCheckErrorMod;
     }
@@ -113,8 +113,8 @@ BENCHMARK_DEFINE_F(GeneralFixture, CiphertextModUpModDown)(benchmark::State& sta
     CudaCheckErrorMod;
 }
 
-BENCHMARK_REGISTER_F(GeneralFixture, CiphertextModUp)->ArgsProduct({{0, 1, 2, 3}, {0}, BATCH_CONFIG})->UseManualTime();
-BENCHMARK_REGISTER_F(GeneralFixture, CiphertextModDown)->ArgsProduct({{0, 1, 2, 3}, {0}, BATCH_CONFIG})->UseManualTime();
-BENCHMARK_REGISTER_F(GeneralFixture, CiphertextModUpModDown)->ArgsProduct({{0, 1, 2, 3}, {0}, BATCH_CONFIG});
+BENCHMARK_REGISTER_F(GeneralFixture, CiphertextModUp)->ArgsProduct({PARAMETERS, {0}, BATCH_CONFIG})->UseManualTime();
+BENCHMARK_REGISTER_F(GeneralFixture, CiphertextModDown)->ArgsProduct({PARAMETERS, {0}, BATCH_CONFIG})->UseManualTime();
+BENCHMARK_REGISTER_F(GeneralFixture, CiphertextModUpModDown)->ArgsProduct({PARAMETERS, {0}, BATCH_CONFIG});
 
 }  // namespace FIDESlib::Benchmarks

@@ -19,7 +19,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, MultPlaintext)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
 
@@ -35,16 +35,43 @@ BENCHMARK_DEFINE_F(GeneralFixture, MultPlaintext)(benchmark::State& state) {
 
     state.counters["p_batch"] = state.range(2);
     state.counters["p_limbs"] = state.range(3);
+    CudaCheckErrorMod;
+    if constexpr (0) {
+        int its = 0;
+        for (auto _ : state) {
+            its++;
+            //auto start = std::chrono::high_resolution_clock::now();
+            GPUct1.multPt(GPUpt2, false);
+            if constexpr (SYNC)
+                CudaCheckErrorMod;
+            else if (its % 100 == 99)
+                CudaCheckErrorMod;
+            //auto end = std::chrono::high_resolution_clock::now();
+            //auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+            //state.SetIterationTime(elapsed.count());
+            //GPUct1.c0.grow(GPUct1.c0.getLevel() + 1);
+            //GPUct1.c1.grow(GPUct1.c1.getLevel() + 1);
+            GPUct1.NoiseLevel = 1;
+        }
+    }
 
-    for (auto _ : state) {
-        auto start = std::chrono::high_resolution_clock::now();
-        GPUct1.multPt(GPUpt2, true);
-        CudaCheckErrorMod;
-        auto end = std::chrono::high_resolution_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
-        state.SetIterationTime(elapsed.count());
-        GPUct1.c0.grow(GPUct1.c0.getLevel() + 1);
-        GPUct1.c1.grow(GPUct1.c1.getLevel() + 1);
+    {
+        for (int n = 1;; n *= 10) {
+            cudaDeviceSynchronize();
+            auto start = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < n; i++) {
+                GPUct1.multPt(GPUpt2, false);
+            }
+            cudaDeviceSynchronize();
+            auto end = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+            if (elapsed > std::chrono::seconds(1)) {
+                std::cout << 1000000 * elapsed.count() / n << " us" << std::endl;
+                break;
+            }
+        }
+        //state.SetIterationTime(elapsed.count());
+        //GPUct1.NoiseLevel = 2;
     }
     CudaCheckErrorMod;
 }
@@ -61,11 +88,11 @@ BENCHMARK_DEFINE_F(GeneralFixture, Rescale)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
 
-    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1, 1, state.range(3));
+    lbcrypto::Plaintext ptxt1 = cc->MakeCKKSPackedPlaintext(x1, 2, state.range(3));
 
     auto c1 = cc->Encrypt(keys.publicKey, ptxt1);
 
@@ -76,16 +103,53 @@ BENCHMARK_DEFINE_F(GeneralFixture, Rescale)(benchmark::State& state) {
     state.counters["p_batch"] = state.range(2);
     state.counters["p_limbs"] = state.range(3);
 
-    for (auto _ : state) {
-        auto start = std::chrono::high_resolution_clock::now();
-        GPUct1.rescale();
-        CudaCheckErrorMod;
-        auto end = std::chrono::high_resolution_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
-        state.SetIterationTime(elapsed.count());
-        GPUct1.c0.grow(GPUct1.c0.getLevel() + 1);
-        GPUct1.c1.grow(GPUct1.c1.getLevel() + 1);
+    CudaCheckErrorMod;
+    {
+        for (int n = 1;; n *= 10) {
+            cudaDeviceSynchronize();
+            auto start = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < n; i++) {
+                GPUct1.rescale();
+                GPUct1.c0.grow(GPUct1.c0.getLevel() + 1);
+                GPUct1.c1.grow(GPUct1.c1.getLevel() + 1);
+                GPUct1.NoiseLevel = 2;
+            }
+            cudaDeviceSynchronize();
+            auto end = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+            if (elapsed > std::chrono::seconds(1)) {
+                std::cout << 1000000 * elapsed.count() / n << " us" << std::endl;
+                break;
+            }
+        }
     }
+    //int its = 0;
+    //for (auto _ : state) {
+    //sleep(1);
+    //cudaDeviceSynchronize();
+    //its++;
+    //cudaDeviceSynchronize();
+    //auto start = std::chrono::high_resolution_clock::now();
+
+    /*
+        for (int i = 0; i < 100; ++i) {
+            GPUct1.rescale();
+            if constexpr (SYNC)
+                CudaCheckErrorMod;
+            //else if (its % 100 == 99)
+            //    cudaDeviceSynchronize();
+
+            //std::cout << "a";
+            GPUct1.c0.grow(GPUct1.c0.getLevel() + 1);
+            GPUct1.c1.grow(GPUct1.c1.getLevel() + 1);
+            //auto end = std::chrono::high_resolution_clock::now();
+            //auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+            //state.SetIterationTime(elapsed.count());
+            //GPUct1.NoiseLevel = 2;
+        }
+        */
+    //cudaDeviceSynchronize();
+    //}
     CudaCheckErrorMod;
 }
 
@@ -97,7 +161,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustAddSub)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
 
@@ -116,7 +180,10 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustAddSub)(benchmark::State& state) {
     state.counters["p_batch"] = state.range(2);
     state.counters["p_limbs"] = state.range(3);
 
+    CudaCheckErrorMod;
+    int its = 0;
     for (auto _ : state) {
+        its++;
 
         auto start = std::chrono::high_resolution_clock::now();
         if (!GPUct1.adjustForAddOrSub(GPUct2)) {
@@ -127,7 +194,10 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustAddSub)(benchmark::State& state) {
                 return;
             }
         }
-        CudaCheckErrorMod;
+        if constexpr (SYNC)
+            CudaCheckErrorMod;
+        else if (its % 100 == 99)
+            CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         state.SetIterationTime(elapsed.count());
@@ -145,7 +215,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustMult)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
 
@@ -163,8 +233,10 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustMult)(benchmark::State& state) {
 
     state.counters["p_batch"] = state.range(2);
     state.counters["p_limbs"] = state.range(3);
-
+    CudaCheckErrorMod;
+    int its = 0;
     for (auto _ : state) {
+        its++;
 
         auto start = std::chrono::high_resolution_clock::now();
         if (!GPUct1.adjustForMult(GPUct2)) {
@@ -175,7 +247,10 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustMult)(benchmark::State& state) {
                 return;
             }
         }
-        CudaCheckErrorMod;
+        if constexpr (SYNC)
+            CudaCheckErrorMod;
+        else if (its % 100 == 99)
+            CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         state.SetIterationTime(elapsed.count());
@@ -193,7 +268,7 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustPlaintext)(benchmark::State& state) {
 
     fideslibParams.batch = state.range(2);
     FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc);
-    FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), GPUs};
+    FIDESlib::CKKS::Context GPUcc = FIDESlib::CKKS::GenCryptoContextGPU(fideslibParams.adaptTo(raw_param), GPUs);
 
     std::vector<double> x1 = {0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0};
 
@@ -211,13 +286,14 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustPlaintext)(benchmark::State& state) {
 
     state.counters["p_batch"] = state.range(2);
     state.counters["p_limbs"] = state.range(3);
-
+    CudaCheckErrorMod;
+    int its = 0;
     for (auto _ : state) {
+        its++;
 
         auto start = std::chrono::high_resolution_clock::now();
-        if (GPUcc.rescaleTechnique == CKKS::Context::FLEXIBLEAUTO ||
-            GPUcc.rescaleTechnique == CKKS::Context::FLEXIBLEAUTOEXT ||
-            GPUcc.rescaleTechnique == CKKS::Context::FIXEDAUTO) {
+        if (GPUcc->rescaleTechnique == CKKS::FLEXIBLEAUTO || GPUcc->rescaleTechnique == CKKS::FLEXIBLEAUTOEXT ||
+            GPUcc->rescaleTechnique == CKKS::FIXEDAUTO) {
             if (b.c0.getLevel() != GPUct1.getLevel() || b.NoiseLevel == 2 ||
                 (b.NoiseLevel == 1 && GPUct1.NoiseLevel == 2) /*!hasSameScalingFactor(b)*/) {
                 CKKS::Plaintext b_(GPUcc);
@@ -227,7 +303,10 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustPlaintext)(benchmark::State& state) {
                 }
             }
         }
-        CudaCheckErrorMod;
+        if constexpr (SYNC)
+            CudaCheckErrorMod;
+        else if (its % 100 == 99)
+            CudaCheckErrorMod;
         auto end = std::chrono::high_resolution_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         state.SetIterationTime(elapsed.count());
@@ -238,14 +317,15 @@ BENCHMARK_DEFINE_F(GeneralFixture, AdjustPlaintext)(benchmark::State& state) {
 }
 
 BENCHMARK_REGISTER_F(GeneralFixture, MultPlaintext)
-    ->ArgsProduct({{0, 1, 2, 3}, {0}, BATCH_CONFIG, LEVEL_CONFIG})
+    ->ArgsProduct({PARAMETERS, {0}, BATCH_CONFIG, LEVEL_CONFIG})
     ->UseManualTime();
 BENCHMARK_REGISTER_F(GeneralFixture, Rescale)
-    ->ArgsProduct({{0, 1, 2, 3}, {0}, BATCH_CONFIG, LEVEL_CONFIG})
+    ->ArgsProduct({PARAMETERS, {0}, BATCH_CONFIG, LEVEL_CONFIG})
     ->UseManualTime();
 
+/*
 BENCHMARK_REGISTER_F(GeneralFixture, AdjustAddSub)
-    ->ArgsProduct({{0, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 17, 21, 22, 23, 24},
+    ->ArgsProduct({{0, 1, 2, 7, 8, 9, 10, 14, 15, 16, 17, 21, 22, 23, 24},
                    {0},
                    BATCH_CONFIG,
                    {0, 1, 2, 3},
@@ -254,7 +334,7 @@ BENCHMARK_REGISTER_F(GeneralFixture, AdjustAddSub)
                    {1, 2}})
     ->UseManualTime();
 BENCHMARK_REGISTER_F(GeneralFixture, AdjustMult)
-    ->ArgsProduct({{0, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 17, 21, 22, 23, 24},
+    ->ArgsProduct({{0, 1, 2, 7, 8, 9, 10, 14, 15, 16, 17, 21, 22, 23, 24},
                    {0},
                    BATCH_CONFIG,
                    {0, 1, 2, 3},
@@ -263,7 +343,7 @@ BENCHMARK_REGISTER_F(GeneralFixture, AdjustMult)
                    {1, 2}})
     ->UseManualTime();
 BENCHMARK_REGISTER_F(GeneralFixture, AdjustPlaintext)
-    ->ArgsProduct({{0, 1, 2, 3, 7, 8, 9, 10, 14, 15, 16, 17, 21, 22, 23, 24},
+    ->ArgsProduct({{0, 1, 2, 7, 8, 9, 10, 14, 15, 16, 17, 21, 22, 23, 24},
                    {0},
                    BATCH_CONFIG,
                    {0, 1, 2, 3},
@@ -271,5 +351,5 @@ BENCHMARK_REGISTER_F(GeneralFixture, AdjustPlaintext)
                    {0, 1, 2, 3},
                    {1, 2}})
     ->UseManualTime();
-
+*/
 }  // namespace FIDESlib::Benchmarks

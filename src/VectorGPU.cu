@@ -23,6 +23,7 @@ VectorGPU<T>::VectorGPU(T* data, const int size, const int device, const int off
     }
     CudaCheckErrorModNoSync;
     assert(size > 0);
+
     Out(MEMORY, "Unmanaged vector construct OK");
 }
 
@@ -33,20 +34,21 @@ VectorGPU<T>::~VectorGPU() {
 }
 
 template <typename T>
-void VectorGPU<T>::free(const Stream& stream) {
+void VectorGPU<T>::free(Stream& stream) {
     if (!managed) {
         return;
     }
     assert(!freeing);
-    cudaFreeAsync((void*)data, stream.ptr);
+    //cudaDeviceSynchronize();
+    GPUfree(data, device, sizeof(T) * size, stream.ptr(), true);
+    //cudaFreeAsync((void*)data, stream.ptr());
     freeing = true;
     Out(MEMORY, "Managed vector free OK");
 }
 
 template <typename T>
-VectorGPU<T>::VectorGPU(const Stream& stream, const int size, const int device, const T* src)
+VectorGPU<T>::VectorGPU(Stream& stream, const int size, const int device, const T* src)
     : data(nullptr), size(size), device(device), freeing(false), managed(true) {
-    assert(size > 0);
     assert(device >= 0);
     {
         int device_count = -1;
@@ -60,16 +62,26 @@ VectorGPU<T>::VectorGPU(const Stream& stream, const int size, const int device, 
         //cudaSetDevice(device);
     }
     int bytes = size * sizeof(T);
-    cudaMallocAsync(&data, bytes, stream.ptr);
-    if (src != nullptr) {
-        cudaMemcpyAsync(data, src, bytes, cudaMemcpyHostToDevice, stream.ptr);
-    }
 
+    if (size == 0) {
+        managed = false;
+        freeing = true;
+    } else {
+        //cudaDeviceSynchronize();
+        data = (T*)GPUmalloc(device, bytes, stream.ptr(), true);
+        //cudaDeviceSynchronize();
+        //cudaMallocAsync(&data, bytes, stream.ptr());
+
+        if (src != nullptr) {
+            cudaMemcpyAsync(data, src, bytes, cudaMemcpyHostToDevice, stream.ptr());
+        }
+    }
     Out(MEMORY, "Managed vector construct OK");
 }
 
 template class VectorGPU<int>;
 template class VectorGPU<void*>;
+template class VectorGPU<void**>;
 template class VectorGPU<uint32_t>;
 template class VectorGPU<uint64_t>;
 }  // namespace FIDESlib

@@ -79,24 +79,24 @@ __global__ void sub_(void** a, void** b, void** c, const int primeid_init) {
 }
 
 __global__ void scalar_add_(void** a, uint64_t* b, const int primeid_init) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
-
+    
     if (ISU64(primeid)) {
-        ((uint64_t*)a[blockIdx.y])[idx] = modadd(((uint64_t*)a[blockIdx.y])[idx], b[blockIdx.y], primeid);
+        ((uint64_t*)a[blockIdx.y])[idx] = modadd(((uint64_t*)a[blockIdx.y])[idx], b[primeid], primeid);
     } else {
-        ((uint32_t*)a[blockIdx.y])[idx] = modadd(((uint32_t*)a[blockIdx.y])[idx], (uint32_t)b[blockIdx.y], primeid);
+        ((uint32_t*)a[blockIdx.y])[idx] = modadd(((uint32_t*)a[blockIdx.y])[idx], (uint32_t)b[primeid], primeid);
     }
 }
 
 __global__ void scalar_sub_(void** a, uint64_t* b, const int primeid_init) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
     const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
 
     if (ISU64(primeid)) {
-        ((uint64_t*)a[blockIdx.y])[idx] = modsub(((uint64_t*)a[blockIdx.y])[idx], b[blockIdx.y], primeid);
+        ((uint64_t*)a[blockIdx.y])[idx] = modsub(((uint64_t*)a[blockIdx.y])[idx], b[primeid], primeid);
     } else {
-        ((uint32_t*)a[blockIdx.y])[idx] = modsub(((uint32_t*)a[blockIdx.y])[idx], (uint32_t)b[blockIdx.y], primeid);
+        ((uint32_t*)a[blockIdx.y])[idx] = modsub(((uint32_t*)a[blockIdx.y])[idx], (uint32_t)b[primeid], primeid);
     }
 }
 
