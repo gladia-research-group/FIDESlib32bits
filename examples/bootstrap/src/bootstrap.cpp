@@ -93,11 +93,10 @@ void SimpleBootstrapExample() {
 
 	auto keyPair = cryptoContext->KeyGen();
 	cryptoContext->EvalMultKeyGen(keyPair.secretKey);
-	
-	cryptoContext->LoadContext(keyPair.publicKey);
-
 	cryptoContext->EvalBootstrapSetup(levelBudget, { 0, 0 }, numSlots, 0);
-	cryptoContext->EvalBootstrapKeyGen(keyPair, numSlots);
+	cryptoContext->EvalBootstrapKeyGen(keyPair.secretKey, numSlots);
+
+	cryptoContext->LoadContext(keyPair.publicKey);
 
 	std::vector<double> x = { 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0 };
 	size_t encodedLength  = x.size();
@@ -124,7 +123,7 @@ void SimpleBootstrapExample() {
 void BootstrapExample(uint32_t numSlots) {
 	CCParams<CryptoContextCKKSRNS> parameters;
 
-	SecretKeyDist secretKeyDist = SPARSE_TERNARY;
+	SecretKeyDist secretKeyDist = UNIFORM_TERNARY;
 	parameters.SetSecretKeyDist(secretKeyDist);
 	parameters.SetSecurityLevel(HEStd_NotSet);
 	parameters.SetRingDim(1 << 12);
@@ -166,11 +165,10 @@ void BootstrapExample(uint32_t numSlots) {
 
 	auto keyPair = cryptoContext->KeyGen();
 	cryptoContext->EvalMultKeyGen(keyPair.secretKey);
-	
-	cryptoContext->LoadContext(keyPair.publicKey);
-
 	cryptoContext->EvalBootstrapSetup(levelBudget, bsgsDim, numSlots, 0);
-	cryptoContext->EvalBootstrapKeyGen(keyPair, numSlots);
+	cryptoContext->EvalBootstrapKeyGen(keyPair.secretKey, numSlots);
+
+	cryptoContext->LoadContext(keyPair.publicKey);
 
 	std::vector<double> x;
 	std::random_device rd;
@@ -248,11 +246,10 @@ void BootstrapExampleSSE(uint32_t numSlots) {
 
 	auto keyPair = cryptoContext->KeyGen();
 	cryptoContext->EvalMultKeyGen(keyPair.secretKey);
-	
-	cryptoContext->LoadContext(keyPair.publicKey);
-	
 	cryptoContext->EvalBootstrapSetup(levelBudget, bsgsDim, numSlots, 0);
-	cryptoContext->EvalBootstrapKeyGen(keyPair, numSlots);
+	cryptoContext->EvalBootstrapKeyGen(keyPair.secretKey, numSlots);
+
+	cryptoContext->LoadContext(keyPair.publicKey);
 
 	std::vector<double> x;
 	std::random_device rd;

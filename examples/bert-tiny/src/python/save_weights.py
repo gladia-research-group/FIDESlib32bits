@@ -1,43 +1,30 @@
-from transformers import BertForSequenceClassification, BertTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import numpy as np
-from datasets import load_dataset
-import pandas as pd
-import torch
-import os
 
-tokenizer = BertTokenizer.from_pretrained("prajjwal1/bert-tiny", use_fast=False)
-model = BertForSequenceClassification.from_pretrained("prajjwal1/bert-tiny")
-
-trained = torch.load('SST-2-BERT-tiny.bin', map_location=torch.device('cpu'))
-model.load_state_dict(trained , strict=False)
+tokenizer = AutoTokenizer.from_pretrained("Intel/bert-base-uncased-mrpc")
+model = AutoModelForSequenceClassification.from_pretrained("Intel/bert-base-uncased-mrpc")
 model.eval()
 
+import os 
 # Output directory
-output_dir = "../../weights/weights-bert-tiny-sst2"
+output_dir = "weights-bert-base"
 os.makedirs(output_dir, exist_ok=True)
-
-# Load SST-2 dataset
-dataset = load_dataset("glue", "sst2", split="validation")
-df = dataset.to_pandas()
-df.to_csv(output_dir + "/sst2_validation.csv", index=False)
 
 def save(name, array):
     path = os.path.join(output_dir, f"{name}.txt")
     np.savetxt(path, array, fmt="%.12f")
 
-save("tokens_sst2", np.zeros((4,4)))    # dummy file for tokens
-
 # For layers 0 and 1
-for i in range(2):
+for i in range(12):
     prefix = f"layer{i}_"
     layer = model.bert.encoder.layer[i]
 
     # Attention weights (transposed)
     Wq = layer.attention.self.query.weight.detach().numpy().T
-    Wk = layer.attention.self.key.weight.detach().numpy().T / 128.0 # Softmax scale
+    Wk = layer.attention.self.key.weight.detach().numpy().T 
     Wv = layer.attention.self.value.weight.detach().numpy().T
     bq = layer.attention.self.query.bias.detach().numpy().reshape(-1, 1).T
-    bk = layer.attention.self.key.bias.detach().numpy().reshape(-1, 1).T / 128.0 # Softmax scale
+    bk = layer.attention.self.key.bias.detach().numpy().reshape(-1, 1).T
     bv = layer.attention.self.value.bias.detach().numpy().reshape(-1, 1).T
 
     save(prefix + "Wq", Wq)
@@ -54,9 +41,9 @@ for i in range(2):
     save(prefix + "bo", bo)
 
     # # Feed-forward layers (intermediate and output)
-    Wff1 = layer.intermediate.dense.weight.detach().numpy().T / 20.0  # Chebyshev scale
-    bff1 = layer.intermediate.dense.bias.detach().numpy().reshape(-1, 1).T / 20.0   # Chebyshev scale
-    Wff2 = layer.output.dense.weight.detach().numpy().T *20
+    Wff1 = layer.intermediate.dense.weight.detach().numpy().T
+    bff1 = layer.intermediate.dense.bias.detach().numpy().reshape(-1, 1).T
+    Wff2 = layer.output.dense.weight.detach().numpy().T
     bff2 = layer.output.dense.bias.detach().numpy().reshape(-1, 1).T
 
     save(prefix + "Wu", Wff1)
@@ -82,8 +69,8 @@ bp = model.bert.pooler.dense.bias.detach().numpy().reshape(-1, 1).T
 save("Wp", Wp)
 save("bp", bp)
 
-Wc = model.classifier.weight.detach().numpy()
-bc = model.classifier.bias.detach().numpy().reshape(-1, 1)
+Wc = model.classifier.weight.detach().numpy().T
+bc = model.classifier.bias.detach().numpy().reshape(-1, 1).T
 
 save("Wc", Wc)
 save("bc", bc)

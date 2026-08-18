@@ -21,6 +21,7 @@ template <> class CiphertextImpl<DCRTPoly> {
 
 	CiphertextImpl(const CiphertextImpl<DCRTPoly>&);
 	CiphertextImpl(const Ciphertext<DCRTPoly>&);
+	CiphertextImpl(const CiphertextImpl<DCRTPoly>&, bool lazy_cpu_shadow);
 	CiphertextImpl& operator=(const CiphertextImpl<DCRTPoly>&) = delete;
 	CiphertextImpl& operator=(const Ciphertext<DCRTPoly>&)	   = delete;
 
@@ -42,11 +43,9 @@ template <> class CiphertextImpl<DCRTPoly> {
 	// ---- Setters ----
 	void SetSlots(size_t slots);
 	void SetLevel(size_t level);
-	void EnsureLazyCPUCopy();
 
 	// ---- Internal State ----
 
-	bool need_lazy_copy = false;
 	std::any cpu;
 	uint32_t gpu = 0;
 	/// @brief Flag indicating whether the ciphertext is loaded to the devices.

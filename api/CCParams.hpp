@@ -34,6 +34,8 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 
 	void SetMultiplicativeDepth(uint32_t depth);
 	void SetScalingModSize(uint32_t size);
+	void SetScalingModSizePerLevel(std::vector<uint32_t> sizes);
+	void SetCKKSDataTypeComplex();
 	void SetBatchSize(uint32_t size);
 	void SetRingDim(uint32_t dim);
 	void SetScalingTechnique(ScalingTechnique tech);
@@ -58,7 +60,7 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	// ---- Internal State ----
 
 	std::any cpu;
-	std::vector<int> devices = { };
+	std::vector<int> devices = { 0 };
 	SecretKeyDist keyDist	 = UNIFORM_TERNARY;
 	bool plaintextAutoload	 = false;
 	bool ciphertextAutoload	 = true;

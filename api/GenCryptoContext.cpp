@@ -20,6 +20,11 @@ CryptoContext<DCRTPoly> GenCryptoContext(CCParams<CryptoContextCKKSRNS>& params)
 	context.auto_load_plaintexts	 = params.plaintextAutoload;
 	context.auto_load_ciphertexts	 = params.ciphertextAutoload;
 	context.multiplicative_depth	 = impl_params.GetMultiplicativeDepth();
+	context.device_plaintexts_mutex	 = std::make_unique<std::shared_mutex>();
+	context.device_ciphertexts_mutex = std::make_unique<std::shared_mutex>();
+	context.plaintext_ready_events_mutex = std::make_unique<std::shared_mutex>();
+	context.offloaded_ciphertexts_mutex = std::make_unique<std::shared_mutex>();
+	context.prefetched_raw_mutex	 = std::make_unique<std::shared_mutex>();
 	context.keyDist					 = params.keyDist;
 	auto ptr						 = std::make_shared<CryptoContextImpl<DCRTPoly>>(std::move(context));
 	ptr->self_reference				 = std::weak_ptr<CryptoContextImpl<DCRTPoly>>(ptr);

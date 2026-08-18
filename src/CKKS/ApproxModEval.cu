@@ -6,6 +6,8 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CudaUtils.cuh"
+#include <atomic>
+#include <cstdlib>
 #if defined(__clang__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
@@ -19,7 +21,80 @@ constexpr bool PRINT = false;
 using namespace FIDESlib::CKKS;
 
 void evalChebyshevSeries(Ciphertext& ctxt, const KeySwitchingKey& keySwitchingKey, std::vector<double>& coefficients, double lower_bound, double upper_bound);
-void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey& kskEval);
+void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey& kskEval, double outScale = 1.0);
+
+// Arcsine correction (FIDESLIB_ARCSINE=1, coefficient override FIDESLIB_ARCSINE_C3):
+// u = asin(2*pi*y)/(2*pi) ~= y*(1 + (2*pi)^2/6 * y^2) cancels the EvalMod
+// sine-linearization cubic so correction_factor can stay ~0 at small scales.
+// Runtime scoping: setArcsineOverride(1/0) forces on/off (-1 restores the env
+// default) so a caller (cutmax argmax) can enable it per-region while the rest
+// of the pipeline bootstraps arcsine-free. The context must have the levels
+// reserved at build (FIDESLIB_ARCSINE or FIDESLIB_ARCSINE_RESERVE).
+static std::atomic<int>& arcsineOverride() {
+	static std::atomic<int> v{ -1 };
+	return v;
+}
+void FIDESlib::CKKS::setArcsineOverride(int v) {
+	arcsineOverride().store(v, std::memory_order_relaxed);
+}
+static bool arcsineEnabled() {
+	const int o = arcsineOverride().load(std::memory_order_relaxed);
+	if (o >= 0)
+		return o != 0;
+	static const bool v = [] {
+		const char* e = std::getenv("FIDESLIB_ARCSINE");
+		return e && *e && *e != '0';
+	}();
+	return v;
+}
+
+// FIDESLIB_SPARSE_ARCSINE = dual-slots mode: arcsine reservation+correction
+// live ONLY on sparse-slot precomps (approxModReductionSparse); the full-slot
+// (dense) path never applies it. Removes the reserve/consume mismatch surface
+// entirely (mismatch in either direction is fatal, job 48603930).
+static bool sparseArcsineMode() {
+	static const bool v = [] {
+		const char* e = std::getenv("FIDESLIB_SPARSE_ARCSINE");
+		return e && *e && *e != '0';
+	}();
+	return v;
+}
+
+// FIDESLIB_SPARSE_BTS_BIAS=eps: deliberate (1-eps) multiplicative output bias on the
+// SPARSE precomp only, folded into the Chebyshev coeffs (x S^(1/2^r)) + the double-angle
+// constants (x S^(2^(j-r))) — zero extra ops/levels, dense path untouched. Restores the
+// dense EvalMod's structured-value downward bias that the accurate sparse path loses
+// (softmax/LN Goldschmidt band-edge margin — the T=128 sparse decode cliff).
+static double sparseBtsBias() {
+	static const double v = [] {
+		const char* e = std::getenv("FIDESLIB_SPARSE_BTS_BIAS");
+		return (e && *e) ? std::atof(e) : 0.0;
+	}();
+	return v;
+}
+
+static double arcsineC3() {
+	static const double v = [] {
+		const char* e = std::getenv("FIDESLIB_ARCSINE_C3");
+		return (e && *e) ? std::atof(e) : (2.0 * M_PI) * (2.0 * M_PI) / 6.0;
+	}();
+	return v;
+}
+
+static void applyArcsineCorrection(Ciphertext& y) {
+	const int lvl_in = static_cast<int>(y.getLevel());
+	Ciphertext t(y.cc_);
+	t.square(y, false);
+	t.multScalar(arcsineC3(), false);
+	t.addScalar(1.0);
+	y.mult(t, false);
+	static const bool logged = [&] {
+		std::cout << "[arcsine] engaged C3=" << arcsineC3() << " level " << lvl_in << "->" << y.getLevel()
+				  << std::endl;
+		return true;
+	}();
+	(void)logged;
+}
 
 void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey, uint64_t post) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
@@ -29,7 +104,7 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 		std::cout << "Approx mod red start " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
 
 	bool constexpr COMPLEX = true;
-	ContextData& cc        = ctxtEnc.cc;
+	ContextData& cc		   = ctxtEnc.cc;
 
 	if constexpr (COMPLEX)
 		evalChebyshevSeries(ctxtEncI, cc.GetCoeffsChebyshev(), -1.0, 1.0);
@@ -53,6 +128,11 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
 	if constexpr (COMPLEX)
 		applyDoubleAngleIterations(ctxtEncI, cc.GetDoubleAngleIts(), keySwitchingKey);
+	if (!sparseArcsineMode() && arcsineEnabled()) {
+		applyArcsineCorrection(ctxtEnc);
+		if constexpr (COMPLEX)
+			applyArcsineCorrection(ctxtEncI);
+	}
 	if constexpr (PRINT) {
 		std::cout << "ctxtEnc DA res " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
 		for (auto& i : ctxtEnc.c0.GPU.at(0).limb) {
@@ -77,7 +157,8 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 	if constexpr (!COMPLEX)
 		ctxtEnc.add(ctxtEnc);
 	// cudaDeviceSynchronize();
-	multIntScalar(ctxtEnc, post);
+	if (post != 1)
+		multIntScalar(ctxtEnc, post);
 	if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
 		ctxtEnc.rescale();
 	// cudaDeviceSynchronize();
@@ -97,7 +178,23 @@ void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post
 
 	KeySwitchingKey& keySwitchingKey = cc.GetEvalKey(ctxtEnc.keyID);
 
-	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), (double)-1.0, (double)1.0);
+	const double S = 1.0 - sparseBtsBias();
+	if (S != 1.0) {
+		const int r	   = cc.GetDoubleAngleIts();
+		const double t = std::pow(S, std::ldexp(1.0, -r));
+		std::vector<double> scaled = cc.GetCoeffsChebyshev();
+		for (auto& a : scaled)
+			a *= t;
+		static const bool logged = [&] {
+			std::cout << "[sparse_bts_bias] engaged eps=" << sparseBtsBias() << " S=" << S << " r=" << r
+					  << " cheb_pre=" << t << std::endl;
+			return true;
+		}();
+		(void)logged;
+		evalChebyshevSeries(ctxtEnc, scaled, (double)-1.0, (double)1.0);
+	} else {
+		evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), (double)-1.0, (double)1.0);
+	}
 
 	if constexpr (PRINT) {
 		std::cout << "ctxtEnc res " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
@@ -107,7 +204,11 @@ void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post
 		}
 		std::cout << std::endl;
 	}
-	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey, S);
+	// dual-slots mode: this precomp carries the +3 reservation — the
+	// correction MUST run unconditionally (reserve-without-consume is fatal)
+	if (sparseArcsineMode() || arcsineEnabled())
+		applyArcsineCorrection(ctxtEnc);
 	if constexpr (PRINT) {
 		std::cout << "ctxtEnc DA " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
 		for (auto& i : ctxtEnc.c0.GPU.at(0).limb) {
@@ -116,7 +217,8 @@ void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post
 		}
 		std::cout << std::endl;
 	}
-	multIntScalar(ctxtEnc, post);
+	if (post != 1)
+		multIntScalar(ctxtEnc, post);
 	if constexpr (PRINT) {
 		std::cout << "ctxtEnc final " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
 		for (auto& i : ctxtEnc.c0.GPU.at(0).limb) {
@@ -136,14 +238,14 @@ void FIDESlib::CKKS::multIntScalar(Ciphertext& ctxt, uint64_t op) {
 }
 
 void innerEvalChebyshevPS(const Ciphertext& ctxt,
-                          Ciphertext& out,
-                          const std::vector<double>& coefficients,
-                          const uint32_t k,
-                          uint32_t m,
-                          const std::vector<Ciphertext*>& T,
-                          const std::vector<Ciphertext*>& T2,
-                          int level_offset = 0,
-                          int max_m        = 1000) {
+  Ciphertext& out,
+  const std::vector<double>& coefficients,
+  const uint32_t k,
+  uint32_t m,
+  const std::vector<Ciphertext*>& T,
+  const std::vector<Ciphertext*>& T2,
+  int level_offset = 0,
+  int max_m		   = 1000) {
 	FIDESlib::CudaNvtxRange r(std::string{ sc::current().function_name() });
 	/*
 Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DCRTPoly> x,
@@ -152,7 +254,7 @@ Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DC
 															  std::vector<Ciphertext<DCRTPoly>>& T2) const {
 */
 	FIDESlib::CKKS::Context& cc_ = ctxt.cc_;
-	ContextData& cc              = ctxt.cc;
+	ContextData& cc				 = ctxt.cc;
 
 	/// Left AS IS ///
 	// Compute k*2^{m-1}-k because we use it a lot
@@ -190,8 +292,8 @@ Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DC
 	if constexpr (true) {
 		// Evaluate c at u
 		Ciphertext& cu = out;
-		uint32_t dc    = lbcrypto::Degree(divcs->q);
-		bool flag_c    = false;
+		uint32_t dc	   = lbcrypto::Degree(divcs->q);
+		bool flag_c	   = false;
 		if (dc >= 1) {
 			if (dc == 1) {
 				if (divcs->q[1] != 1) {
@@ -325,7 +427,7 @@ Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DC
 				su.growToLevel(T2[m - 1]->getLevel() + (T2[m - 1]->NoiseLevel == 1 ? 1 : 0) - 1 - level_offset);
 				su.dropToLevel(T2[m - 1]->getLevel() + (T2[m - 1]->NoiseLevel == 1 ? 1 : 0) - 1 - level_offset);
 
-				su.evalLinearWSumMutable(/*lbcrypto::Degree(scopy)*/ ctxs.size(), ctxs, weights);
+				su.evalLinearWSumMutable(/*lbcrypto::Degree(scopy)*/ ctxs.size(), T, weights);
 				// adds the free term (at x^0)
 				su.addScalar(s2.front() / 2);
 
@@ -350,8 +452,7 @@ Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DC
 		if (flag_c) {
 			if (max_m - m <= 1)
 				T2[m - 1]->adjustForAddOrSub(
-					cu);
-			// For m > 3, the required levels for the recursive cu component are not strictly decreasing, caching is needed, for which the benefit is uncertain
+				  cu); // For m > 3, the required levels for the recursive cu component are not strictly decreasing, caching is needed, for which the benefit is uncertain
 			if (T2[m - 1]->NoiseLevel == 1 && cu.NoiseLevel == 2)
 				cu.rescale();
 			cu.add(*T2[m - 1]);
@@ -374,22 +475,9 @@ void FIDESlib::CKKS::evalChebyshevSeries(Ciphertext& ctxt, std::vector<double>& 
 	Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::EvalChebyshevSeriesPS(ConstCiphertext<DCRTPoly> x,
 const std::vector<double>& coefficients, double a, double b) const {
 	*/
-
-	if (abs(lower_bound + 1.0) > 1e-9 || abs(upper_bound - 1.0) > 1e-9) {
-		if (abs(upper_bound - lower_bound - 2.0) < 1e-8) {
-			ctxt.addScalar(-lower_bound + 1.0);
-		} else {
-			if (abs(lower_bound + upper_bound) > 1e-8)
-				ctxt.addScalar(-(upper_bound - lower_bound) / 2.0); // center on 0 (substract mean)
-			if (ctxt.cc.rescaleTechnique == CKKS::FIXEDMANUAL && ctxt.NoiseLevel == 2)
-				ctxt.rescale();
-			ctxt.multScalar(2.0 / (upper_bound - lower_bound));
-		}
-	}
-
 	constexpr bool sync = false;
 
-	uint32_t n             = lbcrypto::Degree(coefficients);
+	uint32_t n			   = lbcrypto::Degree(coefficients);
 	std::vector<double> f2 = coefficients;
 	f2.resize(n + 1);
 	/*
@@ -401,8 +489,8 @@ const std::vector<double>& coefficients, double a, double b) const {
 	*/
 
 	std::vector<uint32_t> degs = lbcrypto::ComputeDegreesPS(n);
-	uint32_t k                 = degs[0];
-	uint32_t m                 = degs[1];
+	uint32_t k				   = degs[0];
+	uint32_t m				   = degs[1];
 	if (false) {
 		if (n <= 36) {
 			k = 12;
@@ -422,7 +510,7 @@ const std::vector<double>& coefficients, double a, double b) const {
 	//        (std::round(lower_bound) == -1) && (std::round(upper_bound) == 1));
 
 	FIDESlib::CKKS::Context& cc_ = ctxt.cc_;
-	ContextData& cc              = ctxt.cc;
+	ContextData& cc				 = ctxt.cc;
 	/*
 	std::vector<Ciphertext> T_;
 	T_.emplace_back(cc);
@@ -441,10 +529,10 @@ const std::vector<double>& coefficients, double a, double b) const {
 
 	std::vector<Ciphertext*> T(k);
 	for (uint32_t i = 0; i < k; ++i)
-		T[i]        = &aux[i];
+		T[i] = &aux[i];
 	std::vector<Ciphertext*> T2(m);
 	for (uint32_t i = 0; i < m; i++)
-		T2[i]       = &aux[i + k];
+		T2[i] = &aux[i + k];
 	/*
 	std::vector<Ciphertext*> T(k);
 	for (uint32_t i = 0; i < k; ++i)
@@ -590,7 +678,7 @@ const std::vector<double>& coefficients, double a, double b) const {
 	if (cryptoParams->GetScalingTechnique() == FIXEDMANUAL) {
 		// brings all powers of x to the same level
 		for (size_t i = 1; i < k; i++) {
-			uint32_t levelDiff = T[k - 1]->GetLevel() - T[i - 1]->GetLevel();
+			usint levelDiff = T[k - 1]->GetLevel() - T[i - 1]->GetLevel();
 			cc->LevelReduceInPlace(T[i - 1], nullptr, levelDiff);
 		}
 	} else {
@@ -721,18 +809,73 @@ const std::vector<double>& coefficients, double a, double b) const {
 		cudaDeviceSynchronize();
 }
 
-void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey& kskEval) {
+void FIDESlib::CKKS::evalHornerSeries(Ciphertext& ctxt, const std::vector<double>& coefficients) {
+	FIDESlib::CudaNvtxRange r(std::string{ sc::current().function_name() });
+
+	int n = (int)coefficients.size() - 1;
+	if (n < 0) return;
+
+	FIDESlib::CKKS::Context& cc_ = ctxt.cc_;
+	ContextData& cc				 = ctxt.cc;
+
+	if (n == 0) {
+		ctxt.multScalar(0.0);
+		ctxt.addScalar(coefficients[0]);
+		return;
+	}
+
+	// acc = c_n * x + c_{n-1}  (scalar ops, 0 levels consumed)
+	Ciphertext acc(cc_);
+	acc.copy(ctxt);
+	if (acc.NoiseLevel == 2) acc.rescale();
+	acc.multScalar(coefficients[n]);
+	acc.addScalar(coefficients[n - 1]);
+
+	// acc = acc * x + c_i  (1 ctxt-ctxt mult per step)
+	for (int i = n - 2; i >= 0; i--) {
+		Ciphertext x_tmp(cc_);
+		x_tmp.copy(ctxt);
+		acc.adjustForMult(x_tmp);
+		x_tmp.adjustForMult(acc);
+		acc.mult(acc, x_tmp, false);
+		if (cc.rescaleTechnique == FIXEDMANUAL && acc.NoiseLevel == 2)
+			acc.rescale();
+		acc.addScalar(coefficients[i]);
+	}
+
+	ctxt.copy(acc);
+}
+
+// FIDESLIB_DA_FOLD=k folds the 2^k correction recovery into the LAST double-angle
+// iteration's constants (Y = 2^k*y: Y = 2*2^k*y^2 + 2^k*d). Signal exits the DA
+// already amplified, so StC/final-stage noise is NOT amplified by the recovery —
+// pair with FIDESLIB_SKIP_CORFACTOR=1 and correction_factor = k + deg.
+static int daFoldBits() {
+	static const int v = [] {
+		const char* e = std::getenv("FIDESLIB_DA_FOLD");
+		return e ? std::atoi(e) : 0;
+	}();
+	return v;
+}
+
+void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey& kskEval, double outScale) {
 	FIDESlib::CudaNvtxRange r_(std::string{ sc::current().function_name() });
 	ContextData& cc = ctxt.cc;
-	int32_t r       = its;
+	int32_t r		= its;
 	// std::cout << "Its: " << its << std::endl;
 	for (int32_t j = 1; j < r + 1; j++) {
 		if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
 			ctxt.rescale();
 		ctxt.square(false);
-		ctxt.add(ctxt);
-		double scalar = -1.0 / std::pow((2.0 * M_PI), std::pow(2.0, j - r));
-		ctxt.addScalar(scalar);
+		double scalar = -1.0 / std::pow((2.0 * M_PI) / outScale, std::pow(2.0, j - r));
+		if (daFoldBits() && j == r) {
+			const double s = std::pow(2.0, daFoldBits());
+			ctxt.multScalar(2.0 * s, false);
+			ctxt.addScalar(scalar * s);
+		} else {
+			ctxt.add(ctxt);
+			ctxt.addScalar(scalar);
+		}
 
 		// cudaDeviceSynchronize();
 	}
