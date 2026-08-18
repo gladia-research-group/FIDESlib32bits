@@ -4,59 +4,65 @@ namespace fs = std::filesystem;
 using namespace FIDESlib::CKKS;
 
 int main(const int argc, char** argv) {
-	init_devices_from_env(); // Read GPU count from FIDESLIB_NUM_GPUS env var
-	read_ring_dim();			// Read ring dimension from FIDESLIB_RING_DIM env var (default to 16 if not set)
 
-	// ----- Dataset + model paths -----
-	const fs::path model_path_fs = fs::path(root_dir) / "weights/weights-bert-tiny-sst2";
-	std::string model_path		 = model_path_fs.string();
+    // ----- Dataset + model paths -----
+    const std::string dataset = "sst2";
 
-	// Pre-tokenized samples directory
-	const fs::path pretokenized_path = model_path_fs / "pretokenized";
+    std::string model_name = "bert-tiny-" + dataset;
+    const fs::path model_path_fs = fs::path(root_dir) / ("weights/weights-" + model_name);
+    std::string model_path = model_path_fs.string();
 
-	// Dummy tokens file (for ct_tokens template)
-	const fs::path tokens_path = model_path_fs / "tokens_sst2.txt";
+    std::string tokens_file   = "tokens_" + dataset + ".txt";
+    const fs::path tokens_path = model_path_fs / tokens_file;
 
-	// ----- Output path -----
-	std::string output_path = "all_out.txt";
-	std::ofstream outFile(output_path);
-	if (!outFile.is_open()) {
-		std::cerr << "Error: could not create file " << output_path << std::endl;
-		return 1;
-	}
-	outFile.close();
+    std::string val_csv_file  = dataset + "_validation.csv";
+    const fs::path val_csv_path = model_path_fs / val_csv_file;
 
-	create_cpu_context();
-	lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys = cc->KeyGen();
-	keys_									   = keys;
-	const int numSlots						   = static_cast<int>(cc->GetEncodingParams()->GetBatchSize());
-	const int blockSize						   = static_cast<int>(sqrt(numSlots));
-	EncoderConfiguration conf{ .numSlots = numSlots, .blockSize = blockSize, .token_length = 63 };
+    std::string path = val_csv_path.string();
 
-	FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc, FIDESlib::ENCAPS);
-	FIDESlib::CKKS::Context cc_			= FIDESlib::CKKS::GenCryptoContextGPU(params.adaptTo(raw_param), devices);
-	FIDESlib::CKKS::ContextData& GPUcc	= *cc_;
-	prepare_cpu_context(cc_, keys, conf.numSlots, conf.blockSize, conf);
-	prepare_gpu_context_bert(cc_, keys, conf);
+    // ----- Output path -----
+    std::string outputBase = ".";
+    fs::path outDir(outputBase);
+    std::error_code ec;
+    fs::create_directories(outDir, ec); 
 
-	// Loading weights and biases
-	struct PtMasks_GPU masks = GetPtMasks_GPU(cc_, cc, conf.numSlots, conf.blockSize, conf.level_matmul + 1);
+    std::string output_path = "all_out.txt";
+    std::ofstream outFile(output_path);
+    if (!outFile.is_open()) {
+        std::cerr << "Error: could not create file " << output_path << std::endl;
+        return 1;
+    }
+    outFile.close();
 
-	struct PtWeights_GPU weights_layer0 =
-	  GetPtWeightsGPU(cc_, keys.publicKey, model_path, 0, conf.numSlots, conf.blockSize, conf.rows, conf.cols, conf.level_matmul, conf.num_heads);
-	struct PtWeights_GPU weights_layer1 =
-	  GetPtWeightsGPU(cc_, keys.publicKey, model_path, 1, conf.numSlots, conf.blockSize, conf.rows, conf.cols, conf.level_matmul, conf.num_heads);
+    create_cpu_context();
+    lbcrypto::KeyPair<lbcrypto::DCRTPoly> keys = cc->KeyGen();
+    keys_ = keys;
+    const int numSlots = static_cast<int>(cc->GetEncodingParams()->GetBatchSize());
+    const int blockSize = static_cast<int>(sqrt(numSlots));
+    EncoderConfiguration conf{.numSlots = numSlots,
+                              .blockSize = blockSize,
+                              .token_length = 63};
 
-	struct MatrixMatrixProductPrecomputations_GPU precomp_gpu =
-	  getMatrixMatrixProductPrecomputations_GPU(cc_, cc, conf.blockSize, conf.bStep, conf.level_matmul, conf.level_matmul, conf.prescale, conf.numSlots);
-	TransposePrecomputations_GPU Tprecomp_gpu = getMatrixTransposePrecomputations_GPU(cc_, cc, conf.blockSize, conf.bStep, conf.level_matmul + 1);
+    FIDESlib::CKKS::RawParams raw_param = FIDESlib::CKKS::GetRawParams(cc, FIDESlib::ENCAPS);
+    FIDESlib::CKKS::Context cc_ = FIDESlib::CKKS::GenCryptoContextGPU(params.adaptTo(raw_param), devices);
+    FIDESlib::CKKS::ContextData& GPUcc = *cc_;
+    prepare_cpu_context(cc_, keys, conf.numSlots, conf.blockSize, conf);
+    prepare_gpu_context_bert(cc_, keys, conf);  //?
 
-	ct_tokens = encryptMatrixtoCPU(tokens_path.string(), keys.publicKey, conf.numSlots, conf.blockSize, conf.rows, conf.cols);
+    // Loading weights and biases
+    struct PtMasks_GPU masks = GetPtMasks_GPU(cc_, cc, conf.numSlots, conf.blockSize, conf.level_matmul + 1);
 
-	// Process pre-tokenized samples (no Python runtime required)
-	process_pretokenized_samples(
-	  pretokenized_path.string(), output_path, conf, keys.publicKey, cc_, ct_tokens, weights_layer0, weights_layer1, masks, precomp_gpu, Tprecomp_gpu, cc, keys.secretKey);
+    struct PtWeights_GPU weights_layer0 = GetPtWeightsGPU(cc_, keys.publicKey, model_path, 0, conf.numSlots, conf.blockSize, conf.rows, conf.cols, conf.level_matmul + 1, conf.num_heads);
+    struct PtWeights_GPU weights_layer1 = GetPtWeightsGPU(cc_, keys.publicKey, model_path, 1, conf.numSlots, conf.blockSize, conf.rows, conf.cols, conf.level_matmul + 1, conf.num_heads);
 
-	DeregisterAllContexts();
-	return 0;
+    struct MatrixMatrixProductPrecomputations_GPU precomp_gpu = getMatrixMatrixProductPrecomputations_GPU(cc_, cc, conf.blockSize, conf.bStep, conf.level_matmul + 2, conf.level_matmul + 2, conf.prescale, conf.numSlots);
+    TransposePrecomputations_GPU Tprecomp_gpu = getMatrixTransposePrecomputations_GPU(cc_, cc, conf.blockSize, conf.bStep, conf.level_matmul);
+
+    ct_tokens = encryptMatrixtoCPU(tokens_path.string(), keys.publicKey, conf.numSlots, conf.blockSize, conf.rows, conf.cols);
+
+    process_sentences_from_csv(path, tokens_file, model_name, model_path, output_path, conf, keys.publicKey,
+                                    cc_, ct_tokens, weights_layer0, weights_layer1, masks, precomp_gpu, Tprecomp_gpu,
+                                    cc, keys.secretKey, dataset);
+
+    return 0;
 }

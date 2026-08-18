@@ -53,6 +53,10 @@ class PlaintextImpl {
 	uint32_t gpu = 0;
 	/// @brief Flag indicating whether the plaintext is loaded to the devices.
 	bool loaded = false;
+	/// @brief COEFF-mode weight plaintext (MarkCoeffStaged): the CPU side holds a single q0 EVAL
+	/// limb; device loads expand it to the target level's limbs on the GPU (loadCoeffExpand).
+	/// Must be consumed through the staged path — a plain load of a marked plaintext throws.
+	bool coeff_staged = false;
 	/// @brief Parent context for device management.
 	CryptoContext<DCRTPoly> parent_context;
 };

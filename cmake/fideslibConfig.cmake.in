@@ -23,4 +23,8 @@ message(STATUS "Using FIDESlib.")
 
 ############### Link dependencies ###############
 
+if (@TBB_FOUND@)
+  find_package(TBB)
+endif()
+
 find_package(CUDAToolkit)

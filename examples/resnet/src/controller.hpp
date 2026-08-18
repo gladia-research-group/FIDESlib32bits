@@ -70,7 +70,6 @@ class resnet {
 		-192,
 		// Average pool rotations.
 		768
-		
 	};
 
 	// Weights for ResNet-20 layers.

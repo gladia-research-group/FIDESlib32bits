@@ -22,13 +22,19 @@ CiphertextImpl<DCRTPoly>::CiphertextImpl(const CryptoContext<DCRTPoly>&& context
 
 // ---- Copy ----
 
-CiphertextImpl<DCRTPoly>::CiphertextImpl(const CiphertextImpl<DCRTPoly>& other) {
-	// Share CPU ciphertext and detach only on first CPU mutation.
-	auto const& other_cpu = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(other.cpu);
-	this->cpu					= std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(other_cpu);
-	this->need_lazy_copy = true;
+CiphertextImpl<DCRTPoly>::CiphertextImpl(const CiphertextImpl<DCRTPoly>& other)
+	: CiphertextImpl<DCRTPoly>(other, /*lazy_cpu_shadow=*/false) {
+}
 
-	// Copy underlying GPU ciphertext if loaded.
+CiphertextImpl<DCRTPoly>::CiphertextImpl(const CiphertextImpl<DCRTPoly>& other, bool lazy_cpu_shadow) {
+
+	auto const& other_cpu = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(other.cpu);
+	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> cpu_copy =
+		lazy_cpu_shadow ? other_cpu->CloneEmpty()
+						: std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(*other_cpu);
+	this->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(std::move(cpu_copy));
+
+	// Copy underlying GPU Ciphertext if loaded.
 	this->loaded = other.loaded;
 	if (this->loaded) {
 		this->gpu = other.parent_context->CopyDeviceCiphertext(other);
@@ -86,7 +92,6 @@ void CiphertextImpl<DCRTPoly>::SetSlots(size_t slots) {
 
 	if (!this->loaded) {
 		// Fall back to CPU.
-		this->EnsureLazyCPUCopy();
 		auto& ct = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(this->cpu);
 		ct->SetSlots(slots);
 		return;
@@ -100,8 +105,14 @@ void CiphertextImpl<DCRTPoly>::SetLevel(size_t level) {
 
 	if (!this->loaded) {
 		// Fall back to CPU.
-		this->EnsureLazyCPUCopy();
 		auto& ct = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(this->cpu);
+
+		// A lazy CPU shadow (see the lazy_cpu_shadow ctor) has no elements to drop.
+		// Fail loudly rather than index an empty vector: this can only be reached if a
+		// lazily-shadowed ciphertext was evicted from the device while still live.
+		if (ct->GetElements().empty()) {
+			OPENFHE_THROW("SetLevel: ciphertext is unloaded and has a metadata-only CPU shadow");
+		}
 
 		size_t currentTowers = ct->GetElements()[0].GetNumOfElements();
 		size_t currentLevel	 = ct->GetLevel();
@@ -128,17 +139,6 @@ void CiphertextImpl<DCRTPoly>::SetLevel(size_t level) {
 	auto ct_gpu	  = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->parent_context->GetDeviceCiphertext(this->gpu));
 	auto maxDepth = this->parent_context->multiplicative_depth;
 	ct_gpu->dropToLevel(maxDepth - level);
-}
-
-void CiphertextImpl<DCRTPoly>::EnsureLazyCPUCopy() {
-	if (!this->need_lazy_copy) {
-		return;
-	}
-
-	auto const& ct_cpu = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(this->cpu);
-	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> cpu_copy = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(*ct_cpu);
-	this->cpu											   = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(std::move(cpu_copy));
-	this->need_lazy_copy = false;
 }
 
 // ---- Operators ----
