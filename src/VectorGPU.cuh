@@ -21,6 +21,11 @@ class VectorGPU {
    public:
     T* data;
     const int size;
+    // Elements actually allocated (>= size). U32 limbs must over-allocate to the uint64-slot
+    // size (2N elements): the NTT kernels' U32 tiling (kernel M=8 vs u64 M=4, same BYTE tile)
+    // sweeps [0, 2N) u32 per row, so a dense N-element allocation gets its pool neighbor
+    // clobbered by the [N, 2N) tail writes.
+    const int alloc;
     const int device;
 
     VectorGPU(VectorGPU<T>&& v) noexcept;
@@ -40,7 +45,7 @@ class VectorGPU {
     VectorGPU<T>& operator=(const VectorGPU<T>& v) = delete;
     VectorGPU(const VectorGPU<T>& v) = delete;
     VectorGPU(T* data, const int size, const int device, const int offset = 0);
-    VectorGPU(Stream& stream, const int size, const int device, const T* src = nullptr);
+    VectorGPU(Stream& stream, const int size, const int device, const T* src = nullptr, const int alloc_size = 0);
     void free(Stream& stream);
     ~VectorGPU();
 };

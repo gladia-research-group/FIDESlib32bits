@@ -3,6 +3,7 @@
 //
 #include <algorithm>
 #include <array>
+#include <stdexcept>
 #include <variant>
 #include <vector>
 
@@ -17,6 +18,32 @@
 #include "VectorGPU.cuh"
 
 namespace FIDESlib::CKKS {
+
+namespace {
+/** One device pointer table per batch call, built from a function-local std::vector into a persistent
+ *  scratch slot of the object whose stream drives the op (element [0] / acc0); reuse across calls is
+ *  serialised by that stream. Falls back to a per-call cudaMallocAsync/cudaFreeAsync pair. */
+struct BatchPtrTable {
+    void*** d = nullptr;
+    bool persist = false;
+    Stream& s;
+
+    BatchPtrTable(LimbPartition& owner, int slot, const std::vector<void**>& h, Stream& stream) : s(stream) {
+        const size_t bytes = sizeof(void**) * h.size();
+        d = (void***)owner.scratchGet(slot, bytes);
+        persist = d != nullptr;
+        if (!persist)
+            cudaMallocAsync((void**)&d, bytes, s.ptr());
+        cudaMemcpyAsync(d, h.data(), bytes, cudaMemcpyHostToDevice, s.ptr());
+    }
+    ~BatchPtrTable() {
+        if (!persist && d)
+            cudaFreeAsync(d, s.ptr());   // stream-ordered: end-of-scope == the old free point
+    }
+    BatchPtrTable(const BatchPtrTable&) = delete;
+    BatchPtrTable& operator=(const BatchPtrTable&) = delete;
+};
+}  // namespace
 
 void LimbPartition::addBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<LimbPartition*>& partb,
                                       int stride, double usage, bool sub, bool exta, bool extb) {
@@ -70,10 +97,8 @@ void LimbPartition::addBatchManyToOne(std::vector<LimbPartition*>& parta, const 
 
     Stream& s = parta[0]->s;
 
-    void*** data_ptrs_d;
-    cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
-    //cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-    cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+    BatchPtrTable tbl(*parta[0], LimbPartition::SC_BATCH_ADD, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
     s.wait(partb[0]->s);
     if (!sub) {
         if (!exta && !extb) {
@@ -132,7 +157,6 @@ void LimbPartition::addBatchManyToOne(std::vector<LimbPartition*>& parta, const 
         }
     }
     partb[0]->s.wait(s);
-    cudaFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::multPtBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<LimbPartition*>& partb,
@@ -172,16 +196,13 @@ void LimbPartition::multPtBatchManyToOne(std::vector<LimbPartition*>& parta, con
 
     Stream& s = parta[0]->s;
 
-    void*** data_ptrs_d;
-    cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
-    //cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-    cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+    BatchPtrTable tbl(*parta[0], LimbPartition::SC_BATCH_MULTPT, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
     s.wait(partb[0]->s);
     if (limbsize > 0)
         mult_reuse_b___<<<grid, block, 0, s.ptr()>>>(data_ptrs_d, data_ptrs_d + its * split * partb.size(),
                                                      PARTITION(parta[0]->id, 0), n, its);
     partb[0]->s.wait(s);
-    cudaFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::addScalarBatchManyToOne(std::vector<LimbPartition*>& parta,
@@ -224,15 +245,12 @@ void LimbPartition::addScalarBatchManyToOne(std::vector<LimbPartition*>& parta,
 
     Stream& s = parta[0]->s;
 
-    void*** data_ptrs_d;
-    cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
-    //cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-    cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+    BatchPtrTable tbl(*parta[0], LimbPartition::SC_BATCH_ADDSCALAR, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
 
     if (limbsize > 0)
         add_scalar_reuse_b___<<<grid, block, 0, s.ptr()>>>(data_ptrs_d, data_ptrs_d + its * split * vector.size(),
                                                            PARTITION(parta[0]->id, 0), n, its);
-    cudaFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::multScalarBatchManyToOne(std::vector<LimbPartition*>& parta,
@@ -279,17 +297,65 @@ void LimbPartition::multScalarBatchManyToOne(std::vector<LimbPartition*>& parta,
 
     Stream& s = parta[0]->s;
 
-    void*** data_ptrs_d;
-    cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
-    //cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-    cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+    BatchPtrTable tbl(*parta[0], LimbPartition::SC_BATCH_MULTSCALAR, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
 
     if (limbsize > 0)
         mult_scalar_reuse_b___<<<grid, block, 0, s.ptr()>>>(
             data_ptrs_d, data_ptrs_d + its * split * vector.size(),
             data_ptrs_d + its * split * vector.size() + split * vector.size() * MAXP, PARTITION(parta[0]->id, 0), n,
             its);
-    cudaFreeAsync(data_ptrs_d, s.ptr());
+}
+
+void LimbPartition::binomialMultAccumBatch(LimbPartition& acc0, LimbPartition& acc1, LimbPartition& acc2,
+                                           const std::vector<const LimbPartition*>& a0,
+                                           const std::vector<const LimbPartition*>& a1,
+                                           const std::vector<const LimbPartition*>& b0,
+                                           const std::vector<const LimbPartition*>& b1) {
+    ContextData& cc = acc0.cc;
+    cudaSetDevice(acc0.device);
+    const int limbsize = acc0.getLimbSize(*acc0.level);
+    const int n = static_cast<int>(a0.size());
+    assert((int)a1.size() == n && (int)b0.size() == n && (int)b1.size() == n);
+    if (n == 0 || limbsize <= 0)
+        return;
+
+    // Pointer tables: 4 arrays of n limb-table pointers each.
+    std::vector<void**> data_ptrs(4 * n, nullptr);
+    for (int j = 0; j < n; ++j) {
+        data_ptrs[0 * n + j] = a0[j]->limbptr.data;
+        data_ptrs[1 * n + j] = a1[j]->limbptr.data;
+        data_ptrs[2 * n + j] = b0[j]->limbptr.data;
+        data_ptrs[3 * n + j] = b1[j]->limbptr.data;
+    }
+
+    Stream& s = acc0.s;
+    BatchPtrTable tbl(acc0, LimbPartition::SC_BATCH_BINOMIAL, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
+
+    s.wait(acc1.s);
+    s.wait(acc2.s);
+    for (int j = 0; j < n; ++j) {
+        s.wait(a0[j]->getS());
+        s.wait(a1[j]->getS());
+        s.wait(b0[j]->getS());
+        s.wait(b1[j]->getS());
+    }
+
+    dim3 block = {128u, 1u, 1u};
+    dim3 grid = {cc.N / 128u, (uint32_t)limbsize, 1u};
+    binomialMultAccum_<<<grid, block, 0, s.ptr()>>>(PARTITION(acc0.id, 0), acc0.limbptr.data, acc1.limbptr.data,
+                                                    acc2.limbptr.data, data_ptrs_d + 0 * n, data_ptrs_d + 1 * n,
+                                                    data_ptrs_d + 2 * n, data_ptrs_d + 3 * n, n);
+
+    acc1.s.wait(s);
+    acc2.s.wait(s);
+    for (int j = 0; j < n; ++j) {
+        a0[j]->getS().wait(s);
+        a1[j]->getS().wait(s);
+        b0[j]->getS().wait(s);
+        b1[j]->getS().wait(s);
+    }
 }
 
 void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
@@ -439,10 +505,8 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
 
     Stream& s = in[0]->s;
 
-    void*** data_ptrs_d;
-    cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
-    //cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-    cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+    BatchPtrTable tbl(*in[0], LimbPartition::SC_BATCH_LTDOT, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
     s.wait(out[0]->s);
     s.wait(pt[0]->s);
 
@@ -489,7 +553,6 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
     }
     out[0]->s.wait(s);
     pt[0]->s.wait(s);
-    cudaFreeAsync(data_ptrs_d, s.ptr());
 }
 
 void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
@@ -539,6 +602,11 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out, co
     assert(out.size() == in.size() * n);
     assert(ksk_a.size() * in.size() == out.size());
     assert(ksk_b.size() * in.size() == out.size());
+    for (auto* k : ksk_a)
+        if (k && k->key_pack_bits)
+            throw std::runtime_error(
+                "fusedHoistedRotateBatch: hoistedRotateDotKSKBatched___ is not packed-key aware "
+                "(FIDESLIB_KSK_PACK=0 to disable)");
 
     int size = 2 * out.size() + in.size() + (num_d + 1) * in.size() / 2 + (num_d + 1) * (ksk_a.size() + ksk_b.size()) +
                (indexes.size() + 1) / 2;
@@ -583,10 +651,8 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out, co
 
     Stream& s = in[0]->s;
 
-    void*** data_ptrs_d;
-    cudaMallocAsync(&data_ptrs_d, sizeof(void**) * size, s.ptr());
-    //cudaMalloc(&data_ptrs_d, sizeof(void**) * size);
-    cudaMemcpyAsync(data_ptrs_d, data_ptrs.data(), sizeof(void**) * size, cudaMemcpyHostToDevice, s.ptr());
+    BatchPtrTable tbl(*in[0], LimbPartition::SC_BATCH_HOISTROT, data_ptrs, s);
+    void*** const data_ptrs_d = tbl.d;
     s.wait(out[0]->s);
     s.wait(ksk_a[0] ? ksk_a[0]->s : ksk_a[1]->s);
 
@@ -599,7 +665,6 @@ void LimbPartition::fusedHoistedRotateBatch(std::vector<LimbPartition*>& out, co
 
     out[0]->s.wait(s);
     (ksk_a[0] ? ksk_a[0]->s : ksk_a[1]->s).wait(s);
-    cudaFreeAsync(data_ptrs_d, s.ptr());
 }
 
 }  // namespace FIDESlib::CKKS

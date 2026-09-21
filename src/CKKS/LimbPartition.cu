@@ -1,6 +1,8 @@
 //
 // Created by carlosad on 27/04/24.
 //
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -59,12 +61,21 @@ LimbPartition::LimbPartition(LimbPartition&& l) noexcept
       DIGITlimbptr(std::move(l.DIGITlimbptr)),
       //      DIGITauxptr(std::move(l.DIGITlimbptr)),
       GATHERptr(std::move(l.GATHERptr)),
+      DECOMPALLptr(std::move(l.DECOMPALLptr)),
       bufferDECOMPandDIGIT(l.bufferDECOMPandDIGIT),
       bufferSPECIAL(l.bufferSPECIAL),
       bufferLIMB(l.bufferLIMB),
       bufferGATHER(l.bufferGATHER),
       bufferDECOMPandDIGIT_handle(l.bufferDECOMPandDIGIT_handle),
       bufferGATHER_handle(l.bufferGATHER_handle) {
+    key_q_band = l.key_q_band;
+    key_pack_bits = l.key_pack_bits;
+    bufferKSKPACK = l.bufferKSKPACK;
+    bufferKSKPACKbytes = l.bufferKSKPACKbytes;
+    bufferSPECIALbytes = l.bufferSPECIALbytes;
+    bufferSPECIALcudaMalloc = l.bufferSPECIALcudaMalloc;
+    bufferLIMBbytes = l.bufferLIMBbytes;
+    l.bufferKSKPACK = nullptr;
     l.bufferSPECIAL = nullptr;
     l.bufferLIMB = nullptr;
     l.bufferDECOMPandDIGIT = nullptr;
@@ -72,6 +83,10 @@ LimbPartition::LimbPartition(LimbPartition&& l) noexcept
     l.bufferGATHER = nullptr;
     l.bufferDECOMPandDIGIT_handle = nullptr;
     l.bufferGATHER_handle = nullptr;
+    for (int i = 0; i < SC_N; ++i) {
+        scratch_[i] = l.scratch_[i];
+        l.scratch_[i] = DevScratch{};   // else both dtors cudaFree the same pointer
+    }
 }
 
 std::vector<VectorGPU<void*>> LimbPartition::generateDecompLimbptr(
@@ -82,6 +97,40 @@ std::vector<VectorGPU<void*>> LimbPartition::generateDecompLimbptr(
         offset += MAXP;
     }
     return result;
+}
+
+
+void* LimbPartition::scratchGet(const int slot, const size_t bytes) {
+    if (bytes == 0)
+        return nullptr;
+    assert(slot >= 0 && slot < SC_N);
+    DevScratch& sc = scratch_[slot];
+    if (sc.p != nullptr && sc.bytes >= bytes)
+        return sc.p;
+    cudaSetDevice(device);
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess || p == nullptr) {
+        cudaGetLastError();   // never fail the op over a scratch buffer
+        return nullptr;
+    }
+    if (sc.p != nullptr) {
+        // The old buffer may still be read by work already enqueued on this partition's stream.
+        cudaStreamSynchronize(s.ptr());
+        cudaFree(sc.p);
+    }
+    sc.p = p;
+    sc.bytes = bytes;
+    return sc.p;
+}
+
+void LimbPartition::scratchFreeAll() {
+    for (auto& sc : scratch_) {
+        if (sc.p) {
+            cudaFree(sc.p);
+            sc.p = nullptr;
+            sc.bytes = 0;
+        }
+    }
 }
 
 void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
@@ -137,7 +186,10 @@ LimbPartition::LimbPartition(ContextData& cc, const uint64_t& uid, int* level, c
       //      DECOMPauxptr(generateDecompLimbptr(bufferAUXptrs, DECOMPmeta, device, (4 + DECOMPmeta.size()) * MAXP)),
       DIGITlimbptr(generateDecompLimbptr(bufferAUXptrs, DIGITmeta, device, (4 + DECOMPmeta.size()) * MAXP)),
       //      , DIGITauxptr(generateDecompLimbptr(bufferAUXptrs, DIGITmeta, device, (4 + 3 * DECOMPmeta.size()) * MAXP))
-      GATHERptr(bufferAUXptrs, std::max(1ul, GATHERmeta.size()), device, (4 + 2 * DECOMPmeta.size()) * MAXP) {}
+      GATHERptr(bufferAUXptrs, std::max(1ul, GATHERmeta.size()), device, (4 + 2 * DECOMPmeta.size()) * MAXP),
+      // One spare MAXP-slot after GATHERptr — fits, the buffer holds (4 + 4*dnum)
+      // slots and slots used so far are 4 + 2*dnum + 1 (see CudaMallocAuxBuffer).
+      DECOMPALLptr(bufferAUXptrs, MAXP, device, (5 + 2 * DECOMPmeta.size()) * MAXP) {}
 
 LimbPartition::~LimbPartition() {
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
@@ -154,6 +206,7 @@ LimbPartition::~LimbPartition() {
     SPECIALlimbptr.free(s);
     SPECIALauxptr.free(s);
     GATHERptr.free(s);
+    DECOMPALLptr.free(s);
     for (auto& d : DECOMPlimbptr)
         d.free(s);
     //    for (auto& d : DECOMPauxptr)
@@ -175,16 +228,20 @@ LimbPartition::~LimbPartition() {
 #endif
     } else {
         if (bufferDECOMPandDIGIT)
+            // bytes=0 would mis-file the block in GPUfree's 1 KB bucket; left as-is only because this
+            // branch is unreachable (both allocation sites for bufferDECOMPandDIGIT are commented out).
             GPUfree(bufferDECOMPandDIGIT, id, 0, s.ptr());
         // cudaFreeAsync(bufferDECOMPandDIGIT, s.ptr());
     }
-    if (bufferSPECIAL)
-        GPUfree(bufferSPECIAL, id, 0, s.ptr());
+    freeSpecialBuffer();  // correct size AND route, not GPUfree(..., 0, ...)
     //cudaFreeAsync(bufferSPECIAL, s.ptr());
+    if (bufferKSKPACK)
+        GPUfree(bufferKSKPACK, id, (int)bufferKSKPACKbytes, s.ptr());
     if (bufferLIMB) {
-        GPUfree(bufferLIMB, id, 0, s.ptr());
+        GPUfree(bufferLIMB, id, (int)bufferLIMBbytes, s.ptr());
         //cudaFreeAsync(bufferLIMB, s.ptr());
     }
+    scratchFreeAll();   // plain cudaMalloc'd, so plain cudaFree
     if (bufferAUXptrs)
         GPUfree(bufferAUXptrs, id, MAXP * sizeof(void*) * (4ul + 4 * std::max(cc.dnum, 1)), s.ptr(), false);
     // cudaFreeAsync(bufferAUXptrs, s.ptr());
@@ -200,6 +257,8 @@ LimbPartition::~LimbPartition() {
 #endif
     } else {
         if (bufferGATHER)
+            // Same bytes=0 defect, left as-is: bufferGATHER is allocated only by ncclMemAlloc, whose
+            // companion handle sends it down the branch above.
             GPUfree(bufferGATHER, id, 0, s.ptr());
         //cudaFreeAsync(bufferGATHER, s.ptr());
     }
@@ -240,7 +299,7 @@ void LimbPartition::generate(std::vector<LimbRecord>& records, std::vector<LimbI
                 offset += cc.N;
             } else
                 limbs.emplace_back(
-                    Limb<uint32_t>(cc, id, USE_PARTITION_STREAM ? s : records.at(i).stream, r.id, auxptrs ? 1 : 0));
+                    Limb<uint32_t>(cc, id, USE_PARTITION_STREAM ? s : records.at(i).stream, r.id, !auxptrs));
             cpu_ptr[i - limbs_size] = {&(std::get<U32>(limbs.back()).v.data)[0]};
             cpu_auxptr[i - limbs_size] = {&(std::get<U32>(limbs.back()).aux.data)[0]};
         }
@@ -275,12 +334,13 @@ void LimbPartition::generate(std::vector<LimbRecord>& records, std::vector<LimbI
     }
     if (size > 0) {
         if (!noptr) {
-            cudaMemcpyAsync(ptrs.data + limbs_size, cpu_ptr.data(), size * sizeof(void*), cudaMemcpyHostToDevice,
-                            s.ptr());
+        if (limbs_size + size > ptrs.size) { std::cerr << "PTRS BOUNDS ERROR: ptrs.size=" << ptrs.size << " limbs_size=" << limbs_size << " size=" << size << " total=" << (limbs_size + size) << " at " << __FILE__ << ":" << __LINE__ << std::endl; }
+            cudaMemcpyAsync(ptrs.data + limbs_size, cpu_ptr.data(),
+                            size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
             CudaCheckErrorModNoSync;
             if (auxptrs) {
-                cudaMemcpyAsync((*auxptrs).data + limbs_size, cpu_auxptr.data(), size * sizeof(void*),
-                                cudaMemcpyHostToDevice, s.ptr());
+                cudaMemcpyAsync((*auxptrs).data + limbs_size, cpu_auxptr.data(),
+                                size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
             }
             CudaCheckErrorModNoSync;
         }
@@ -346,18 +406,211 @@ void LimbPartition::generateAllDigitLimb(uint64_t* pInt, size_t offset, int q_ba
     }
 }
 
+/* KSK bit-packing: repack this KEY partition's loaded DECOMP/DIGIT limbs into
+ * dense `bits`-per-coefficient bitstreams, point the SAME device pointer tables (limbptr /
+ * DIGITlimbptr[i]) at the packed streams, and free the dense u32 Limb storage back to the
+ * pool. Consumers must launch the KSK_PACKED=true dot-kernel arms (selected via
+ * key_pack_bits at the launch sites); any other reader of these tables is stale by
+ * construction — the only such paths are dead (per-limb dotKSK, *ModupDotKSK, the batched
+ * hoisted rotate). Lossless: residues are canonical < p < 2^bits.
+ * All-u32 single-GPU chains only; composes with key_q_band (packs whatever limbs exist). */
+void LimbPartition::packKeyLimbs(const int bits) {
+    cudaSetDevice(device);
+    assert(cc.GPUid.size() == 1);
+    assert(bits > 0 && bits < 32);
+    if (key_pack_bits)
+        return;
+    const size_t words = ((size_t)cc.N * bits + 31) / 32;
+    const size_t slotBytes = ((words * 4 + 4) + 15) & ~15ull;  // +1 guard word, 16B-aligned slots
+    size_t nlimbs = 0;
+    for (auto& d : DECOMPlimb)
+        nlimbs += d.size();
+    for (auto& d : DIGITlimb)
+        nlimbs += d.size();
+    if (nlimbs == 0)
+        return;
+    bufferKSKPACKbytes = nlimbs * slotBytes;
+    bufferKSKPACK = (uint64_t*)GPUmalloc(device, bufferKSKPACKbytes, s.ptr());
+
+    size_t slot = 0;
+    const uint32_t grid = (uint32_t)((words + 1 + 127) / 128);
+    auto pack_one = [&](LimbImpl& l) -> void* {
+        assert(l.index() == U32);
+        void* dst = (char*)bufferKSKPACK + slot * slotBytes;
+        ++slot;
+        s.wait(STREAM(l));
+        packKsk_<<<dim3{grid}, 128, 0, s.ptr()>>>((uint32_t*)dst, std::get<U32>(l).v.data, cc.N, bits);
+        return dst;
+    };
+
+    // limbptr mirrors loadDecompDigit's mapping: entry k = the DECOMP limb with meta[k].id.
+    // Key partitions never fill `limb`, so unmatched entries are nullptr by construction.
+    std::vector<void*> h_limbptr(limbptr.size, nullptr);
+    for (size_t i = 0; i < DECOMPlimb.size(); ++i) {
+        for (auto& j : DECOMPlimb.at(i)) {
+            void* p = pack_one(j);
+            for (size_t k = 0; k < meta.size(); ++k)
+                if (PRIMEID(j) == meta.at(k).id)
+                    h_limbptr[k] = p;
+        }
+    }
+    cudaMemcpyAsync(limbptr.data, h_limbptr.data(), limbptr.size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+    for (size_t i = 0; i < DIGITlimb.size(); ++i) {
+        if (DIGITlimb[i].empty())
+            continue;
+        std::vector<void*> h(DIGITlimb[i].size(), nullptr);
+        for (size_t j = 0; j < DIGITlimb[i].size(); ++j)
+            h[j] = pack_one(DIGITlimb[i][j]);
+        cudaMemcpyAsync(DIGITlimbptr[i].data, h.data(), h.size() * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+    }
+    CudaCheckErrorModNoSync;
+    // The pack kernels must complete before the dense storage returns to the pool (a later
+    // allocation could recycle and overwrite a block a pack kernel is still reading).
+    cudaDeviceSynchronize();
+    for (auto& d : DECOMPlimb)
+        d.clear();
+    for (auto& d : DIGITlimb)
+        d.clear();
+    key_pack_bits = bits;
+}
+
+/* FIDESLIB_KSK_REGEN level (default 2): 0 = stream the stored `a`; 1 = hoisted-rotation dot regenerates
+ * `a` in-kernel from the key seed; 2 = both `a` readers regenerate, so `a` is never materialized on the
+ * device; 3 = level 2 with the shared-memory (stage-A) fusedDotKSK arm. */
+int kskRegenLevel() {
+    static const int level = [] {
+        const char* e = getenv("FIDESLIB_KSK_REGEN");
+        return e != nullptr ? atoi(e) : 2;
+    }();
+    return level;
+}
+
+/* Record the seed and RELEASE this KEY partition's `a` rows
+ * instead of expanding them. Legal only when every consumer regenerates (FIDESLIB_KSK_REGEN
+ * >= 2 — see kskRegenLevel()); KeySwitchingKey::Initialize is the only caller and owns that
+ * check. generateDecompAndDigit has already built the device pointer TABLES by the time we
+ * get here — those stay (they are a few hundred pointers) and are nulled, so every host
+ * staging path keeps working untouched while any missed reader gets a null deref rather than
+ * stale key material. The dense storage returns to the pool exactly the way packKeyLimbs
+ * releases it after packing. */
+void LimbPartition::adoptKskASeed(const std::vector<uint32_t>& seed, int q_band) {
+    cudaSetDevice(device);
+    assert(cc.GPUid.size() == 1);
+    assert(seed.size() == 8);
+    for (int i = 0; i < 8; ++i)
+        ksk_seed[i] = seed[i];
+    ksk_seed_set = true;
+    ksk_a_released = true;
+    // generateAllDecompAndDigit would have set this; the caller now skips that call entirely,
+    // so carry the band ourselves — dotKSK's banded-key guard reads it.
+    if (q_band >= 0)
+        key_q_band = q_band;
+
+    // Works whether or not the rows were ever generated: KeySwitchingKey::Initialize skips
+    // generateDecompAndDigit for a released `a` (never allocating), but the earlier form
+    // allocated first and released here, and both must stay valid. Same ordering rule
+    // packKeyLimbs documents: nothing may still be reading these blocks when they return to
+    // the pool, or a later allocation recycles them under a live kernel.
+    cudaDeviceSynchronize();
+    for (auto& d : DECOMPlimb)
+        d.clear();
+    for (auto& d : DIGITlimb)
+        d.clear();
+
+    // Null EVERY pointer table this partition owns. They live in bufferAUXptrs and are built
+    // by the constructor from the metas, so they exist (correctly sized) even when the storage
+    // never was — which is exactly why skipping the generate call is safe for the host staging
+    // paths. Uninitialized device memory would otherwise leave them holding garbage that reads
+    // as a valid pointer; nulled, any reader this design missed faults instead.
+    size_t maxsz = std::max<size_t>({(size_t)limbptr.size, (size_t)GATHERptr.size, (size_t)DECOMPALLptr.size, 1ul});
+    for (auto& t : DIGITlimbptr)
+        maxsz = std::max<size_t>(maxsz, (size_t)t.size);
+    for (auto& t : DECOMPlimbptr)
+        maxsz = std::max<size_t>(maxsz, (size_t)t.size);
+    const std::vector<void*> nulls(maxsz, nullptr);
+    auto null_table = [&](VectorGPU<void*>& t) {
+        if (t.size > 0)
+            cudaMemcpyAsync(t.data, nulls.data(), t.size * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+    };
+    null_table(limbptr);
+    null_table(GATHERptr);
+    null_table(DECOMPALLptr);
+    for (auto& t : DIGITlimbptr)
+        null_table(t);
+    for (auto& t : DECOMPlimbptr)
+        null_table(t);
+    CudaCheckErrorModNoSync;
+    cudaStreamSynchronize(s.ptr());
+}
+
+void LimbPartition::expandKskADigits(const std::vector<uint32_t>& seed) {
+    cudaSetDevice(device);
+    assert(cc.GPUid.size() == 1);
+    assert(seed.size() == 8);
+    KskSeedWords sw;
+    for (int i = 0; i < 8; ++i)
+        sw.k[i] = seed[i];
+    // Record for the 1b-ii in-kernel regen arms (dot kernels re-derive `a` from this).
+    for (int i = 0; i < 8; ++i)
+        ksk_seed[i] = seed[i];
+    ksk_seed_set = true;
+    const uint32_t n16 = (uint32_t)cc.N >> 4;
+    const uint32_t grid = (uint32_t)((cc.N + 127) / 128);
+
+    const uint32_t n8 = (uint32_t)cc.N >> 3;
+    auto expand_one = [&](LimbImpl& l, int digit) {
+        STREAM(l).wait(s);
+        if (l.index() == U32) {
+            const uint32_t p = (uint32_t)cc.precom.constants[id].primes[PRIMEID(l)];
+            expandKskA_<<<dim3{grid}, 128, 0, STREAM(l).ptr()>>>(std::get<U32>(l).v.data, sw, digit, p, n16, cc.N);
+        } else {
+            // SPEC v2 (KSKB): the NATIVE_SIZE=64 chain's limbs, primes < 2^60.
+            const uint64_t p = cc.precom.constants[id].primes[PRIMEID(l)];
+            expandKskA64_<<<dim3{grid}, 128, 0, STREAM(l).ptr()>>>(std::get<U64>(l).v.data, sw, digit, p, n8, cc.N);
+        }
+    };
+    for (size_t i = 0; i < DECOMPlimb.size(); ++i)
+        for (auto& j : DECOMPlimb.at(i))
+            expand_one(j, (int)i);
+    for (size_t i = 0; i < DIGITlimb.size(); ++i)
+        for (auto& j : DIGITlimb.at(i))
+            expand_one(j, (int)i);
+    CudaCheckErrorModNoSync;
+
+    // The decomp-row pointer mapping the dot kernels read — same as loadDecompDigit's.
+    std::vector<void*> cpu_ptr(MAXP, nullptr);
+    for (size_t i = 0; i < DECOMPlimb.size(); ++i)
+        for (auto& j : DECOMPlimb.at(i))
+            for (size_t k = 0; k < meta.size(); ++k)
+                if (PRIMEID(j) == meta.at(k).id)
+                    cpu_ptr[k] = (j.index() == U32) ? (void*)std::get<U32>(j).v.data
+                                                    : (void*)std::get<U64>(j).v.data;
+    cudaMemcpyAsync(limbptr.data, cpu_ptr.data(), cpu_ptr.size() * sizeof(void*), cudaMemcpyHostToDevice, s.ptr());
+
+    for (auto& d : DECOMPlimb)
+        for (auto& j : d)
+            s.wait(STREAM(j));
+    for (auto& d : DIGITlimb)
+        for (auto& j : d)
+            s.wait(STREAM(j));
+}
+
 void LimbPartition::generateSpecialLimb(const bool zero_out, const bool for_communication) {
     cudaSetDevice(device);
     if ((for_communication && cc.GPUid.size() > 0 && bufferSPECIAL == nullptr && SPECIALmeta.size() > 0) ||
         (!(for_communication && cc.GPUid.size() > 0) && SPECIALlimb.size() == 0 && SPECIALmeta.size() > 0)) {
         if ((for_communication && cc.GPUid.size() > 0)) {
             assert(SPECIALlimb.size() == 0);
-            cudaMalloc(&bufferSPECIAL, std::max(1ul, cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t)));
+            bufferSPECIALbytes = std::max(1ul, cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t));
+            bufferSPECIALcudaMalloc = true;  // plain cudaMalloc: must be plain cudaFree
+            cudaMalloc(&bufferSPECIAL, bufferSPECIALbytes);
             generate(SPECIALmeta, SPECIALlimb, SPECIALlimbptr, (int)SPECIALmeta.size() - 1, &SPECIALauxptr,
                      bufferSPECIAL, 0, bufferSPECIAL, cc.N * SPECIALmeta.size());
         } else {
             assert(bufferSPECIAL == nullptr);
-            bufferSPECIAL = (uint64_t*)GPUmalloc(device, cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t), s.ptr());
+            bufferSPECIALbytes = cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t);
+            bufferSPECIALcudaMalloc = false;
+            bufferSPECIAL = (uint64_t*)GPUmalloc(device, (int)bufferSPECIALbytes, s.ptr());
             CudaCheckErrorModNoSync;
             //generate(SPECIALmeta, SPECIALlimb, SPECIALlimbptr, (int)SPECIALmeta.size() - 1, &SPECIALauxptr, nullptr, 0,
             //         nullptr, 0);
@@ -388,13 +641,20 @@ template <ALGO algo, NTT_MODE mode>
 void LimbPartition::ApplyNTT(int batch, LimbPartition::NTT_fusion_fields fields, std::vector<LimbImpl>& limb,
                              VectorGPU<void*>& limbptr, VectorGPU<void*>& auxptr, ContextData& cc,
                              const int primeid_init, const int limbsize) {
-    constexpr int M = 4;
+    const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
+    // The dynamic shared size scales with the limb word size: the kernel lays out
+    // `sizeof(T) * blockDim.x * (2*M + 1 + shoup)` bytes, and `32 / M` IS sizeof(T)
+    // (M=8 -> 4 for u32, M=4 -> 8 for u64). Same formula at every ApplyNTT/ApplyINTT site.
     const dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
     const dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
-    const int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
-    const int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
-    const int size = (limbsize != -1 ? limbsize : limb.size()) - (mode == NTT_RESCALE || mode == NTT_MULTPT);
+    const int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+    const int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+    // NTT_RESCALE2: fused composite double drop. The two top limbs are consumed
+    // (size = limbsize - 2); stage-1 dat = limbptr + size, so the kernel sees dat[0] = the qb
+    // limb and dat[1] = the qa top (both coeff domain); primeid_rescale = the TOP prime (qa).
+    const int size = (limbsize != -1 ? limbsize : limb.size()) -
+                     (mode == NTT_RESCALE || mode == NTT_MULTPT) - 2 * (mode == NTT_RESCALE2);
 
     for (int i = 0; i < size; i += batch) {
         uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(size - i));
@@ -402,17 +662,23 @@ void LimbPartition::ApplyNTT(int batch, LimbPartition::NTT_fusion_fields fields,
         NTT_<false, algo, mode><<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
                                   STREAM(limb.at(i)).ptr()>>>(
             getGlobals(),
-            (mode == NTT_RESCALE || mode == NTT_MULTPT) ? limbptr.data + size
-            : (mode == NTT_MODDOWN)                     ? fields.op2->limbptr.data + i
-                                                        : limbptr.data + i,
+            (mode == NTT_RESCALE || mode == NTT_MULTPT || mode == NTT_RESCALE2) ? limbptr.data + size
+            : (mode == NTT_MODDOWN)                                             ? fields.op2->limbptr.data + i
+                                                                                : limbptr.data + i,
             primeid_init + i, auxptr.data + i, nullptr,
-            (mode == NTT_RESCALE || mode == NTT_MULTPT) ? PRIMEID(limb[size]) : 0, nullptr, nullptr);
+            (mode == NTT_RESCALE || mode == NTT_MULTPT) ? PRIMEID(limb[size])
+            : (mode == NTT_RESCALE2)                    ? PRIMEID(limb[size + 1])
+                                                        : 0,
+            nullptr, nullptr);
 
         NTT_<true, algo, mode><<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond,
                                  STREAM(limb.at(i)).ptr()>>>(
             getGlobals(), auxptr.data + i, primeid_init + i, limbptr.data + i,
             mode == NTT_MULTPT ? fields.pt->limbptr.data + i : nullptr,
-            (mode == NTT_RESCALE || mode == NTT_MULTPT) ? PRIMEID(limb[size]) : 0, nullptr, nullptr);
+            (mode == NTT_RESCALE || mode == NTT_MULTPT) ? PRIMEID(limb[size])
+            : (mode == NTT_RESCALE2)                    ? PRIMEID(limb[size + 1])
+                                                        : 0,
+            nullptr, nullptr);
     }
 }
 
@@ -449,12 +715,12 @@ template <ALGO algo, INTT_MODE mode>
 void LimbPartition::ApplyINTT(int batch, LimbPartition::INTT_fusion_fields fields, std::vector<LimbImpl>& limb,
                               VectorGPU<void*>& limbptr, VectorGPU<void*>& auxptr, ContextData& cc,
                               const int primeid_init, const int limbsize) {
-    constexpr int M = 4;
+    const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
     dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN - (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
     dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1 + (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
-    int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-    int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+    int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+    int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
     for (int i = 0; i < limbsize; i += batch) {
         uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(limbsize - i));
@@ -498,15 +764,76 @@ void LimbPartition::INTT(int batch, bool sync, INTT_fusion_fields fields) {
 #include "ntt_types.inc"
 #undef WWW
 
+// The in-place limb add goes through the BYTES-indexed vectorized kernel.
+// Forward declaration — the definition sits with the copy dispatch further down this file.
+static inline size_t uniform_limb_bytes(const std::vector<LimbRecord>& meta, size_t begin, size_t n, int N);
+
+#ifndef FIDESLIB_ADD_VEC
+#define FIDESLIB_ADD_VEC 1
+#endif
+
+#ifndef FIDESLIB_ADD_CENSUS
+#define FIDESLIB_ADD_CENSUS 0
+#endif
+#if FIDESLIB_ADD_CENSUS
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <utility>
+namespace {
+std::mutex g_add_mu;
+std::map<void*, long> g_add_sites;
+struct AddCensusDump {
+    ~AddCensusDump() {
+        std::lock_guard<std::mutex> g(g_add_mu);
+        long tot = 0;
+        for (auto& kv : g_add_sites) tot += kv.second;
+        std::fprintf(stderr, "[addcensus] total LimbPartition::add = %ld across %zu sites\n", tot,
+                     g_add_sites.size());
+        std::vector<std::pair<void*, long>> v(g_add_sites.begin(), g_add_sites.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        for (auto& kv : v) {
+            Dl_info info{};
+            size_t off = 0;
+            if (dladdr(kv.first, &info) && info.dli_fbase)
+                off = (size_t)((char*)kv.first - (char*)info.dli_fbase);
+            std::fprintf(stderr, "[addcensus] %6ld  +0x%zx\n", kv.second, off);
+        }
+    }
+} g_add_dump;
+#define FIDESLIB_ADD_CENSUS_HIT()                                     \
+    do {                                                              \
+        void* bt[6];                                                  \
+        const int n_ = backtrace(bt, 6);                              \
+        void* site = (n_ > 4) ? bt[4] : (n_ > 1 ? bt[n_ - 1] : nullptr); \
+        std::lock_guard<std::mutex> g_(g_add_mu);                     \
+        g_add_sites[site]++;                                          \
+    } while (0)
+}  // namespace
+#else
+#define FIDESLIB_ADD_CENSUS_HIT() ((void)0)
+#endif
+
 void LimbPartition::add(const LimbPartition& p, const bool ext) {
+    FIDESLIB_ADD_CENSUS_HIT();
     cudaSetDevice(device);
     const int limbsize = getLimbSize(*level);
     s.wait(p.getS());
     for (int i = 0; i < limbsize; i += cc.batch) {
         STREAM(limb[i]).wait(s);
         uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
-        add_<<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(
-            limbptr.data + i, p.limbptr.data + i, PARTITION(id, i));
+        const int add_bpt = fideslibAddBytes();
+        const size_t add_bpl = FIDESLIB_ADD_VEC ? uniform_limb_bytes(meta, (size_t)i, (size_t)num_limbs, cc.N) : 0;
+        if (add_bpl && (add_bpl % (size_t)(add_bpt * 128)) == 0)
+            launchAddBytes(dim3{(uint32_t)(add_bpl / (add_bpt * 128)), num_limbs}, dim3{128}, STREAM(limb[i]).ptr(),
+                           limbptr.data + i, p.limbptr.data + i, PARTITION(id, i), add_bpt);
+        else
+            add_<<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(
+                limbptr.data + i, p.limbptr.data + i, PARTITION(id, i));
     }
     if (ext) {
         int start = cc.splitSpecialMeta.at(id).at(0).id - (cc.L + 1);
@@ -515,6 +842,14 @@ void LimbPartition::add(const LimbPartition& p, const bool ext) {
             STREAM(SPECIALlimb[i]).wait(s);
             uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
             {
+                const int sadd_bpt = fideslibAddBytes();
+                const size_t sadd_bpl =
+                    FIDESLIB_ADD_VEC ? uniform_limb_bytes(SPECIALmeta, (size_t)i, (size_t)size, cc.N) : 0;
+                if (sadd_bpl && (sadd_bpl % (size_t)(sadd_bpt * 128)) == 0)
+                    launchAddBytes(dim3{(uint32_t)(sadd_bpl / (sadd_bpt * 128)), size}, dim3{128},
+                                   STREAM(SPECIALlimb[i]).ptr(), SPECIALlimbptr.data + i, p.SPECIALlimbptr.data + i,
+                                   SPECIAL(id, i), sadd_bpt);
+                else
                 add_<<<dim3{(uint32_t)cc.N / 128, size}, 128, 0, STREAM(SPECIALlimb[i]).ptr()>>>(
                     SPECIALlimbptr.data + i, p.SPECIALlimbptr.data + i,
                     SPECIAL(
@@ -553,6 +888,12 @@ void LimbPartition::sub(const LimbPartition& p) {
     for (int i = 0; i < limbsize; i += cc.batch) {
         STREAM(limb[i]).wait(s);
         uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
+        const int sub_bpt = fideslibAddBytes();
+        const size_t sub_bpl = FIDESLIB_ADD_VEC ? uniform_limb_bytes(meta, (size_t)i, (size_t)num_limbs, cc.N) : 0;
+        if (sub_bpl && (sub_bpl % (size_t)(sub_bpt * 128)) == 0)
+            launchSubBytes(dim3{(uint32_t)(sub_bpl / (sub_bpt * 128)), num_limbs}, dim3{128}, STREAM(limb[i]).ptr(),
+                           limbptr.data + i, p.limbptr.data + i, PARTITION(id, i), sub_bpt);
+        else
         sub_<<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(
             limbptr.data + i, p.limbptr.data + i, PARTITION(id, i));
     }
@@ -618,12 +959,12 @@ void LimbPartition::rescale() {
     if (aux_size == 0) {
         {
             constexpr ALGO algo = ALGO_SHOUP;
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int start = 0;
             for (int i = limbsize - 1; i < limbsize; i += cc.batch) {
@@ -649,12 +990,12 @@ void LimbPartition::rescale() {
         s.wait(auxLimbs.getS());
         if (limbsize > 0) {
             constexpr ALGO algo = ALGO_SHOUP;
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             {
                 NTT_<false, algo, NTT_RESCALE>
@@ -683,6 +1024,64 @@ void LimbPartition::rescale() {
     //    STREAM(limb.back()).wait(s);
     //    limb.pop_back();
     //}
+}
+
+// Fused composite DOUBLE prime drop (compositeDegree()==2 chains). One gy=2
+// top-pair INTT + one NTT_RESCALE2 pass replace TWO full sequential rescale passes (each with
+// its own gy=1 top INTT + gy=(L-1) NTT_RESCALE pair) — ~half the rescale kernel work.
+// Sequential drop semantics are preserved exactly inside the kernel (rescale2_combine,
+// NTT.cu), so the result is BIT-IDENTICAL to two rescale() calls. Returns false (caller falls
+// back to the two-pass loop) when the shape doesn't fit: fewer than 3 limbs, non-consecutive
+// top primeids (multi-GPU interleaving), or aux-less (constant) limbs.
+bool LimbPartition::rescale2() {
+    const int limbsize = getLimbSize(*level);
+    if (limbsize < 3)
+        return false;
+    LimbImpl& top = limb.at(limbsize - 1);
+    LimbImpl& top2 = limb.at(limbsize - 2);
+    if (PRIMEID(top2) != PRIMEID(top) - 1)
+        return false;
+    int aux_size;
+    SWITCH_RET(top, aux.size, aux_size);
+    if (aux_size == 0)
+        return false;
+
+    cudaSetDevice(device);
+    constexpr ALGO algo = ALGO_SHOUP;
+    const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8)
+
+    // 1. top-pair INTT (gy=2), in place via the limbs' own aux staging, on the partition stream.
+    {
+        dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
+        dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
+        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+
+        INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), 2}, blockDimFirst, bytesFirst,
+                                        s.ptr()>>>(getGlobals(), limbptr.data + limbsize - 2,
+                                                   PARTITION(id, limbsize - 2), auxptr.data + limbsize - 2);
+        INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), 2}, blockDimSecond, bytesSecond,
+                                       s.ptr()>>>(getGlobals(), auxptr.data + limbsize - 2,
+                                                  PARTITION(id, limbsize - 2), limbptr.data + limbsize - 2);
+
+    }
+
+    // 2. the fused double-drop pass (gy = limbsize-2), also on the partition stream.
+    {
+        dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
+        dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
+        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+        const int size = limbsize - 2;
+
+        NTT_<false, algo, NTT_RESCALE2><<<dim3{cc.N / (blockDimFirst.x * M * 2), (uint32_t)size}, blockDimFirst,
+                                          bytesFirst, s.ptr()>>>(getGlobals(), limbptr.data + size, PARTITION(id, 0),
+                                                                 auxptr.data, nullptr, PRIMEID(top));
+        NTT_<true, algo, NTT_RESCALE2><<<dim3{cc.N / (blockDimSecond.x * M * 2), (uint32_t)size}, blockDimSecond,
+                                         bytesSecond, s.ptr()>>>(getGlobals(), auxptr.data, PARTITION(id, 0),
+                                                                 limbptr.data, nullptr, PRIMEID(top));
+    }
+    return true;
 }
 
 void LimbPartition::multPt(const LimbPartition& p) {
@@ -743,6 +1142,37 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
         std::cout << std::endl;
     }
 
+    // ONE wide INTT over all source limbs instead of dnum per-digit launches (small per-digit
+    // grids under-fill the GPU). The merged launch (gy = limbsize) is byte- and primeid-identical:
+    // stage 2 scatters through DECOMPALLptr, whose entry (start_d + i) IS DECOMPlimbptr[d][i].
+    // Per-digit conv/NTT below still fan out on the digit streams; each s_d.wait(s) picks up the
+    // merged INTT's completion.
+    {
+        const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+
+        dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
+        dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
+        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+
+        for (int i = 0; i < limbsize; i += cc.batch) {
+            STREAM(limb.at(i)).wait(s);
+            uint32_t num_limbs = std::min((uint32_t)cc.batch, (uint32_t)(limbsize - i));
+
+            INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst,
+                                            bytesFirst, STREAM(limb.at(i)).ptr()>>>(
+                getGlobals(), limbptr.data + i, PARTITION(id, i), auxptr.data + i);
+
+            INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond,
+                                           bytesSecond, STREAM(limb.at(i)).ptr()>>>(
+                getGlobals(), auxptr.data + i, PARTITION(id, i), DECOMPALLptr.data + i);
+
+        }
+        for (int i = 0; i < limbsize; i += cc.batch) {
+            s.wait(STREAM(limb.at(i)));
+        }
+    }
+
     for (size_t d = 0; d < DECOMPlimb.size(); ++d) {
 
         int start = 0;
@@ -751,44 +1181,9 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
         int size = std::min((int)DECOMPlimb.at(d).size(), limbsize - start);
         if (size <= 0)
             break;
-        /*
-        for (auto& l : DECOMPlimb[d]) {
-            for (auto& p : limb) {
-                if (PRIMEID(l) == PRIMEID(p)) {
-                    STREAM(l).wait(STREAM(p));
-                    SWITCH(l, INTT_from(p));
-                    s_d.wait(STREAM(l));
-                }
-            }
-        }
-        */
+
         Stream& s_d = cc.digitStream.at(d).at(id);
         s_d.wait(s);
-
-        {
-            constexpr int M = 4;
-
-            dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
-            dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-
-            for (int i = 0; i < size; i += cc.batch) {
-                STREAM(limb.at(start + i)).wait(s_d);
-                uint32_t num_limbs = std::min((uint32_t)cc.batch, (uint32_t)(size - i));
-
-                INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst,
-                                                bytesFirst, STREAM(limb.at(start + i)).ptr()>>>(
-                    getGlobals(), limbptr.data + start + i, PARTITION(id, start + i), auxptr.data + start + i);
-
-                INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond,
-                                               bytesSecond, STREAM(limb.at(start + i)).ptr()>>>(
-                    getGlobals(), auxptr.data + start + i, PARTITION(id, start + i), DECOMPlimbptr[d].data + i);
-            }
-            for (size_t i = 0; i < size; i += cc.batch) {
-                s_d.wait(STREAM(limb.at(start + i)));
-            }
-        }
 
         if constexpr (PRINT) {
             cudaDeviceSynchronize();
@@ -851,11 +1246,72 @@ void LimbPartition::freeSpecialLimbs() {
         STREAM(SPECIALlimb.at(i)).wait(s);
     }
     SPECIALlimb.clear();
-    if (bufferSPECIAL != nullptr) {
-        GPUfree(bufferSPECIAL, id, 0, s.ptr());
-        //cudaFreeAsync(bufferSPECIAL, s.ptr());
-        bufferSPECIAL = nullptr;
+    freeSpecialBuffer();
+}
+
+/* Hand GPUfree the byte count GPUmalloc was given, and match the ROUTE. GPUfree derives the
+ * free-list bucket from `bytes` (0 files a large block in the 1 KB bucket, stranding it), and
+ * generateSpecialLimb's `for_communication` arm uses plain cudaMalloc, which must not reach cudaFreeAsync. */
+void LimbPartition::freeSpecialBuffer() {
+    if (bufferSPECIAL == nullptr)
+        return;
+    if (bufferSPECIALcudaMalloc) {
+        cudaFree(bufferSPECIAL);
+    } else {
+        assert(bufferSPECIALbytes > 0 && "special buffer freed without its GPUmalloc byte count");
+        GPUfree(bufferSPECIAL, id, (int)bufferSPECIALbytes, s.ptr());
     }
+    bufferSPECIAL = nullptr;
+    bufferSPECIALbytes = 0;
+    bufferSPECIALcudaMalloc = false;
+}
+
+/* FALLBACK limb-copy path. The default copy is the type-unaware copy_bytes_ (dispatch below);
+ * copy_v4_ and scalar copy_ survive only for when the limb width is unknown or non-uniform, or the
+ * limb does not tile the per-thread width. Neither takes a length, so the grid must cover N exactly.
+ * bytes_per_limb == 0 means "unknown or non-uniform widths" -> the typed kernels branch per limb. */
+#ifndef FIDESLIB_COPY_ABLATE
+#define FIDESLIB_COPY_ABLATE 0
+#endif
+
+static inline void launch_copy_limbs(uint32_t N, uint32_t nlimbs, cudaStream_t stream, void** src, void** dst,
+                                     size_t bytes_per_limb = 0) {
+#if FIDESLIB_COPY_ABLATE
+    // DIAGNOSTIC (default 0; produces incorrect results by design): skip the limb copy entirely,
+    // to bound what eliminating copies could save.
+    return;
+#endif
+    if (nlimbs == 0)
+        return;
+    /* Type-unaware byte copy at 16 B/thread, the path when the width is known: same geometry as copy_v4_
+     * without the per-element ISU64 branch, and correct for mixed-width chains by construction. 16 B/thread
+     * is the production optimum: wider per-thread work shrinks the grid and loses under co-scheduling. */
+    if (bytes_per_limb) {
+        constexpr int req = 16;
+        for (int bpt = req; bpt >= 16; bpt >>= 1) {
+            const size_t tile = (size_t)bpt * 128;
+            if (bytes_per_limb % tile != 0)
+                continue;
+            launchCopyBytes(dim3{(uint32_t)(bytes_per_limb / tile), nlimbs}, dim3{128}, stream, src, dst, bpt);
+            return;
+        }
+    }
+    if ((N % 512) == 0)
+        copy_v4_<<<dim3{N / 512, nlimbs}, 128, 0, stream>>>(src, dst);
+    else
+        copy_<<<dim3{N / 128, nlimbs}, 128, 0, stream>>>(src, dst);
+}
+
+/* Bytes per limb IF every limb in [begin, begin+n) has the same element width; 0 otherwise,
+ * which routes the caller to the typed fallback. Cheap (n <= ~54) and called once per copy. */
+static inline size_t uniform_limb_bytes(const std::vector<LimbRecord>& meta, size_t begin, size_t n, int N) {
+    if (n == 0 || begin + n > meta.size())
+        return 0;
+    const auto t = meta[begin].type;
+    for (size_t k = begin + 1; k < begin + n; ++k)
+        if (meta[k].type != t)
+            return 0;
+    return (size_t)N * (t == U32 ? 4u : 8u);
 }
 
 void LimbPartition::copyLimb(const LimbPartition& partition) {
@@ -865,8 +1321,8 @@ void LimbPartition::copyLimb(const LimbPartition& partition) {
     assert(*level == *partition.level);
     //std::cout << "GPU: " << id << " copy " << limbsize << "limbs" << std::endl;
     if (limbsize > 0)
-        copy_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)limbsize}, 128, 0, s.ptr()>>>(partition.limbptr.data,
-                                                                                   limbptr.data);
+        launch_copy_limbs((uint32_t)cc.N, (uint32_t)limbsize, s.ptr(), partition.limbptr.data, limbptr.data,
+                          uniform_limb_bytes(meta, 0, (size_t)limbsize, cc.N));
     /*
     for (size_t i = 0; i < partition.limb.size(); ++i) {
         STREAM(limb.at(i)).wait(s);
@@ -889,10 +1345,11 @@ void LimbPartition::copySpecialLimb(const LimbPartition& p) {
         STREAM(SPECIALlimb[i - (SPECIALmeta.size() > SPECIALlimb.size()) * start]).wait(s);
         uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
 
-        copy_<<<dim3{(uint32_t)cc.N / 128, size}, 128, 0,
-                STREAM(SPECIALlimb[i - (SPECIALmeta.size() > SPECIALlimb.size()) * start]).ptr()>>>(
+        launch_copy_limbs(
+            (uint32_t)cc.N, size, STREAM(SPECIALlimb[i - (SPECIALmeta.size() > SPECIALlimb.size()) * start]).ptr(),
             p.SPECIALlimbptr.data + i - (SPECIALmeta.size() > p.SPECIALlimb.size()) * start,
-            SPECIALlimbptr.data + i - (SPECIALmeta.size() > SPECIALlimb.size()) * start);
+            SPECIALlimbptr.data + i - (SPECIALmeta.size() > SPECIALlimb.size()) * start,
+            uniform_limb_bytes(SPECIALmeta, (size_t)i, (size_t)size, cc.N));
     }
     for (size_t i = start; i < start + num_limbs; i += cc.batch) {
         s.wait(STREAM(SPECIALlimb[i - (SPECIALmeta.size() > SPECIALlimb.size()) * start]));
@@ -935,6 +1392,9 @@ void LimbPartition::generateAllDecompAndDigit(bool iskey, int q_band) {
         //generateAllDecompLimb(bufferDECOMPandDIGIT, 0);
         generateGatherLimb(iskey);
         DECOMPlimb.resize(DECOMPmeta.size());
+        // Also assemble the digit-major concatenation of all DECOMP staging
+        // pointers (DECOMPALLptr) so modup can INTT every source limb in ONE wide launch.
+        std::vector<void*> all_ptr;
         for (size_t i = 0; i < DECOMPmeta.size(); ++i) {
             for (size_t j = 0; j < DECOMPmeta.at(i).size(); ++j) {
                 int pos = 0;
@@ -957,6 +1417,15 @@ void LimbPartition::generateAllDecompAndDigit(bool iskey, int q_band) {
             if (DECOMPmeta.at(i).size() * sizeof(void*) > 0)
                 cudaMemcpyAsync(DECOMPlimbptr[i].data, cpu_ptr.data(), DECOMPmeta.at(i).size() * sizeof(void*),
                                 cudaMemcpyHostToDevice, s.ptr());
+            all_ptr.insert(all_ptr.end(), cpu_ptr.begin(), cpu_ptr.end());
+        }
+        if (!all_ptr.empty()) {
+            assert((int)all_ptr.size() <= MAXP);
+            // NOTE: cudaMemcpyAsync from pageable host memory is staged synchronously by the
+            // driver, so all_ptr going out of scope right after is safe (same idiom as the
+            // per-digit copies above).
+            cudaMemcpyAsync(DECOMPALLptr.data, all_ptr.data(), all_ptr.size() * sizeof(void*),
+                            cudaMemcpyHostToDevice, s.ptr());
         }
         generateGatherLimb(iskey);
         generateAllDigitLimb(bufferDECOMPandDIGIT, 0 /*cc.N * decomp_limbs*/, q_band);
@@ -1065,7 +1534,8 @@ void LimbPartition::generateLimbSingleMalloc() {
     if (bufferLIMB == nullptr) {
         assert(limb.size() == 0);
 
-        bufferLIMB = (uint64_t*)GPUmalloc(device, cc.N * limbsize * 2 * sizeof(uint64_t), s.ptr());
+        bufferLIMBbytes = cc.N * limbsize * 2 * sizeof(uint64_t);
+        bufferLIMB = (uint64_t*)GPUmalloc(device, (int)bufferLIMBbytes, s.ptr());
         //cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * 2 * sizeof(uint64_t)), s.ptr());
     }
 
@@ -1082,20 +1552,14 @@ void LimbPartition::generateLimbConstant() {
     assert(limb.size() == 0);
     assert(limbsize <= meta.size());
 
-    if (bufferLIMB == nullptr) {
-        //bufferLIMB = (uint64_t*)GPUmalloc(device, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
-        //cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
-    } else {
-        GPUfree(bufferLIMB, id, 0, s.ptr());
+    if (bufferLIMB != nullptr) {
+        GPUfree(bufferLIMB, id, (int)bufferLIMBbytes, s.ptr());
         bufferLIMB = nullptr;
-        //cudaFreeAsync(&bufferLIMB, s.ptr());
-        //bufferLIMB = (uint64_t*)GPUmalloc(device, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
-        //cudaMallocAsync(&bufferLIMB, std::max(1ul, cc.N * limbsize * sizeof(uint64_t)), s.ptr());
+        bufferLIMBbytes = 0;
     }
 
     //limb.clear();
-    //generate(meta, limb, limbptr, (int)limbsize - 1, &auxptr, bufferLIMB, 0, nullptr, 0);
-    generate(meta, limb, limbptr, (int)limbsize - 1, nullptr /*&auxptr*/, nullptr, 0, nullptr, 0);
+    generate(meta, limb, limbptr, (int)limbsize - 1, nullptr /*&auxptr*/, bufferLIMB, 0, nullptr, 0);
 }
 
 void LimbPartition::loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data,
@@ -1175,6 +1639,8 @@ void LimbPartition::dotKSK(const LimbPartition& src, const LimbPartition& ksk, c
     if (ksk.key_q_band >= 0 && limbsize > ksk.key_q_band + 1)
         throw std::runtime_error("dotKSK: banded key (band " + std::to_string(ksk.key_q_band) +
                                  ") used at limbsize " + std::to_string(limbsize));
+    if (ksk.key_pack_bits)
+        throw std::runtime_error("dotKSK: per-limb path is not packed-key aware (FIDESLIB_KSK_PACK=0 to disable)");
 
     if constexpr (0) {
         std::map<int, int> used;
@@ -1393,6 +1859,9 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
     constexpr bool PRINT = false;
     assert(c0.SPECIALlimb.size() == SPECIALmeta.size());
     assert(c1.SPECIALlimb.size() == SPECIALmeta.size());
+    if (ksk_a.key_pack_bits)
+        throw std::runtime_error(
+            "*ModupDotKSK: NTT_KSK_DOT paths are not packed-key aware (FIDESLIB_KSK_PACK=0 to disable)");
     cudaSetDevice(device);
 
     //std::map<int, int> used;
@@ -1419,12 +1888,12 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
             }
 
         if constexpr (1) {  // Batched
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             for (int i = 0; i < size; i += cc.batch) {
                 STREAM(limb.at(start + i)).wait(s);
@@ -1460,12 +1929,12 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
         }
 
         if constexpr (1) {  // Batched
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int size = c0.SPECIALlimb.size();
             for (int i = 0; i < size; i += cc.batch) {
@@ -1523,12 +1992,12 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
                 if (size <= 0)
                     break;
 
-                constexpr int M = 4;
+                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
                 dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 for (int i = 0; i < size; i += cc.batch) {
                     STREAM(c0.limb.at(Lstart + i)).wait(s);
@@ -1569,7 +2038,7 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
     ksk_b.getS().wait(s);
 }
 
-int LimbPartition::getLimbSize(int level) {
+int LimbPartition::getLimbSize(int level) const {
     int size = 0;
     while (size < meta.size() && meta[size].id <= level) {
         //assert(limb.size() > size);
@@ -1586,6 +2055,9 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
     constexpr bool PRINT = false;
     assert(c0.SPECIALlimb.size() == SPECIALmeta.size());
     assert(c1.SPECIALlimb.size() == SPECIALmeta.size());
+    if (ksk_a.key_pack_bits)
+        throw std::runtime_error(
+            "*ModupDotKSK: NTT_KSK_DOT paths are not packed-key aware (FIDESLIB_KSK_PACK=0 to disable)");
     cudaSetDevice(device);
 
     //std::map<int, int> used;
@@ -1610,12 +2082,12 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
             }
 
         if constexpr (1) {  // Batched
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             for (int i = 0; i < size; i += cc.batch) {
                 STREAM(limb.at(start + i)).wait(s);
@@ -1651,12 +2123,12 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
         }
 
         if constexpr (1) {  // Batched
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int size = c0.SPECIALlimb.size();
             for (int i = 0; i < size; i += cc.batch) {
@@ -1712,12 +2184,12 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
                 if (size <= 0)
                     break;
 
-                constexpr int M = 4;
+                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
                 dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 for (int i = 0; i < size; i += cc.batch) {
                     STREAM(c0.limb.at(Lstart + i)).wait(s);
@@ -1765,6 +2237,9 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
     constexpr bool PRINT = false;
     assert(c0.SPECIALlimb.size() == SPECIALmeta.size());
     assert(c1.SPECIALlimb.size() == SPECIALmeta.size());
+    if (ksk_a.key_pack_bits)
+        throw std::runtime_error(
+            "*ModupDotKSK: NTT_KSK_DOT paths are not packed-key aware (FIDESLIB_KSK_PACK=0 to disable)");
     cudaSetDevice(device);
 
     //std::map<int, int> used;
@@ -1789,12 +2264,12 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
             }
 
         if constexpr (1) {  // Batched
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             for (int i = 0; i < size; i += cc.batch) {
                 STREAM(limb.at(start + i)).wait(s);
@@ -1830,12 +2305,12 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
         }
 
         if constexpr (1) {  // Batched
-            constexpr int M = 4;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int size = c0.SPECIALlimb.size();
             for (int i = 0; i < size; i += cc.batch) {
@@ -1891,12 +2366,12 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
                 if (size <= 0)
                     break;
 
-                constexpr int M = 4;
+                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
                 dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 for (int i = 0; i < size; i += cc.batch) {
                     STREAM(c0.limb.at(Lstart + i)).wait(s);
@@ -1994,6 +2469,7 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
         }
         if (limbsize > 0)
             NTT<algo, NTT_MODDOWN>(cc.batch, false, NTT_fusion_fields{.op2 = &auxLimbs});
+
 
         if constexpr (PRINT) {
             std::cout << "Output ModDown after sub mult.";
@@ -2106,12 +2582,12 @@ void LimbPartition::modupInto(LimbPartition& partition, LimbPartition& aux_parti
         if (size <= 0)
             break;
 
-        constexpr int M = 4;
+        const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
         dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
         dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-        int bytesFirst = 8 * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-        int bytesSecond = 8 * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
         for (int i = 0; i < size; i += cc.batch) {
             STREAM(limb.at(start + i)).wait(s);
@@ -2123,7 +2599,9 @@ void LimbPartition::modupInto(LimbPartition& partition, LimbPartition& aux_parti
 
             INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond,
                                            bytesSecond, STREAM(limb.at(start + i)).ptr()>>>(
-                getGlobals(), auxptr.data + start + i, PARTITION(id, start + i), partition.DECOMPlimbptr[d].data + i);
+                getGlobals(), auxptr.data + start + i, PARTITION(id, start + i),
+                partition.DECOMPlimbptr[d].data + i);
+
         }
         for (size_t i = 0; i < size; i += cc.batch) {
             s.wait(STREAM(limb.at(start + i)));
@@ -2186,63 +2664,94 @@ void LimbPartition::multScalar(std::vector<uint64_t>& vector) {
      */
     const int limbsize = getLimbSize(*level);
 
-    uint64_t* elems;
-    cudaMallocAsync(&elems, vector.size() * sizeof(uint64_t), s.ptr());
-    //cudaMalloc(&elems, vector.size() * sizeof(uint64_t));
+    // Persistent operand buffer (scratch slot); falls back to a per-call allocation if the slot is unavailable.
+    const size_t elems_bytes = vector.size() * sizeof(uint64_t);
+    uint64_t* elems = (uint64_t*)scratchGet(SC_SCALAR_MULT, elems_bytes);
+    const bool elems_persist = elems != nullptr;
+    if (!elems_persist)
+        cudaMallocAsync((void**)&elems, elems_bytes, s.ptr());
     cudaMemcpyAsync(elems, vector.data(), vector.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
 
     for (int i = 0; i < limbsize; i += cc.batch) {
         STREAM(limb[i]).wait(s);
         uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
-        Scalar_mult_<ALGO_BARRETT><<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(
-            limbptr.data + i, elems, PARTITION(id, i), nullptr);
+        const int smul_bpt = fideslibAddBytes();
+        const size_t smul_bpl = FIDESLIB_ADD_VEC ? uniform_limb_bytes(meta, (size_t)i, (size_t)num_limbs, cc.N) : 0;
+        if (smul_bpl && smul_bpt >= 16 && (smul_bpl % (size_t)(smul_bpt * 128)) == 0)
+            launchScalarMultBytes(dim3{(uint32_t)(smul_bpl / (smul_bpt * 128)), num_limbs}, dim3{128},
+                                  STREAM(limb[i]).ptr(), limbptr.data + i, elems, PARTITION(id, i), nullptr, smul_bpt);
+        else
+            Scalar_mult_<ALGO_BARRETT><<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(
+                limbptr.data + i, elems, PARTITION(id, i), nullptr);
     }
     for (int i = 0; i < limbsize; i += cc.batch) {
         s.wait(STREAM(limb[i]));
     }
-    cudaFreeAsync(elems, s.ptr());
+    if (!elems_persist)
+        cudaFreeAsync(elems, s.ptr());
 }
 
 void LimbPartition::addScalar(std::vector<uint64_t>& vector) {
     const int limbsize = getLimbSize(*level);
     cudaSetDevice(device);
-    uint64_t* elems;
-    cudaMallocAsync(&elems, vector.size() * sizeof(uint64_t), s.ptr());
-    //cudaMalloc(&elems, vector.size() * sizeof(uint64_t));
+    // Persistent operand buffer (scratch slot); falls back to a per-call allocation if the slot is unavailable.
+    const size_t elems_bytes = vector.size() * sizeof(uint64_t);
+    uint64_t* elems = (uint64_t*)scratchGet(SC_SCALAR_ADD, elems_bytes);
+    const bool elems_persist = elems != nullptr;
+    if (!elems_persist)
+        cudaMallocAsync((void**)&elems, elems_bytes, s.ptr());
     cudaMemcpyAsync(elems, vector.data(), vector.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
     for (int i = 0; i < limbsize; i += cc.batch) {
         STREAM(limb[i]).wait(s);
         uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
         int primeid_init = PARTITION(id, i);
+        const int scalar_add_bpt = fideslibAddBytes();
+        const size_t scalar_add_bpl = FIDESLIB_ADD_VEC ? uniform_limb_bytes(meta, (size_t)i, (size_t)num_limbs, cc.N) : 0;
+        if (scalar_add_bpl && (scalar_add_bpl % (size_t)(scalar_add_bpt * 128)) == 0)
+            launchScalarAddSubBytes(dim3{(uint32_t)(scalar_add_bpl / (scalar_add_bpt * 128)), num_limbs}, dim3{128},
+                                    STREAM(limb[i]).ptr(), limbptr.data + i, elems, PARTITION(id, i), scalar_add_bpt, false);
+        else
         scalar_add_<<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(limbptr.data + i, elems,
                                                                                               primeid_init);
     }
     for (int i = 0; i < limbsize; i += cc.batch) {
         s.wait(STREAM(limb[i]));
     }
-    cudaFreeAsync(elems, s.ptr());
+    if (!elems_persist)
+        cudaFreeAsync(elems, s.ptr());
 }
 
 void LimbPartition::subScalar(std::vector<uint64_t>& vector) {
     const int limbsize = getLimbSize(*level);
     cudaSetDevice(device);
-    uint64_t* elems;
-    cudaMallocAsync(&elems, vector.size() * sizeof(uint64_t), s.ptr());
-    //cudaMalloc(&elems, vector.size() * sizeof(uint64_t));
+    // Persistent operand buffer (scratch slot); falls back to a per-call allocation if the slot is unavailable.
+    const size_t elems_bytes = vector.size() * sizeof(uint64_t);
+    uint64_t* elems = (uint64_t*)scratchGet(SC_SCALAR_SUB, elems_bytes);
+    const bool elems_persist = elems != nullptr;
+    if (!elems_persist)
+        cudaMallocAsync((void**)&elems, elems_bytes, s.ptr());
     cudaMemcpyAsync(elems, vector.data(), vector.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
     for (int i = 0; i < limbsize; i += cc.batch) {
         STREAM(limb[i]).wait(s);
         uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
+        const int scalar_sub_bpt = fideslibAddBytes();
+        const size_t scalar_sub_bpl = FIDESLIB_ADD_VEC ? uniform_limb_bytes(meta, (size_t)i, (size_t)num_limbs, cc.N) : 0;
+        if (scalar_sub_bpl && (scalar_sub_bpl % (size_t)(scalar_sub_bpt * 128)) == 0)
+            launchScalarAddSubBytes(dim3{(uint32_t)(scalar_sub_bpl / (scalar_sub_bpt * 128)), num_limbs}, dim3{128},
+                                    STREAM(limb[i]).ptr(), limbptr.data + i, elems, PARTITION(id, i), scalar_sub_bpt, true);
+        else
         scalar_sub_<<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(limbptr.data + i, elems,
                                                                                               PARTITION(id, i));
     }
     for (int i = 0; i < limbsize; i += cc.batch) {
         s.wait(STREAM(limb[i]));
     }
-    cudaFreeAsync(elems, s.ptr());
+    if (!elems_persist)
+        cudaFreeAsync(elems, s.ptr());
 }
 
 void LimbPartition::add(const LimbPartition& a, const LimbPartition& b, const bool ext_a, const bool ext_b) {
+    FIDESLIB_ADD_CENSUS_HIT();
     cudaSetDevice(device);
     s.wait(a.getS());
     s.wait(b.getS());
@@ -2272,15 +2781,15 @@ void LimbPartition::add(const LimbPartition& a, const LimbPartition& b, const bo
             uint32_t size = std::min((int)start + num_limbs - (int)i, cc.batch);
 
             if (!ext_a && ext_b) {
-                copy_<<<dim3{(uint32_t)cc.N / 128, size}, 128, 0, STREAM(SPECIALlimb[i]).ptr()>>>(
-                    b.SPECIALlimbptr.data + i,
-                    SPECIALlimbptr.data +
-                        i);  // TODO: have to check if Limbpartition comes from a plaintext, where extension limbs are mapped differently
+                // TODO: have to check if Limbpartition comes from a plaintext, where extension limbs are mapped differently
+                launch_copy_limbs((uint32_t)cc.N, size, STREAM(SPECIALlimb[i]).ptr(), b.SPECIALlimbptr.data + i,
+                                  SPECIALlimbptr.data + i,
+                                  uniform_limb_bytes(SPECIALmeta, (size_t)i, (size_t)size, cc.N));
             } else if (!ext_b && ext_a) {
-                copy_<<<dim3{(uint32_t)cc.N / 128, size}, 128, 0, STREAM(SPECIALlimb[i]).ptr()>>>(
-                    a.SPECIALlimbptr.data + i,
-                    SPECIALlimbptr.data +
-                        i);  // TODO: have to check if Limbpartition comes from a plaintext, where extension limbs are mapped differently
+                // TODO: have to check if Limbpartition comes from a plaintext, where extension limbs are mapped differently
+                launch_copy_limbs((uint32_t)cc.N, size, STREAM(SPECIALlimb[i]).ptr(), a.SPECIALlimbptr.data + i,
+                                  SPECIALlimbptr.data + i,
+                                  uniform_limb_bytes(SPECIALmeta, (size_t)i, (size_t)size, cc.N));
             } else {
                 add_<<<dim3{(uint32_t)cc.N / 128, size}, 128, 0, STREAM(SPECIALlimb[i]).ptr()>>>(
                     SPECIALlimbptr.data + i, a.SPECIALlimbptr.data + i, b.SPECIALlimbptr.data + i,
@@ -2369,6 +2878,79 @@ void LimbPartition::broadcastLimb0() {
     assert(limbsize - 1 > 0);
     broadcastLimb0_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)limbsize - 1}, 128, 0, s.ptr()>>>(limbptr.data);
 }
+
+void LimbPartition::compositeModRaise(const int d, const std::vector<uint64_t>& qhatinv,
+                                      const std::vector<uint64_t>& qhat) {
+    const int limbsize = getLimbSize(*level);
+    cudaSetDevice(device);
+    assert(limbsize > d);
+    assert((int)qhatinv.size() >= d && (int)qhat.size() >= d * limbsize);
+
+    // The kernel overwrites every limb, including the d source limbs — snapshot the sources
+    // first. Slots are 8*N bytes each regardless of limb width (raw byte copies; the kernel
+    // re-reads them at prime k's width via ISU64).
+    const size_t slot = (size_t)cc.N * sizeof(uint64_t);
+    uint8_t* snap;
+    cudaMallocAsync(
+        (void**)&snap, (size_t)d * slot + d * sizeof(void*) + (qhatinv.size() + qhat.size()) * sizeof(uint64_t),
+        s.ptr());
+    void** srcptrs = (void**)(snap + (size_t)d * slot);
+    uint64_t* dev_qhatinv = (uint64_t*)(srcptrs + d);
+    uint64_t* dev_qhat = dev_qhatinv + qhatinv.size();
+
+    std::vector<void*> hostptrs(d);
+    for (int k = 0; k < d; ++k) {
+        hostptrs[k] = snap + (size_t)k * slot;
+        void* v = nullptr;
+        SWITCH_RET(limb.at(k), v.data, v);
+        const size_t bytes = (size_t)cc.N * (limb.at(k).index() == U64 ? sizeof(uint64_t) : sizeof(uint32_t));
+        cudaMemcpyAsync(hostptrs[k], v, bytes, cudaMemcpyDeviceToDevice, s.ptr());
+    }
+    cudaMemcpyAsync(srcptrs, hostptrs.data(), d * sizeof(void*),
+                    cudaMemcpyHostToDevice, s.ptr());
+    cudaMemcpyAsync(dev_qhatinv, qhatinv.data(),
+                    qhatinv.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, s.ptr());
+    cudaMemcpyAsync(dev_qhat, qhat.data(),
+                    qhat.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, s.ptr());
+
+    compositeModRaise_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)limbsize}, 128, 0, s.ptr()>>>(limbptr.data, srcptrs, d,
+                                                                                           dev_qhatinv, dev_qhat);
+    cudaFreeAsync(snap, s.ptr());
+}
+void LimbPartition::coeffLiftCentered(const uint64_t q0, const uint64_t q1,
+                                      const uint64_t q0inv_mod_q1, const uint64_t Qhalf,
+                                      const std::vector<uint64_t>& Q0_mod_qi) {
+    const int limbsize = getLimbSize(*level);
+    cudaSetDevice(device);
+    assert(limbsize > 2);
+    assert((int)Q0_mod_qi.size() >= limbsize);
+
+    // Same snapshot discipline as compositeModRaise: the kernel overwrites EVERY limb including
+    // the two sources, so copy them aside first. Slots are 8*N bytes regardless of limb width.
+    const size_t slot = (size_t)cc.N * sizeof(uint64_t);
+    uint8_t* snap;
+    cudaMallocAsync((void**)&snap,
+                                     2 * slot + 2 * sizeof(void*) + Q0_mod_qi.size() * sizeof(uint64_t), s.ptr());
+    void** srcptrs = (void**)(snap + 2 * slot);
+    uint64_t* dev_Q0mod = (uint64_t*)(srcptrs + 2);
+
+    std::vector<void*> hostptrs(2);
+    for (int k = 0; k < 2; ++k) {
+        hostptrs[k] = snap + (size_t)k * slot;
+        void* v = nullptr;
+        SWITCH_RET(limb.at(k), v.data, v);
+        const size_t bytes = (size_t)cc.N * (limb.at(k).index() == U64 ? sizeof(uint64_t) : sizeof(uint32_t));
+        cudaMemcpyAsync(hostptrs[k], v, bytes, cudaMemcpyDeviceToDevice, s.ptr());
+    }
+    cudaMemcpyAsync(srcptrs, hostptrs.data(), 2 * sizeof(void*),
+                    cudaMemcpyHostToDevice, s.ptr());
+    cudaMemcpyAsync(dev_Q0mod, Q0_mod_qi.data(),
+                    Q0_mod_qi.size() * sizeof(uint64_t), cudaMemcpyHostToDevice, s.ptr());
+
+    coeffLiftCentered2_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)limbsize}, 128, 0, s.ptr()>>>(
+        limbptr.data, srcptrs, q0, q1, q0inv_mod_q1, Qhalf, dev_Q0mod);
+    cudaFreeAsync(snap, s.ptr());
+}
 void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*> ps, std::vector<uint64_t>& weights) {
     const int limbsize = getLimbSize(*level);
     cudaSetDevice(device);
@@ -2376,25 +2958,39 @@ void LimbPartition::evalLinearWSum(uint32_t n, std::vector<const LimbPartition*>
         s.wait(ps[i]->getS());
     }
 
-    uint64_t* elems;
-    cudaMallocAsync(&elems, weights.size() * sizeof(uint64_t), s.ptr());
-    //cudaMalloc(&elems, weights.size() * sizeof(uint64_t));
-    cudaMemcpyAsync(elems, weights.data(), weights.size() * sizeof(uint64_t), cudaMemcpyDefault, s.ptr());
+    // Persistent operand buffer (scratch slot); falls back to a per-call allocation if the slot is unavailable.
+    const size_t elems_bytes = weights.size() * sizeof(uint64_t);
+    uint64_t* elems = (uint64_t*)scratchGet(SC_LINWSUM_W, elems_bytes);
+    const bool elems_persist = elems != nullptr;
+    if (!elems_persist)
+        cudaMallocAsync((void**)&elems, elems_bytes, s.ptr());
+    cudaMemcpyAsync(elems, weights.data(), elems_bytes, cudaMemcpyDefault, s.ptr());
     std::vector<void**> psptr(n, nullptr);
     for (int i = 0; i < n; ++i) {
         psptr[i] = ps[i]->limbptr.data;
         assert(ps[i]->limb.size() >= limbsize);
     }
-    void*** d_psptr;
-    cudaMallocAsync(&d_psptr, psptr.size() * sizeof(void**), s.ptr());
-    //cudaMalloc(&d_psptr, psptr.size() * sizeof(void**));
-    cudaMemcpyAsync(d_psptr, psptr.data(), psptr.size() * sizeof(void**), cudaMemcpyDefault, s.ptr());
+    const size_t psptr_bytes = psptr.size() * sizeof(void**);
+    void*** d_psptr = (void***)scratchGet(SC_LINWSUM_PS, psptr_bytes);
+    const bool psptr_persist = d_psptr != nullptr;
+    if (!psptr_persist)
+        cudaMallocAsync((void**)&d_psptr, psptr_bytes, s.ptr());
+    cudaMemcpyAsync(d_psptr, psptr.data(), psptr_bytes, cudaMemcpyDefault, s.ptr());
 
-    if (!limb.empty())
-        eval_linear_w_sum_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)limbsize}, 128, 0, s.ptr()>>>(
-            n, limbptr.data, d_psptr, elems, PARTITION(id, 0));
-    cudaFreeAsync(elems, s.ptr());
-    cudaFreeAsync(d_psptr, s.ptr());
+    {
+        const int elws_bpt = fideslibAddBytes();
+        const size_t elws_bpl = FIDESLIB_ADD_VEC ? uniform_limb_bytes(meta, 0, (size_t)limbsize, cc.N) : 0;
+        if (!limb.empty() && elws_bpl && elws_bpt >= 16 && (elws_bpl % (size_t)(elws_bpt * 128)) == 0)
+            launchEvalLinearWSumBytes(dim3{(uint32_t)(elws_bpl / (elws_bpt * 128)), (uint32_t)limbsize}, dim3{128},
+                                      s.ptr(), n, limbptr.data, d_psptr, elems, PARTITION(id, 0), elws_bpt);
+        else if (!limb.empty())
+            eval_linear_w_sum_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)limbsize}, 128, 0, s.ptr()>>>(
+                n, limbptr.data, d_psptr, elems, PARTITION(id, 0));
+    }
+    if (!elems_persist)
+        cudaFreeAsync(elems, s.ptr());
+    if (!psptr_persist)
+        cudaFreeAsync(d_psptr, s.ptr());
     for (uint32_t i = 0; i < n; ++i) {
         ps[i]->getS().wait(s);
     }

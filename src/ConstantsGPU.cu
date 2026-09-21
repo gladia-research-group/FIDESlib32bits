@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include "ConstantsGPU.cuh"
 #include "CudaUtils.cuh"
 #include "Math.cuh"
@@ -27,6 +30,15 @@ __global__ void printConstants() {
         printf("Prime %d: %lu ", i, C_.primes[i]);
     }
     printf("\n");
+}
+
+/* Lazy-reduction BConv: floor(2^64 / q), the reciprocal for a Barrett reduction
+ * valid across the WHOLE u64 range — unlike Neal_reduce_32's mu, which is tuned to a single
+ * product and whose reducer truncates its input to ~2^56. A BConv dot that defers reduction
+ * accumulates n products of up to (q-1)^2, so it needs this one. q is an odd prime > 2, so
+ * the quotient fits comfortably in u64. */
+uint64_t mu64_precomp(const uint64_t q) {
+    return (uint64_t)((((__uint128_t)1) << 64) / (__uint128_t)q);
 }
 
 uint64_t mu_new(const uint64_t q, const uint32_t num_bits) {
@@ -70,6 +82,13 @@ uint64_t unity_root(const uint64_t q, const uint64_t order) {
 
 uint64_t shoup_precomp(uint64_t val, int primeid, Constants& host_constants_) {
     Constants& host_constants = host_constants_;
+    // The Shoup constant must match the LIMB WIDTH of prime `primeid`: Shoup_mult_32
+    // expects val*2^32/p, Shoup_mult_64 expects val*2^64/p. Hard-coding the 2^64 form and
+    // then reading it as uint32_t for a U32 prime yields garbage, so every moddown/keyswitch
+    // Shoup constant (P_inv_shoup, ModDown_*_shoup, N_shoup, root_shoup, ...) corrupted
+    // mult/rotation on NATIVEINT=32. Mirror the width-aware psi_shoup precompute below.
+    if (!HISU64(primeid))
+        return (uint64_t)((val) << 1) * (1ul << 31) / hC_.primes[primeid];
     return (__uint128_t)((val) << 1) * (1ul << 63) / hC_.primes[primeid];
 }
 
@@ -83,16 +102,19 @@ uint64_t shoup_precomp(uint64_t val, int primeid, Constants& host_constants_) {
         }                                \
     } while (false)
 
-#define free(name)                         \
-    do {                                   \
-        if (name[i] != nullptr) {          \
-            if (type & (1 << i)) {         \
-                delete (uint64_t*)name[i]; \
-            } else {                       \
-                delete (uint32_t*)name[i]; \
-            }                              \
-            name[i] = nullptr;             \
-        }                                  \
+#define free(name)                                    \
+    do {                                              \
+        if (name[i] != nullptr) {                     \
+            /* n32: (1 << i) was an int shift — UB   \
+               for i >= 31, and prime ids reach       \
+               MAXP-1 = 63. Must match ISU64. */      \
+            if (type & (((uint64_t)1) << (i))) {      \
+                delete (uint64_t*)name[i];            \
+            } else {                                  \
+                delete (uint32_t*)name[i];            \
+            }                                         \
+            name[i] = nullptr;                        \
+        }                                             \
     } while (false)
 
 Global::~Global() {
@@ -145,6 +167,19 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
         hC_.L = q.size();
         hC_.K = p.size();
 
+        // n32 knife-edge: every per-prime array in Constants/Global is sized MAXP and the
+        // U32/U64 mask is one bit per prime id in a single uint64_t, so the TOTAL prime
+        // count (q towers + specials) must fit MAXP = 64. The composite-scaling prod chain
+        // (56 q + 8 specials at dnum=7) sits EXACTLY at this cap. Fail loudly in Release
+        // too — an overflow here corrupts neighbouring constants silently.
+        if (q.size() + p.size() > (size_t)MAXP) {
+            std::fprintf(stderr,
+                         "FIDESlib: chain has %zu q-primes + %zu specials = %zu > MAXP=%d — "
+                         "the constant tables cannot hold this chain (see ConstantsGPU.cuh)\n",
+                         q.size(), p.size(), q.size() + p.size(), MAXP);
+            std::abort();
+        }
+
         hC_.type = 0;
         for (auto& i : meta)
             for (auto& j : i) {
@@ -169,6 +204,7 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
             hC_.N_inv_shoup[i] = shoup_precomp(hC_.N_inv[i], i, host_constants);
 
             hC_.prime_better_barret_mu[i] = mu_new(q[i].p, q[i].bits);
+            hC_.prime_mu64[i] = mu64_precomp(q[i].p);
             hC_.prime_bits[i] = q[i].bits;
         }
 
@@ -181,6 +217,7 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
             ;
 
             hC_.prime_better_barret_mu[hC_.L + i] = mu_new(hC_.primes[hC_.L + i], p[i].bits);
+            hC_.prime_mu64[hC_.L + i] = mu64_precomp(hC_.primes[hC_.L + i]);
             hC_.prime_bits[hC_.L + i] = p[i].bits;
         }
     }
@@ -541,6 +578,27 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                                hG_.ModDown_matrix_shoup, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
                 }
+
+                if (hC_.type == 0) {
+                    // u32 shadow for the all-U32 fast path (see Globals decl): exact narrow
+                    // copies — residues < 2^28, shoup already 2^32-scaled via shoup_precomp.
+                    constexpr size_t n = sizeof(Global::ModDown_matrix) / sizeof(uint64_t);
+                    std::vector<uint32_t> m32(n), s32(n);
+                    const uint64_t* m = &hG_.ModDown_matrix[0][0];
+                    const uint64_t* s = &hG_.ModDown_matrix_shoup[0][0];
+                    for (size_t j = 0; j < n; ++j) {
+                        m32[j] = (uint32_t)m[j];
+                        s32[j] = (uint32_t)s[j];
+                    }
+                    for (int i = 0; i < GPUid.size(); ++i) {
+                        cudaSetDevice(GPUid[i]);
+                        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, ModDown_matrix32), m32.data(),
+                                   n * sizeof(uint32_t), cudaMemcpyHostToDevice);
+                        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, ModDown_matrix_shoup32),
+                                   s32.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice);
+                        CudaCheckErrorMod;
+                    }
+                }
             }
 
             {
@@ -621,6 +679,19 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
 
                 constexpr int bytes = sizeof(Global::DecompAndModUp_matrix);
                 assert(bytes == 8 * 64 * 64 * 64 * 8);
+                // u32 shadow for the all-U32 fast path — converted once, uploaded per GPU below.
+                constexpr size_t nn = sizeof(Global::DecompAndModUp_matrix) / sizeof(uint64_t);
+                std::vector<uint32_t> m32, s32;
+                if (hC_.type == 0) {
+                    m32.resize(nn);
+                    s32.resize(nn);
+                    const uint64_t* m = &hG_.DecompAndModUp_matrix[0][0][0][0];
+                    const uint64_t* s = &hG_.DecompAndModUp_matrix_shoup[0][0][0][0];
+                    for (size_t j = 0; j < nn; ++j) {
+                        m32[j] = (uint32_t)m[j];
+                        s32[j] = (uint32_t)s[j];
+                    }
+                }
                 for (int i = 0; i < GPUid.size(); ++i) {
                     cudaSetDevice(GPUid[i]);
                     /*
@@ -634,6 +705,13 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                     cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_matrix_shoup),
                                hG_.DecompAndModUp_matrix_shoup, bytes, cudaMemcpyHostToDevice);
                     CudaCheckErrorMod;
+                    if (hC_.type == 0) {
+                        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_matrix32),
+                                   m32.data(), nn * sizeof(uint32_t), cudaMemcpyHostToDevice);
+                        cudaMemcpy(((char*)hG_.globals[i]) + offsetof(Global::Globals, DecompAndModUp_matrix_shoup32),
+                                   s32.data(), nn * sizeof(uint32_t), cudaMemcpyHostToDevice);
+                        CudaCheckErrorMod;
+                    }
                     /*
                     cudaMemcpyFromSymbol(hG_.DecompAndModUp_matrix, hG_.globals[i].DecompAndModUp_matrix, bytes, 0,
                                          cudaMemcpyDeviceToHost);

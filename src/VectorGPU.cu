@@ -6,14 +6,14 @@
 namespace FIDESlib {
 template <typename T>
 VectorGPU<T>::VectorGPU(VectorGPU<T>&& v) noexcept
-    : freeing(v.freeing), managed(v.managed), data(v.data), size(v.size), device(v.device) {
+    : freeing(v.freeing), managed(v.managed), data(v.data), size(v.size), alloc(v.alloc), device(v.device) {
     v.freeing = true;
     v.managed = false;
 }
 
 template <typename T>
 VectorGPU<T>::VectorGPU(T* data, const int size, const int device, const int offset)
-    : data(data + offset), size(size), device(device), managed(false), freeing(true) {
+    : data(data + offset), size(size), alloc(size), device(device), managed(false), freeing(true) {
     assert(data != nullptr);
     {
         cudaPointerAttributes att{};
@@ -40,15 +40,15 @@ void VectorGPU<T>::free(Stream& stream) {
     }
     assert(!freeing);
     //cudaDeviceSynchronize();
-    GPUfree(data, device, sizeof(T) * size, stream.ptr(), true);
+    GPUfree(data, device, sizeof(T) * alloc, stream.ptr(), true);
     //cudaFreeAsync((void*)data, stream.ptr());
     freeing = true;
     Out(MEMORY, "Managed vector free OK");
 }
 
 template <typename T>
-VectorGPU<T>::VectorGPU(Stream& stream, const int size, const int device, const T* src)
-    : data(nullptr), size(size), device(device), freeing(false), managed(true) {
+VectorGPU<T>::VectorGPU(Stream& stream, const int size, const int device, const T* src, const int alloc_size)
+    : data(nullptr), size(size), alloc(std::max(size, alloc_size)), device(device), freeing(false), managed(true) {
     assert(device >= 0);
     {
         int device_count = -1;
@@ -61,7 +61,7 @@ VectorGPU<T>::VectorGPU(Stream& stream, const int size, const int device, const 
         assert(dev == device);
         //cudaSetDevice(device);
     }
-    int bytes = size * sizeof(T);
+    int bytes = alloc * sizeof(T);
 
     if (size == 0) {
         managed = false;
@@ -73,7 +73,7 @@ VectorGPU<T>::VectorGPU(Stream& stream, const int size, const int device, const 
         //cudaMallocAsync(&data, bytes, stream.ptr());
 
         if (src != nullptr) {
-            cudaMemcpyAsync(data, src, bytes, cudaMemcpyHostToDevice, stream.ptr());
+            cudaMemcpyAsync(data, src, size * sizeof(T), cudaMemcpyHostToDevice, stream.ptr());
         }
     }
     Out(MEMORY, "Managed vector construct OK");

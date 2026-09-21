@@ -35,6 +35,12 @@ endif()
 # Option to auto-install patched OpenFHE.
 option(FIDESLIB_INSTALL_OPENFHE "Set ON to install a patched version of OpenFHE." OFF)
 
+# NATIVEINT backend width of the auto-installed OpenFHE. 32 additionally applies
+# deps/openfhe-1.4.2-native32.patch (the CKKS encode fix the 32-bit build needs).
+set(FIDESLIB_OPENFHE_NATIVE_SIZE "64" CACHE STRING
+	"NATIVE_SIZE of the OpenFHE installed by FIDESLIB_INSTALL_OPENFHE (32 or 64).")
+set_property(CACHE FIDESLIB_OPENFHE_NATIVE_SIZE PROPERTY STRINGS 32 64)
+
 # Option to compile the benchmark suite.
 option(FIDESLIB_COMPILE_BENCHMARKS "Set ON to compile the FIDESlib benchmark suite." ON)
 
@@ -128,39 +134,6 @@ else()
   message(STATUS "NCCL not found: building without NCCL support")
 endif()
 
-############### NVTX v3 Configuration (Header-Only) ###################
-
-# Locate nvtx3.hpp (C++ header-only NVTX3 API, shipped with CUDA in cub/detail directory).
-# The CUDA toolkit ships NVTX3 v3 headers in the CUB library; we search in multiple standard locations.
-if (NOT DEFINED NVTX3_INCLUDE)
-  # Search in CUDA toolkit targets directory (primary location in CUDA 11.5+)
-  file(GLOB _nvtx3_from_cuda
-      "${CUDA_PATH}/targets/*/include"
-      "${CUDA_PATH}/targets/x86_64-linux/include")
-  
-  # Search in nsight-compute and nsight-systems directories (alternative locations)
-  file(GLOB _nvtx3_from_nsight
-      "${CUDA_PATH}/opt/nvidia/nsight-compute/*/host/target-linux-x64/nvtx/include"
-      "${CUDA_PATH}/opt/nvidia/nsight-systems/*/target-linux-x64/nvtx/include")
-  
-  foreach(_dir IN LISTS _nvtx3_from_cuda _nvtx3_from_nsight)
-    # Check for cub/detail/nvtx3.hpp (standard location in CUDA 11.5+)
-    if(EXISTS "${_dir}/cub/detail/nvtx3.hpp")
-      set(NVTX3_INCLUDE "${_dir}")
-      break()
-    endif()
-  endforeach()
-endif()
-
-if (NVTX3_INCLUDE)
-  message(STATUS "Found NVTX v3 header-only API (cub/detail/nvtx3.hpp) at: ${NVTX3_INCLUDE}")
-  include_directories("${NVTX3_INCLUDE}")
-  add_compile_definitions(ENABLE_NVTX)
-  message(STATUS "FIDESlib compiled with NVTX v3 profiling support (header-only, no linking required)")
-else()
-  message(FATAL_ERROR "NVTX v3 header (cub/detail/nvtx3.hpp) not found. Pass -DNVTX3_INCLUDE=<dir> to specify the include path. For example: cmake ... -DNVTX3_INCLUDE=/usr/local/cuda/targets/x86_64-linux/include")
-endif()
-
 ############### OpenFHE Configuration ###################
 
 # Default runs will not update nor install OpenFHE. Specify manually to install.
@@ -170,7 +143,9 @@ if (FIDESLIB_INSTALL_OPENFHE)
 	if (NOT EXISTS "${FIDESLIB_OPENFHE_BUILD_SCRIPT}")
 		message(FATAL_ERROR "OpenFHE build script not found at ${FIDESLIB_OPENFHE_BUILD_SCRIPT}")
 	endif()
+	message(STATUS "Installing patched OpenFHE (NATIVE_SIZE=${FIDESLIB_OPENFHE_NATIVE_SIZE})")
 	execute_process(COMMAND "${FIDESLIB_OPENFHE_BUILD_SCRIPT}" "${OPENFHE_INSTALL_PREFIX}"
+					"${FIDESLIB_OPENFHE_NATIVE_SIZE}"
 					WORKING_DIRECTORY "${FIDESLIB_DEPS_DIR}"
 					COMMAND_ERROR_IS_FATAL ANY)
 endif()
@@ -403,7 +378,7 @@ if (FIDESLIB_COMPILE_TESTS)
 
 	set(INSTALL_GTEST OFF)
 
-	FetchContent_Declare(googletest GIT_REPOSITORY https://github.com/google/googletest.git GIT_TAG main)
+	FetchContent_Declare(googletest GIT_REPOSITORY https://github.com/google/googletest.git GIT_TAG v1.14.0)
 	FetchContent_MakeAvailable(googletest)
 	include(GoogleTest)
 
@@ -440,20 +415,13 @@ endif()
 
 ############### Benchmark ###################
 
-############### Python Bindings ###################
-
-option(FIDESLIB_COMPILE_PYTHON_BINDINGS "Build _pyfideslib pybind11 module" OFF)
-if (FIDESLIB_COMPILE_PYTHON_BINDINGS)
-    add_subdirectory(bindings)
-endif()
-
 if (FIDESLIB_COMPILE_BENCHMARKS)
 
 	set(BENCHMARK_ENABLE_INSTALL OFF)
 	set(BENCHMARK_INSTALL_DOCS OFF)
 	set(BENCHMARK_DOWNLOAD_DEPENDENCIES ON)
 
-	FetchContent_Declare(benchmark GIT_REPOSITORY https://github.com/google/benchmark.git GIT_TAG main)
+	FetchContent_Declare(benchmark GIT_REPOSITORY https://github.com/google/benchmark.git GIT_TAG v1.8.3)
 	FetchContent_MakeAvailable(benchmark)
 
 	set(BENCH_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/bench)

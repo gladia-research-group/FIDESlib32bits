@@ -178,11 +178,10 @@ class Ciphertext {
      * cudaDeviceSynchronize() that the plain overload issues. The per-limb
      * cudaStreamSynchronize inside Limb::store (and c0/c1.sync()) already
      * guarantee the D->H copies complete before this returns, so the two
-     * whole-device drains were redundant over-synchronisation — at ~780 K/V
-     * ciphertexts/token that is ~1560 device-wide serialisations removed. The
+     * whole-device drains would be redundant over-synchronisation — at ~780 K/V
+     * ciphertexts/token, ~1560 device-wide serialisations avoided. The
      * `stream` argument is reserved for a future dedicated-offload-stream copy
      * path; today the per-limb copies still run on their own limb streams.
-     * See docs/speed/mask_encode_cache.md §B (K0).
      */
     void store(RawCipherText& rawct, cudaStream_t stream);
 
@@ -191,6 +190,11 @@ class Ciphertext {
 
     /** @brief Async D2H of c0,c1 into a pinned arena slot `base`; fills `m` (except moduli). No sync. */
     void storeStaged(uint8_t* base, StagedCtMeta& m, cudaStream_t stream);
+    /// storeStaged with producer ordering: bridges the partition stream (where the ops
+    /// that produced this value ran) into `stream` via an event before copying — the
+    /// async-capture snapshot primitive (no device-wide sync, unlike store()).
+    /// max_limbs > 0 snapshots only the first max_limbs towers (magnitude probes).
+    void storeStagedOrdered(uint8_t* base, StagedCtMeta& m, cudaStream_t stream, int max_limbs = -1);
 
     /** @brief Async H2D reconstruction of c0,c1 from a pinned arena slot `base` per `m`. No sync. */
     void loadStaged(const uint8_t* base, const StagedCtMeta& m, cudaStream_t stream);
@@ -318,6 +322,17 @@ class Ciphertext {
      * @param rescale Perform rescaling after multiplication if true.
      */
     void mult(const Ciphertext& b, const Ciphertext& c, bool rescale = false);
+
+    /**
+     * @brief this += Σ_j a[j]·b[j] with ONE keyswitch (FHE_LANE_BATCH phase 2).
+     *
+     * *this* must already hold a NoiseLevel-2 product (the lane-0 seed) at the common
+     * level; every a[j]/b[j] must be NoiseLevel-1 at that level. The binomial partial
+     * products of all lanes are accumulated in one fused kernel pass (d0→c0, d1→c1,
+     * d2→keyswitch aux), then a single relinearization closes the sum — numerically
+     * Σ relin(d2_j) == relin(Σ d2_j). No rescale, mirroring serial mult(rescale=false).
+     */
+    void multAccumulateBatch(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b);
 
     /**
      * @brief Multiplies both polynomial components by a scalar without pre‑checks.
@@ -560,6 +575,14 @@ class Ciphertext {
     void copy(const Ciphertext& ciphertext);
 
     /**
+     * @brief Takes the polynomial buffers of `src` by swap (no device copy) and copies its
+     * metadata. `src` must be dying or about to be fully overwritten: it is left holding
+     * *this*'s previous buffers (valid, unspecified contents). Replaces `copy()` where the
+     * source is a local accumulator about to go out of scope.
+     */
+    void takeFrom(Ciphertext& src);
+
+    /**
      * @brief Adds a plaintext to a ciphertext and stores the result in *this*.
      *
      * @param ciphertext Ciphertext operand.
@@ -595,6 +618,11 @@ class Ciphertext {
      * @return `true` on successful adjustment.
      */
     bool adjustForAddOrSub(const Ciphertext& ciphertext);
+    /** The untraced bodies of adjustForAddOrSub/adjustForMult; the public entry points are
+     *  thin wrappers recording the E3a histogram under FIDESLIB_ADJUST_TRACE (default off,
+     *  byte-identical behavior). Call the public names, not these. */
+    bool adjustForAddOrSubBody(const Ciphertext& ciphertext);
+    bool adjustForMultBody(const Ciphertext& ciphertext);
 
     /**
      * @brief Adjusts scaling factors to enable multiplication with `ciphertext`.
@@ -668,6 +696,13 @@ class Ciphertext {
      */
     void multMonomial(int power);
 };
+
+
+/** FIDESLIB_KS_DIGIT_INTT: skip the redundant per-digit source INTT in the ct x ct keyswitch
+ *  (default) or restore it (=1, the A/B arm). setKsDigitIntt overrides it at runtime so a test
+ *  can run both arms in one process on the same ciphertext — see LimbPartitionMGPU.cu. */
+void setKsDigitIntt(bool on);
+bool ksDigitIntt();
 
 }  // namespace FIDESlib::CKKS
 

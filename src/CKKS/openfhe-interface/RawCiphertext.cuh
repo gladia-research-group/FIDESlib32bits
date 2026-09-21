@@ -52,6 +52,10 @@ struct RawParams {
     int L;
     int K;
     int logN;
+    // COMPOSITESCALING: number of RNS primes per CKKS level (1 = classic chains). Imported
+    // from OpenFHE's CryptoParametersCKKSRNS::GetCompositeDegree(); consumed wherever one
+    // level transition must move d limbs (rescale, ModRaise, level<->limb conversions).
+    int compositeDegree = 1;
     lbcrypto::ScalingTechnique scalingTechnique;
     std::vector<uint64_t> moduli;
     std::vector<uint64_t> root_of_unity;
@@ -90,6 +94,11 @@ struct RawKeySwitchKey {
     std::vector<std::vector<std::vector<std::vector<uint64_t>>>> r_key;
     std::vector<std::vector<std::vector<uint64_t>>> dcrt_keys;
     std::string keyid;
+    // KSKA seed expansion: the 256-bit ChaCha12 seed r_key[0] (the `a`
+    // component) was expanded from (KskSeedExpand.cuh FROZEN SPEC). Empty = seedless key
+    // (unpatched OpenFHE / OPENFHE_KSKA_SEED=0 / threshold HE) — consumers must fall back
+    // to the dense `a`.
+    std::vector<uint32_t> a_seed;
 };
 
 std::vector<std::vector<uint64_t>> GetRawArray(const std::vector<lbcrypto::PolyImpl<lbcrypto::NativeVector>>& polys);

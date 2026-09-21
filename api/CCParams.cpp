@@ -63,6 +63,16 @@ void CCParams<CryptoContextCKKSRNS>::SetScalingTechnique(ScalingTechnique tech) 
 	params.SetScalingTechnique(scale_openfhe);
 }
 
+void CCParams<CryptoContextCKKSRNS>::SetCompositeDegree(uint32_t degree) {
+	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(cpu);
+	params.SetCompositeDegree(degree);
+}
+
+void CCParams<CryptoContextCKKSRNS>::SetRegisterWordSize(uint32_t bits) {
+	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(cpu);
+	params.SetRegisterWordSize(bits);
+}
+
 void CCParams<CryptoContextCKKSRNS>::SetNumLargeDigits(uint32_t numDigits) {
 	auto& params = std::any_cast<lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS>&>(cpu);
 	params.SetNumLargeDigits(numDigits);

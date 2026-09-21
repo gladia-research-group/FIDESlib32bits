@@ -39,6 +39,10 @@ template <> class CCParams<CryptoContextCKKSRNS> {
 	void SetBatchSize(uint32_t size);
 	void SetRingDim(uint32_t dim);
 	void SetScalingTechnique(ScalingTechnique tech);
+	// COMPOSITESCALING: explicit primes-per-level (COMPOSITESCALINGMANUAL only; AUTO
+	// derives it from the register word size).
+	void SetCompositeDegree(uint32_t degree);
+	void SetRegisterWordSize(uint32_t bits);
 	void SetNumLargeDigits(uint32_t numDigits);
 	void SetFirstModSize(uint32_t size);
 	void SetDigitSize(uint32_t size);

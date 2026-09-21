@@ -2,6 +2,7 @@
 // Created by carlosad on 25/03/24.
 //
 
+#include <cstdlib>
 #include "AddSub.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
@@ -11,6 +12,7 @@
 #include "Rotation.cuh"
 
 namespace FIDESlib::CKKS {
+
 template <typename T>
 Limb<T>::Limb(Limb<T>&& l) noexcept
     : cc(l.cc), primeid(l.primeid), stream(l.stream), v(std::move(l.v)), aux(std::move(l.aux)), id(l.id), raw(l.raw) {}
@@ -26,8 +28,8 @@ Limb<T>::Limb(ContextData& context, const int id, Stream& stream, const int prim
     : cc(context),
       primeid(primeid),
       stream(stream /*StartStream(primeid, cc.L + cc.K + 1)*/),
-      v(stream, context.N, cc.GPUid[id]),
-      aux(stream, constant ? 0 : context.N, cc.GPUid[id]),
+      v(stream, context.N, cc.GPUid[id], nullptr, context.N),
+      aux(stream, constant ? 0 : context.N, cc.GPUid[id], nullptr, constant ? 0 : context.N),
       id(id),
       raw(!cc.isValidPrimeId(primeid)) {
     // TODO: CryptoContext limb tracking.
@@ -138,6 +140,34 @@ void Limb<T>::load_with_stream(const std::vector<Q>& dat_, cudaStream_t stream_o
     cudaMemcpyAsync(v.data, dat.data(), dat.size() * sizeof(T), cudaMemcpyHostToDevice, stream_override);
 }
 
+namespace {
+// Narrow the staging arena's u64-per-coefficient payload into a u32 limb. Residues are < 2^32 by
+// construction (the limb's prime fits the word), so the cast is exact.
+__global__ void narrow_u64_to_u32_(uint32_t* __restrict__ dst, const uint64_t* __restrict__ src,
+                                   const size_t n) {
+    const size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (uint32_t)src[i];
+}
+}  // namespace
+
+template <typename T>
+void Limb<T>::load_async_ptr_u64src(const void* src, size_t coeffs, cudaStream_t stream) {
+    if constexpr (sizeof(T) == sizeof(uint64_t)) {
+        cudaMemcpyAsync(v.data, src, coeffs * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+    } else {
+        // u32 limb: upload the wide payload to scratch, then narrow on device. Keeps the H2D
+        // async; the scratch is stream-ordered so it frees behind the kernel.
+        uint64_t* scratch = nullptr;
+        cudaMallocAsync((void**)&scratch, coeffs * sizeof(uint64_t), stream);
+        cudaMemcpyAsync(scratch, src, coeffs * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice, stream);
+        constexpr int kThreads = 256;
+        narrow_u64_to_u32_<<<(unsigned)((coeffs + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+            reinterpret_cast<uint32_t*>(v.data), scratch, coeffs);
+        cudaFreeAsync(scratch, stream);
+    }
+}
+
 template <typename T>
 void Limb<T>::load_async_ptr(const void* src, size_t bytes, cudaStream_t stream) {
     // src must be pinned (cudaMallocHost arena) for this to be a genuinely asynchronous H2D.
@@ -173,7 +203,8 @@ template void Limb<uint64_t>::load_with_stream<uint64_t>(const std::vector<uint6
 
 template <typename T>
 void Limb<T>::load(const VectorGPU<T>& dat) {
-    cudaMemcpyAsync(v.data, dat.data, v.size, cudaMemcpyDeviceToDevice, stream.ptr());
+    // The size argument is `v.size` ELEMENTS; pass BYTES to the copy.
+    cudaMemcpyAsync(v.data, dat.data, v.size * sizeof(T), cudaMemcpyDeviceToDevice, stream.ptr());
 }
 
 template <typename T>

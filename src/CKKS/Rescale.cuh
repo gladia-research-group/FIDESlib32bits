@@ -39,7 +39,7 @@ namespace FIDESlib::CKKS {
     }
 */
 /**
- *  Adapted from OpenFHE: mubintvecnat.cpp:109
+ *  Adapted from OpenFHE: mubintvecnat.cpp
  */
     template<typename T>
     __device__ __forceinline__  void SwitchModulus(T &a, const int om_pid, const int nm_pid) {

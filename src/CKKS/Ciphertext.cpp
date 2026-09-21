@@ -7,6 +7,12 @@
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/Plaintext.cuh"
 #include <omp.h>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
 #if defined(__clang__)
 #include <experimental/source_location>
 using sc				  = std::experimental::source_location;
@@ -62,15 +68,15 @@ constexpr std::array<const char*, 18> opstr{ "                   Noop: ",
 	"          HoistedRotate: ",
 	"HoistedRotate (outputs): " };
 
-// S7 thread-safety: pre-populate every enum key at static init so operator[] never
-// inserts (a concurrent map-node insert is UB); the remaining concurrent int++ can tear
-// a count but cannot corrupt the map. Counters are diagnostics, not measurements.
-std::map<OPS, int> op_count = [] {
+// Thread-safety: pre-populate every enum key at static init so operator[] never inserts (a
+// concurrent map-node insert is UB); a torn int++ cannot corrupt the map. Deliberately never
+// destroyed: ~ContextData (another TU's static) calls clearOpRecord() during static destruction.
+std::map<OPS, int>& op_count = *new std::map<OPS, int>([] {
 	std::map<OPS, int> m;
 	for (int i = 0; i <= (int)OPS::HOISTEDROTATEOUTS; ++i)
 		m[(OPS)i] = 0;
 	return m;
-}();
+}());
 
 Ciphertext::Ciphertext(Ciphertext&& ct_moved) noexcept
 : my_range(std::move(ct_moved.my_range)), keyID(std::move(ct_moved.keyID)), cc_(ct_moved.cc_), cc(*cc_), c0(std::move(ct_moved.c0)), c1(std::move(ct_moved.c1)),
@@ -235,7 +241,7 @@ void Ciphertext::addPt(const Plaintext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT || cc.rescaleTechnique == FIXEDAUTO) {
-		if (b.NoiseLevel == 1 && NoiseLevel == 2 && b.c0.getLevel() == getLevel() - 1) {
+		if (b.NoiseLevel == 1 && NoiseLevel == 2 && b.c0.getLevel() == getLevel() - cc.compositeDegree()) {
 			this->rescale();
 		}
 
@@ -267,7 +273,7 @@ void Ciphertext::subPt(const Plaintext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	if (cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT || cc.rescaleTechnique == FIXEDAUTO) {
-		if (b.NoiseLevel == 1 && NoiseLevel == 2 && b.c0.getLevel() == getLevel() - 1) {
+		if (b.NoiseLevel == 1 && NoiseLevel == 2 && b.c0.getLevel() == getLevel() - cc.compositeDegree()) {
 			this->rescale();
 		}
 
@@ -332,7 +338,7 @@ void Ciphertext::store(RawCipherText& rawct) {
 // already does a per-limb cudaMemcpyAsync + cudaStreamSynchronize, and c0/c1.sync()
 // drain the component streams, so the host buffer is fully populated on return; the
 // two device-wide drains were redundant. Removing them eliminates ~1560 whole-device
-// serialisations/token on the KV-offload path (docs/speed/mask_encode_cache.md §B, K0).
+// serialisations/token on the KV-offload path.
 void Ciphertext::store(RawCipherText& rawct, cudaStream_t /*stream*/) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 
@@ -364,6 +370,43 @@ void Ciphertext::storeStaged(uint8_t* base, StagedCtMeta& m, cudaStream_t stream
     size_t cursor = 0;
     c0.storeStaged(base, cursor, m.off0, m.len0, stream);
     c1.storeStaged(base, cursor, m.off1, m.len1, stream);
+    m.total_bytes = cursor;
+    m.NoiseLevel  = NoiseLevel;
+    m.Noise       = NoiseFactor;
+    m.keyid       = keyID;
+    m.slots       = slots;
+}
+
+void Ciphertext::storeStagedOrdered(uint8_t* base, StagedCtMeta& m, cudaStream_t stream, int max_limbs) {
+    CKKS::SetCurrentContext(cc_);
+    // Order the snapshot AFTER the producing ops, then copy on the caller's stream — the
+    // main thread never waits on the device.
+    // Wait on EVERY partition stream of BOTH polys: waiting on c0.GPU[0].s only lets c1's streams
+    // race the ring-stream copy and the snapshot reads stale/partial limbs.
+    auto wait_all = [&](RNSPoly& p) {
+        for (auto& part : p.GPU) {
+            cudaEvent_t ready = nullptr;
+            cudaEventCreateWithFlags(&ready, cudaEventDisableTiming);
+            cudaEventRecord(ready, part.s.ptr());
+            cudaStreamWaitEvent(stream, ready, 0);
+            cudaEventDestroy(ready);
+        }
+    };
+    wait_all(c0);
+    wait_all(c1);
+    m.numRes = (max_limbs > 0) ? std::min(max_limbs, c0.getLevel() + 1) : (c0.getLevel() + 1);
+    m.N      = cc.N;
+    size_t cursor = 0;
+    c0.storeStaged(base, cursor, m.off0, m.len0, stream, max_limbs);
+    c1.storeStaged(base, cursor, m.off1, m.len1, stream, max_limbs);
+    // Reverse ordering: later ops on the ct's own streams (including pool-reuse writes
+    // after an eviction) must not overwrite the buffers before the pending D2H drains.
+    cudaEvent_t done = nullptr;
+    cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+    cudaEventRecord(done, stream);
+    for (auto& part : c0.GPU) cudaStreamWaitEvent(part.s.ptr(), done, 0);
+    for (auto& part : c1.GPU) cudaStreamWaitEvent(part.s.ptr(), done, 0);
+    cudaEventDestroy(done);
     m.total_bytes = cursor;
     m.NoiseLevel  = NoiseLevel;
     m.Noise       = NoiseFactor;
@@ -444,7 +487,8 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale) {
 
 	this->multMetadata(*this, b);
 	if (rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL) {
-		NoiseFactor /= cc.param.ModReduceFactor.at(c0.getLevel() + 1);
+		// composite: the drop removed compositeDegree primes; divide by their product
+		NoiseFactor /= cc.modReduceProduct(c0.getLevel() + cc.compositeDegree());
 		NoiseLevel -= 1;
 	}
 }
@@ -466,7 +510,8 @@ void Ciphertext::rescale() {
 	}
 
 	// Manage metadata
-	NoiseFactor /= cc.param.ModReduceFactor.at(c0.getLevel() + 1);
+	// composite: the rescale dropped compositeDegree primes; divide by their product
+	NoiseFactor /= cc.modReduceProduct(c0.getLevel() + cc.compositeDegree());
 	NoiseLevel -= 1;
 }
 
@@ -694,6 +739,71 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 	Out(KEYSWITCH, " finish ");
 }
 
+void Ciphertext::multAccumulateBatch(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(a.size() == b.size());
+	assert(!a.empty());
+	assert(NoiseLevel == 2);  // the lane-0 product seed
+
+	// Mirror serial Ciphertext::mult's head EXACTLY, per lane, on COPIES (the persistent
+	// cache lanes must not change level — graph names embed it): adjustForMult carries the
+	// FLEXIBLEAUTO scalar scale-corrections a plain rescale/drop would miss.
+	std::vector<std::unique_ptr<Ciphertext>> adjusted;
+	std::vector<const Ciphertext*> aa(a), bb(b);
+	for (size_t j = 0; j < aa.size(); ++j) {
+		const Ciphertext* pa = aa[j];
+		const Ciphertext* pb = bb[j];
+		if (pa->NoiseLevel == 1 && pb->NoiseLevel == 1 && pa->getLevel() == getLevel() &&
+		    pb->getLevel() == getLevel())
+			continue;
+		auto ta = std::make_unique<Ciphertext>(cc_);
+		ta->copy(*pa);
+		if (!ta->adjustForMult(*pb)) {
+			auto tb = std::make_unique<Ciphertext>(cc_);
+			tb->copy(*pb);
+			tb->adjustForMult(*ta);
+			ta->adjustForMult(*tb);   // serial mult re-enters and adjusts once more
+			bb[j] = tb.get();
+			adjusted.push_back(std::move(tb));
+		}
+		aa[j] = ta.get();
+		adjusted.push_back(std::move(ta));
+	}
+
+	for (size_t j = 0; j < aa.size(); ++j) {
+		assert(aa[j]->NoiseLevel == 1 && bb[j]->NoiseLevel == 1);
+		assert(aa[j]->getLevel() == getLevel() && bb[j]->getLevel() == getLevel());
+		assert(keyID == aa[j]->keyID && keyID == bb[j]->keyID);
+	}
+	op_count[OPS::MULT] += static_cast<int>(aa.size());
+
+	KeySwitchingKey& kskEval = cc.GetEvalKey(keyID);
+
+	RNSPoly& in = cc.getKeySwitchAux();
+	in.setLevel(c1.getLevel());
+
+	std::vector<const RNSPoly*> a0, a1, b0, b1;
+	a0.reserve(aa.size());
+	a1.reserve(aa.size());
+	b0.reserve(aa.size());
+	b1.reserve(aa.size());
+	for (size_t j = 0; j < aa.size(); ++j) {
+		a0.push_back(&aa[j]->c0);
+		a1.push_back(&aa[j]->c1);
+		b0.push_back(&bb[j]->c0);
+		b1.push_back(&bb[j]->c1);
+	}
+
+	RNSPoly::binomialMultAccumBatch(c0, c1, in, a0, a1, b0, b1);
+
+	RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, /*moddown=*/true);
+	c0.add(aux);
+	c1.add(in);
+	// Metadata: the seed already carries the product NoiseFactor/NoiseLevel/slots; adding
+	// same-scale products leaves it unchanged (exactly as the serial inplace_add chain).
+}
+
 void Ciphertext::square(bool rescale) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
@@ -768,7 +878,7 @@ void Ciphertext::multScalarNoPrecheck(const double c, bool rescale) {
 
 	// Manage metadata
 	NoiseLevel += 1;
-	NoiseFactor *= cc.param.ScalingFactorReal.at(c0.getLevel());
+	NoiseFactor *= cc.sfAtLimb(c0.getLevel());
 	if (rescale && cc.rescaleTechnique == FIXEDAUTO) {
 		this->rescale();
 	}
@@ -790,6 +900,9 @@ void Ciphertext::addScalar(const double c) {
 	CKKS::SetCurrentContext(cc_);
 	op_count[OPS::ADDSCALAR]++;
 
+	if (c == 0.0)
+		return;
+
 	auto elem = cc.ElemForEvalAddOrSub(c0.getLevel(), std::abs(c), this->NoiseLevel);
 
 	if (c < 0.0) {
@@ -798,8 +911,7 @@ void Ciphertext::addScalar(const double c) {
 		}
 	}
 	// if (c >= 0.0) {
-	if (c != 0.0)
-		c0.addScalar(elem);
+	c0.addScalar(elem);
 	//} else {
 	//    c0.subScalar(elem);
 	//}
@@ -1396,7 +1508,7 @@ void Ciphertext::evalLinearWSumMutable(uint32_t n, const std::vector<Ciphertext*
 			slots = std::max(slots, ctxs[i]->slots);
 		}
 		this->NoiseLevel  = 2;
-		this->NoiseFactor = cc.param.ScalingFactorReal.at(getLevel()) * cc.param.ScalingFactorReal.at(getLevel());
+		this->NoiseFactor = cc.sfAtLimb(getLevel()) * cc.sfAtLimb(getLevel());
 	} else {
 		this->multScalar(*ctxs[0], weights[0], false);
 		for (int i = 1; i < n; ++i) {
@@ -1475,6 +1587,15 @@ void Ciphertext::copy(const Ciphertext& ciphertext) {
 	this->copyMetadata(ciphertext);
 }
 
+void Ciphertext::takeFrom(Ciphertext& src) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(this != &src);
+	c0.swap(src.c0);
+	c1.swap(src.c1);
+	this->copyMetadata(src);
+}
+
 void Ciphertext::multPt(const Ciphertext& c, const Plaintext& b, bool rescale) {
 	this->copy(c);
 	multPt(b, rescale);
@@ -1543,6 +1664,10 @@ void Ciphertext::sub(const Ciphertext& ciphertext, const Ciphertext& ciphertext1
 }
 
 bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
+	return adjustForAddOrSubBody(b);
+}
+
+bool Ciphertext::adjustForAddOrSubBody(const Ciphertext& b) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 
@@ -1585,8 +1710,8 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 				if (c2depth == 2) {
 					double scf1 = NoiseFactor;
 					double scf2 = b.NoiseFactor;
-					double scf	= cc.param.ScalingFactorReal[c1lvl];	 // cryptoParams->GetScalingFactorReal(c1lvl);
-					double q1	= cc.param.ModReduceFactor[sizeQl1 - 1]; // cryptoParams->GetModReduceFactor(sizeQl1 - 1);
+					double scf	= cc.sfAtLimb(c1lvl);	 // cryptoParams->GetScalingFactorReal(c1lvl);
+					double q1	= cc.modReduceProduct(c1lvl); // composite: product of the d dropped primes
 					multScalarNoPrecheck(scf2 / scf1 * q1 / scf);
 					rescale();
 					if (getLevel() > b.getLevel()) {
@@ -1599,24 +1724,24 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 					rescale();
 					double scf1 = NoiseFactor;
 					double scf2 = b.NoiseFactor;
-					double scf = cc.param.ScalingFactorReal[c1lvl];  // cryptoParams->GetScalingFactorReal(c1lvl);
+					double scf = cc.sfAtLimb(c1lvl);  // cryptoParams->GetScalingFactorReal(c1lvl);
 					multScalarNoPrecheck(scf2 / scf1 / scf);
 					this->dropToLevel(c2lvl);
 					//LevelReduceInternalInPlace(ciphertext1, c2lvl - c1lvl);
 					NoiseFactor = scf2;
 */
 				} else {
-					if (c1lvl - 1 == c2lvl) {
+					if (c1lvl - cc.compositeDegree() == c2lvl) {
 						rescale();
 					} else {
 						double scf1 = NoiseFactor;
-						double scf2 = cc.param.ScalingFactorRealBig[c2lvl + 1]; // cryptoParams->GetScalingFactorRealBig(c2lvl - 1);
-						double scf	= cc.param.ScalingFactorReal[c1lvl];		// cryptoParams->GetScalingFactorReal(c1lvl);
-						double q1	= cc.param.ModReduceFactor[sizeQl1 - 1];	// cryptoParams->GetModReduceFactor(sizeQl1 - 1);
+						double scf2 = cc.param.ScalingFactorRealBig[c2lvl + cc.compositeDegree()]; // composite: one LEVEL below target
+						double scf	= cc.sfAtLimb(c1lvl);		// cryptoParams->GetScalingFactorReal(c1lvl);
+						double q1	= cc.modReduceProduct(c1lvl);	// composite: product of the d dropped primes
 						multScalarNoPrecheck(scf2 / scf1 * q1 / scf);
 						rescale();
-						if (getLevel() - 1 > b.getLevel()) {
-							this->dropToLevel(b.getLevel() + 1);
+						if (getLevel() - cc.compositeDegree() > b.getLevel()) {
+							this->dropToLevel(b.getLevel() + cc.compositeDegree());
 							// LevelReduceInternalInPlace(ciphertext1, c2lvl - c1lvl - 2);
 						}
 						rescale();
@@ -1629,7 +1754,7 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 				if (c2depth == 2) {
 					double scf1 = NoiseFactor;
 					double scf2 = b.NoiseFactor;
-					double scf	= cc.param.ScalingFactorReal[c1lvl]; // cryptoParams->GetScalingFactorReal(c1lvl);
+					double scf	= cc.sfAtLimb(c1lvl); // cryptoParams->GetScalingFactorReal(c1lvl);
 					multScalarNoPrecheck(scf2 / scf1 / scf);
 					this->dropToLevel(c2lvl);
 					// LevelReduceInternalInPlace(ciphertext1, c2lvl - c1lvl);
@@ -1637,11 +1762,11 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 					NoiseFactor = scf2;
 				} else {
 					double scf1 = NoiseFactor;
-					double scf2 = cc.param.ScalingFactorRealBig[c2lvl + 1]; // cryptoParams->GetScalingFactorRealBig(c2lvl - 1);
-					double scf	= cc.param.ScalingFactorReal[c1lvl];		// cryptoParams->GetScalingFactorReal(c1lvl);
+					double scf2 = cc.param.ScalingFactorRealBig[c2lvl + cc.compositeDegree()]; // composite: one LEVEL below target
+					double scf	= cc.sfAtLimb(c1lvl);		// cryptoParams->GetScalingFactorReal(c1lvl);
 					multScalarNoPrecheck(scf2 / scf1 / scf);
-					if (c1lvl - 1 > c2lvl) {
-						this->dropToLevel(c2lvl + 1);
+					if (c1lvl - cc.compositeDegree() > c2lvl) {
+						this->dropToLevel(c2lvl + cc.compositeDegree());
 						// LevelReduceInternalInPlace(ciphertext1, c2lvl - c1lvl - 1);
 					}
 					rescale();
@@ -1666,6 +1791,10 @@ bool Ciphertext::adjustForAddOrSub(const Ciphertext& b) {
 }
 
 bool Ciphertext::adjustForMult(const Ciphertext& ciphertext) {
+	return adjustForMultBody(ciphertext);
+}
+
+bool Ciphertext::adjustForMultBody(const Ciphertext& ciphertext) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 
@@ -1783,7 +1912,7 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	CKKS::SetCurrentContext(cc_);
 
-	// S7 thread-safety: the cache is checked, built and replaced below — two host threads
+	// Thread-safety: the cache is checked, built and replaced below — two host threads
 	// (dense slots=N/2 runs this even at cplx=0, Bootstrap.cu conjugate split) racing the
 	// erase/emplace corrupt the map. One mutex over the whole rebuild-or-read decision;
 	// the mult itself happens on this ct's streams and needs the cache entry pinned, so

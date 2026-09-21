@@ -1,18 +1,32 @@
-# ⚠️ HEAT REPRODUCIBILITY SNAPSHOT ⚠️
-
-# **This commit exists ONLY to reproduce the HEAT publication.**
-
-### It is the exact, frozen library state the HEAT work was measured on (pyFIDESlib `509990c`, branch `behemoth-port`, 2026-08-10). **Do not base new work on it** — current development is the tip of [`main`](../../tree/main).
-
----
-
 <p align="center">
   <img src="https://github.com/CAPS-UMU/FIDESlib/blob/main/doxygen/FidesLogo.drawio.svg?raw=true" width="200">
 </p>
 
-# FIDESlib 2.0
+# FIDESlib32bits
 
-A server-side CKKS GPU library fully interoperable with OpenFHE.
+A fork of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib) 2.0 — a server-side CKKS GPU library
+fully interoperable with OpenFHE — that adds a **32-bit composite-scaling backend** and
+**seed-expanded key-switching keys**. It is the runtime of
+[Perseus](https://github.com/gladia-research-group/perseus) (*Perseus: A Bootstrap Placer for
+Faster Encrypted Transformer Inference*); `CHANGES.md` lists what differs from upstream.
+
+* `NATIVEINT=32` chains: each CKKS level is a pair of 27-bit primes (composite degree 2), so
+  modular arithmetic rides native 32-bit GPU paths; the 64-bit backend stays available.
+* Key-switching keys: the uniform `a` half is regenerated in-kernel from a 256-bit ChaCha12 seed
+  (`FIDESLIB_KSK_REGEN`, default 2) and the `b` half is stored as a dense 28-bit bit-stream
+  (`FIDESLIB_KSK_PACK`, default 1); on GPT-2 decode the two free 9.1 GiB of device memory and
+  20% of end-to-end latency. `FIDESLIB_KSK_REGEN=0` / `FIDESLIB_KSK_PACK=0` restore stored /
+  unpacked keys for an ablation.
+* Sparse bootstraps (`EvalBootstrapSetup` with a slot count), a host staging layer for
+  streaming plaintext weights through pinned memory, and a KV-cache arena for generative decode.
+
+Measured on one RTX PRO 6000 Blackwell at logN = 16 (32-bit chain / 64-bit reference, µs):
+add 33 / 29, mult ct×pt 72 / 49, mult ct×ct 203 / 243, rotate 214 / 245, bootstrap dense
+28770 / 36690, sparse-512 18590 / 23590, sparse-1 16100 / 19950.
+
+The 32-bit OpenFHE this fork builds against is a fixed upstream commit plus the patch series
+kept in the Perseus repository (`third_party/openfhe-n32/patches`); Perseus's
+`scripts/install_deps.sh` builds both. The `deps/` patches here are the 64-bit path.
 
 ## Improvements in version 2.0
 
@@ -91,7 +105,8 @@ The following options can be used with CMake to configure the build. The default
 
 | CMake Option                  | Values              | Description |
 |-------------------------------|---------------------|------------------------------------------------------
-| `FIDESLIB_ARCH`               | **"all-major"**,string | Select the GPU architectures of the selected backend. |
+| `FIDESLIB_ARCH`               | **"70-real;70-virtual;80-real;86-real;89-real;90-real;90-virtual;100-real;120-real"**, string | CUDA architectures to compile for (pass one, e.g. `120-real`, for a fast build). |
+| `FIDESLIB_OPENFHE_NATIVE_SIZE` | **"64"**, "32" | NATIVEINT width of the OpenFHE the library is built against (32 = the composite-scaling backend). |
 | `CMAKE_BUILD_TYPE`            | **"Release"**, "Debug", "MinSizeRel", "RelWithDebInfo" | Select the compilation build type. |
 | `FIDESLIB_INSTALL_PREFIX`     | **"/usr/local"**,string | Select prefix path for the installation path of FIDESlib. Relative paths are resolved from the project root directory. |
 | `OPENFHE_INSTALL_PREFIX`      | **"/usr/local"**,string | Select prefix path for the installation path of OpenFHE. Relative paths are resolved from the project root directory. |

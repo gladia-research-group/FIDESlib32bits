@@ -52,7 +52,15 @@ __global__ void INTT_(const Global::Globals* Globals, void** __restrict__ dat, c
 
 // ------------------------------------- NTT ----------------------------------------
 /** Kernel fusions */
-enum NTT_MODE { NTT_NONE, NTT_RESCALE, NTT_MULTPT, NTT_MODDOWN, NTT_KSK_DOT, NTT_KSK_DOT_ACC };
+// NTT_RESCALE2: fused composite DOUBLE prime drop — one wide pass instead of two
+// sequential NTT_RESCALE passes. Sequential-drop semantics preserved exactly (bit-identical to
+// two NTT_RESCALE passes): the second top's once-divided value w is derived per-coefficient in
+// coeff domain, and per-prime constants commute with the (exact, modular) NTT. Only ALGO_SHOUP
+// is instantiated (the only algo the rescale path uses). dat = limbptr + (limbsize-2), so
+// dat[0] = the qb limb, dat[1] = the qa top; primeid_rescale = qa's primeid, and qb's primeid
+// is derived as primeid_rescale - 1 (single-GPU composite chains have level-ordered q ids —
+// asserted by the host caller, which falls back to two passes otherwise).
+enum NTT_MODE { NTT_NONE, NTT_RESCALE, NTT_MULTPT, NTT_MODDOWN, NTT_KSK_DOT, NTT_KSK_DOT_ACC, NTT_RESCALE2 };
 
 template <typename T, bool second = true, ALGO algo = ALGO_SHOUP, NTT_MODE mode = NTT_NONE>
 __global__ void NTT_(const Global::Globals* Globals, T* __restrict__ dat, const int __grid_constant__ primeid,

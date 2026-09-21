@@ -53,11 +53,15 @@ struct DecryptResult {
 };
 
 /// @brief Enumeration of supported scaling techniques.
+/// Values mirror lbcrypto::ScalingTechnique (the CCParams forwarder static_casts and
+/// asserts value equality) — keep the order in sync with OpenFHE's constants-defs.h.
 enum ScalingTechnique {
     FIXEDMANUAL = 0,
     FIXEDAUTO,
     FLEXIBLEAUTO,
     FLEXIBLEAUTOEXT,
+    COMPOSITESCALINGAUTO,
+    COMPOSITESCALINGMANUAL,
 };
 
 /// @brief Enumeration of supported key switching techniques.

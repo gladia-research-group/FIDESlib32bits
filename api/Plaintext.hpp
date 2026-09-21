@@ -57,6 +57,10 @@ class PlaintextImpl {
 	/// limb; device loads expand it to the target level's limbs on the GPU (loadCoeffExpand).
 	/// Must be consumed through the staged path — a plain load of a marked plaintext throws.
 	bool coeff_staged = false;
+	/// @brief COEFF-mode prescale (MarkCoeffStaged): host values were encoded ÷2^k so the
+	/// centered lift bound holds; the GPU expand multiplies the lifted limbs back by
+	/// (2^k mod q_i) — exact integer un-prescale, no scale/level change. 0 = none.
+	int coeff_prescale_log2 = 0;
 	/// @brief Parent context for device management.
 	CryptoContext<DCRTPoly> parent_context;
 };

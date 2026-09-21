@@ -2,6 +2,13 @@
 // Created by carlosad on 4/12/24.
 //
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Bootstrap.cuh"
@@ -9,6 +16,7 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/CoeffsToSlots.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/KeySwitchingKey.cuh"
 #if defined(__clang__)
 #include <experimental/source_location>
 using sc = std::experimental::source_location;
@@ -21,23 +29,28 @@ using namespace FIDESlib::CKKS;
 
 constexpr bool PRINT = false;
 
-// Pair with FIDESLIB_DA_FOLD (ApproxModEval.cu): the 2^correction recovery is
-// folded into the last double-angle iteration, so the end-of-bootstrap integer
-// scale-back must be skipped.
-static void btsStageProbe(const char* stage, FIDESlib::CKKS::Ciphertext& ctxt) {
-    if (!std::getenv("BTS_SF_DEBUG"))
-        return;
-    cudaDeviceSynchronize();
-    printf("[bts_stage] %s: level=%d deg=%d log2(NF)=%.3f table=%.3f\n", stage, ctxt.getLevel(), ctxt.NoiseLevel,
-           std::log2(ctxt.NoiseFactor), std::log2(ctxt.cc.param.ScalingFactorReal[ctxt.getLevel()]));
+// Stage-divergence harness (default off): when a caller installs a stash vector, every
+// btsStageProbe checkpoint (pre-CtS / post-CtS / pre-StC / post-StC / end) also deposits a
+// full ciphertext clone the caller can download+decrypt offline. Zero cost when null.
+std::vector<std::pair<std::string, std::shared_ptr<FIDESlib::CKKS::Ciphertext>>>*
+    FIDESlib::CKKS::g_btsStageStash = nullptr;
+
+
+// Effective correction factor for this bootstrap call: the ContextData override (armed by
+// the wrapper's CorrectionScope) wins over the per-slots precomputation value.
+static uint32_t effCorrectionFactor(FIDESlib::CKKS::ContextData& cc, int slots) {
+    return cc.correctionFactorOverride >= 0
+               ? (uint32_t)cc.correctionFactorOverride
+               : cc.GetBootPrecomputation(slots).correctionFactor;
 }
 
-static bool skipCorFactor() {
-    static const bool v = [] {
-        const char* e = std::getenv("FIDESLIB_SKIP_CORFACTOR");
-        return e && *e && *e != '0';
-    }();
-    return v;
+static void btsStageProbe(const char* stage, FIDESlib::CKKS::Ciphertext& ctxt) {
+    if (FIDESlib::CKKS::g_btsStageStash) {
+        cudaDeviceSynchronize();
+        auto c = std::make_shared<FIDESlib::CKKS::Ciphertext>(ctxt.cc_);
+        c->copy(ctxt);
+        FIDESlib::CKKS::g_btsStageStash->emplace_back(stage, std::move(c));
+    }
 }
 
 void FIDESlib::CKKS::BootstrapCPUraise(
@@ -56,6 +69,11 @@ void FIDESlib::CKKS::BootstrapCPUraise(
     //NativeInteger q = elementParamsRaisedPtr->GetParams()[0]->GetModulus().ConvertToInt();
     uint64_t q = cc.prime[0].p;
     double qDouble = (double)q;  //q.ConvertToDouble();
+    // COMPOSITESCALING: level 0 spans compositeDegree primes — the bootstrap's q0 is their
+    // PRODUCT (~2^54 on a 2x27-bit chain). Everything downstream (deg, correction, pre/post,
+    // the ModRaise CRT lift) is derived from it.
+    for (int j_ = 1; j_ < cc.compositeDegree(); ++j_)
+        qDouble *= (double)cc.prime[j_].p;
 
     if constexpr (PRINT) {
         std::cout << "q: " << q << " ";
@@ -68,20 +86,18 @@ void FIDESlib::CKKS::BootstrapCPUraise(
         std::cout << "p: " << p << std::endl;
     }
     int32_t deg = std::round(std::log2(qDouble / powP));
-    // Guard restored (was commented out upstream): deg = q0_bits - scale_bits
-    // must not exceed the correction factor (OpenFHE auto = 9), or the uint32
-    // subtraction below underflows and corFactor = 1 << garbage poisons every
-    // bootstrap SILENTLY (cost us a 6-config param sweep of tok0 garbage).
-    if (deg > static_cast<int32_t>(cc.GetBootPrecomputation(slots).correctionFactor)) {
+    // deg = q0_bits - scale_bits must not exceed the correction factor, or the uint32
+    // subtraction below underflows and corFactor = 1 << garbage silently poisons the bootstrap.
+    if (deg > static_cast<int32_t>(effCorrectionFactor(cc, slots))) {
         throw std::runtime_error(
             "Bootstrap: deg=log2(q0/2^p)=" + std::to_string(deg) +
             " exceeds correctionFactor=" +
-            std::to_string(cc.GetBootPrecomputation(slots).correctionFactor) +
+            std::to_string(effCorrectionFactor(cc, slots)) +
             " (uint32 underflow); pick q0_bits - scale_bits <= correctionFactor.");
     }
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = effCorrectionFactor(cc, slots) - deg;
     if constexpr (PRINT)
-        std::cout << cc.GetBootPrecomputation(slots).correctionFactor << " " << deg << std::endl;
+        std::cout << effCorrectionFactor(cc, slots) << " " << deg << std::endl;
     double post = std::pow(2, static_cast<double>(deg));
 
     double pre = 1. / post;
@@ -91,9 +107,11 @@ void FIDESlib::CKKS::BootstrapCPUraise(
     // identity sf[0] ~ 2^p * 2^deg does not hold; follow the COMPOSITESCALING
     // constants: pre = sf[0]/q0 input normalization, no integer 2^deg recovery
     // (the CPU-precomputed StC matrices carry scaleDec = q0/sf[0]).
-    bool mixedChain = std::fabs(std::log2(cc.param.ScalingFactorReal[cc.L] * post / qDouble)) > 0.5;
-    if (mixedChain) {
-        pre    = cc.param.ScalingFactorReal[cc.L] / qDouble;
+    bool mixedChain = std::fabs(std::log2(cc.sfAtLimb(cc.L) * post / qDouble)) > 0.5;
+    // COMPOSITESCALING always uses the sf/q0 normalization (OpenFHE: pre = sf[0]/qDouble,
+    // no integer 2^deg recovery) — the same constants the mixed-chain arm implements.
+    if (mixedChain || cc.compositeDegree() > 1) {
+        pre    = cc.sfAtLimb(cc.L) / qDouble;
         scalar = 1;
     }
 
@@ -111,6 +129,9 @@ void FIDESlib::CKKS::BootstrapCPUraise(
         double k = cc.GetBootK();
 
         double constantEvalMult = pre * (1.0 / (k * cc.N));
+        // Free per-call input pre-scale (Context.cuh btsPreScale): rides the arbitrary
+        // double the input is multiplied by anyway. Any restore is the caller's business.
+        constantEvalMult *= cc.getBtsPreScale();
 
         if constexpr (PRINT)
             std::cout << "mult: " << constantEvalMult << std::endl;
@@ -169,6 +190,8 @@ void FIDESlib::CKKS::BootstrapCPUraise(
         ctxt.rescale();
     }
 
+    uint64_t corFactor = (uint64_t)1 << std::llround(correction);
+
     btsStageProbe("pre-StC", ctxt);
     if (isLT) {
         EvalLinearTransform(ctxt, slots, true);
@@ -182,8 +205,7 @@ void FIDESlib::CKKS::BootstrapCPUraise(
         ctxt.add(aux);
     }
 
-    uint64_t corFactor = (uint64_t)1 << std::llround(correction);
-    if (!skipCorFactor() && corFactor != 1)
+    if (corFactor != 1)
         multIntScalar(ctxt, corFactor);
     // Mixed-size chain: realize the pending StC rescale so the output lands
     // deg-1 exactly on the per-level table at the data scale (the lazy deg-2
@@ -205,7 +227,9 @@ void FIDESlib::CKKS::BootstrapCPUraise(
     }
 }
 
-void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
+namespace FIDESlib::CKKS {
+
+void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
     CudaNvtxRange r(std::string{sc::current().function_name()});
 
     assert(slots >= ctxt.slots);
@@ -220,6 +244,11 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
     //NativeInteger q = elementParamsRaisedPtr->GetParams()[0]->GetModulus().ConvertToInt();
     uint64_t q = cc.prime[0].p;
     double qDouble = (double)q;  //q.ConvertToDouble();
+    // COMPOSITESCALING: level 0 spans compositeDegree primes — the bootstrap's q0 is their
+    // PRODUCT (~2^54 on a 2x27-bit chain). Everything downstream (deg, correction, pre/post,
+    // the ModRaise CRT lift) is derived from it.
+    for (int j_ = 1; j_ < cc.compositeDegree(); ++j_)
+        qDouble *= (double)cc.prime[j_].p;
 
     if constexpr (PRINT) {
         std::cout << "q: " << q << " ";
@@ -232,20 +261,18 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
         std::cout << "p: " << p << std::endl;
     }
     int32_t deg = std::round(std::log2(qDouble / powP));
-    // Guard restored (was commented out upstream): deg = q0_bits - scale_bits
-    // must not exceed the correction factor (OpenFHE auto = 9), or the uint32
-    // subtraction below underflows and corFactor = 1 << garbage poisons every
-    // bootstrap SILENTLY (cost us a 6-config param sweep of tok0 garbage).
-    if (deg > static_cast<int32_t>(cc.GetBootPrecomputation(slots).correctionFactor)) {
+    // deg = q0_bits - scale_bits must not exceed the correction factor, or the uint32
+    // subtraction below underflows and corFactor = 1 << garbage silently poisons the bootstrap.
+    if (deg > static_cast<int32_t>(effCorrectionFactor(cc, slots))) {
         throw std::runtime_error(
             "Bootstrap: deg=log2(q0/2^p)=" + std::to_string(deg) +
             " exceeds correctionFactor=" +
-            std::to_string(cc.GetBootPrecomputation(slots).correctionFactor) +
+            std::to_string(effCorrectionFactor(cc, slots)) +
             " (uint32 underflow); pick q0_bits - scale_bits <= correctionFactor.");
     }
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = effCorrectionFactor(cc, slots) - deg;
     if constexpr (PRINT)
-        std::cout << cc.GetBootPrecomputation(slots).correctionFactor << " " << deg << std::endl;
+        std::cout << effCorrectionFactor(cc, slots) << " " << deg << std::endl;
     double post = std::pow(2, static_cast<double>(deg));
 
     double pre = 1. / post;
@@ -255,9 +282,11 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
     // identity sf[0] ~ 2^p * 2^deg does not hold; follow the COMPOSITESCALING
     // constants: pre = sf[0]/q0 input normalization, no integer 2^deg recovery
     // (the CPU-precomputed StC matrices carry scaleDec = q0/sf[0]).
-    bool mixedChain = std::fabs(std::log2(cc.param.ScalingFactorReal[cc.L] * post / qDouble)) > 0.5;
-    if (mixedChain) {
-        pre    = cc.param.ScalingFactorReal[cc.L] / qDouble;
+    bool mixedChain = std::fabs(std::log2(cc.sfAtLimb(cc.L) * post / qDouble)) > 0.5;
+    // COMPOSITESCALING always uses the sf/q0 normalization (OpenFHE: pre = sf[0]/qDouble,
+    // no integer 2^deg recovery) — the same constants the mixed-chain arm implements.
+    if (mixedChain || cc.compositeDegree() > 1) {
+        pre    = cc.sfAtLimb(cc.L) / qDouble;
         scalar = 1;
     }
 
@@ -281,6 +310,10 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
             constantEvalMult = pre * (1.0 / (k * cc.N) / 32);
         }
         */
+
+        // Free per-call input pre-scale (Context.cuh btsPreScale): rides the arbitrary
+        // double the input is multiplied by anyway. Any restore is the caller's business.
+        constantEvalMult *= cc.getBtsPreScale();
 
         if constexpr (PRINT)
             std::cout << "mult: " << constantEvalMult << std::endl;
@@ -340,6 +373,8 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
         ctxt.rescale();
     }
 
+    uint64_t corFactor = (uint64_t)1 << std::llround(correction);
+
     btsStageProbe("pre-StC", ctxt);
     if (isLT) {
         EvalLinearTransform(ctxt, slots, true);
@@ -353,8 +388,7 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
         ctxt.add(aux);
     }
 
-    uint64_t corFactor = (uint64_t)1 << std::llround(correction);
-    if (!skipCorFactor() && corFactor != 1)
+    if (corFactor != 1)
         multIntScalar(ctxt, corFactor);
     // Mixed-size chain: realize the pending StC rescale so the output lands
     // deg-1 exactly on the per-level table at the data scale (the lazy deg-2
@@ -377,6 +411,7 @@ void FIDESlib::CKKS::Bootstrap(Ciphertext& ctxt, const int slots, const bool pre
 
     ctxt.slots = old_slots;
 }
+}  // namespace FIDESlib::CKKS
 
 double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {
     ContextData& cc = *cc_;
@@ -385,6 +420,11 @@ double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {
     //NativeInteger q = elementParamsRaisedPtr->GetParams()[0]->GetModulus().ConvertToInt();
     uint64_t q = cc.prime[0].p;
     double qDouble = (double)q;  //q.ConvertToDouble();
+    // COMPOSITESCALING: level 0 spans compositeDegree primes — the bootstrap's q0 is their
+    // PRODUCT (~2^54 on a 2x27-bit chain). Everything downstream (deg, correction, pre/post,
+    // the ModRaise CRT lift) is derived from it.
+    for (int j_ = 1; j_ < cc.compositeDegree(); ++j_)
+        qDouble *= (double)cc.prime[j_].p;
 
     if constexpr (PRINT) {
         std::cout << "q: " << q << " ";
@@ -405,15 +445,18 @@ double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {
         }
     #endif
         */
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = effCorrectionFactor(cc, slots) - deg;
 
     double res = 0.0;
     if (cc.rescaleTechnique == CKKS::FLEXIBLEAUTO || cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT) {
+        const int d_ = cc.compositeDegree();
         uint32_t lvl = cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT;
-        double targetSF = cc.param.ScalingFactorReal[cc.L - lvl];
-        double sourceSF = cc.param.ScalingFactorReal[1];  // ciphertext->GetScalingFactor();
-        uint32_t numTowers = 2;                           // ciphertext->GetElements()[0].GetNumOfElements();
-        double modToDrop = static_cast<double>(cc.prime.at(numTowers - 1).p);
+        double targetSF = cc.sfAtLimb(cc.L - lvl * d_);
+        // composite: the pre-raise ciphertext sits at 2 LEVELS = 2d limbs; its scale lives at
+        // limb 2d-1 and the adjust's rescale drops the top d primes (their product).
+        double sourceSF = cc.sfAtLimb(2 * d_ - 1);  // ciphertext->GetScalingFactor();
+        uint32_t numTowers = 2 * d_;                // ciphertext->GetElements()[0].GetNumOfElements();
+        double modToDrop = cc.modReduceProduct(2 * d_ - 1);
         //cryptoParams->GetElementParams()->GetParams()[numTowers - 1]->GetModulus().ConvertToDouble();
         // in the case of FLEXIBLEAUTO, we need to bring the ciphertext to the right scale using a
         // a scaling multiplication. Note the at currently FLEXIBLEAUTO is only supported for NATIVEINT = 64.
@@ -440,6 +483,7 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
                               const bool sparse_encaps) {
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     ContextData& cc = ctxt.cc;
+    btsStageProbe("MR-entry", ctxt);
     //------------------------------------------------------------------------------
     // RAISING THE MODULUS
     //------------------------------------------------------------------------------
@@ -486,10 +530,11 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
 
     if (cc.rescaleTechnique == CKKS::FLEXIBLEAUTO || cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT) {
         uint32_t lvl = cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT;
-        double targetSF = cc.param.ScalingFactorReal[cc.L - lvl];
+        double targetSF = cc.sfAtLimb(cc.L - lvl * cc.compositeDegree());
         double sourceSF = ctxt.NoiseFactor;        // ciphertext->GetScalingFactor();
         uint32_t numTowers = ctxt.getLevel() + 1;  // ciphertext->GetElements()[0].GetNumOfElements();
-        double modToDrop = static_cast<double>(cc.prime.at(numTowers - 1).p);
+        // composite: the adjust's rescale drops the top d primes — divide by their product
+        double modToDrop = cc.modReduceProduct(ctxt.getLevel());
         //cryptoParams->GetElementParams()->GetParams()[numTowers - 1]->GetModulus().ConvertToDouble();
 
         // in the case of FLEXIBLEAUTO, we need to bring the ciphertext to the right scale using a
@@ -503,11 +548,6 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         adjustmentFactor *= pow;
         if constexpr (PRINT)
             std::cout << adjustmentFactor << std::endl;
-        if (std::getenv("BTS_SF_DEBUG"))
-            printf("[bts_sf] towers=%u log2(targetSF)=%.4f log2(sourceSF)=%.4f "
-                   "log2(modToDrop)=%.4f corr=%u log2(adj)=%.4f\n",
-                   numTowers, log2(targetSF), log2(sourceSF), log2(modToDrop),
-                   correction, log2(adjustmentFactor));
 
         if (!prescaled) {
             if constexpr (PRINT) {
@@ -537,7 +577,7 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
             }
             //cc->EvalMultInPlace(ciphertext, adjustmentFactor);
             ctxt.rescale();
-            ctxt.dropToLevel(0);
+            ctxt.dropToLevel(cc.compositeDegree() - 1);
             if constexpr (PRINT) {
                 cudaDeviceSynchronize();
                 std::cout << "Initial ";
@@ -564,10 +604,10 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
                 CudaCheckErrorMod;
             }
             if (ctxt.NoiseLevel == 2) {
-                ctxt.dropToLevel(1);
+                ctxt.dropToLevel(2 * cc.compositeDegree() - 1);
                 ctxt.rescale();
             } else {
-                ctxt.dropToLevel(0);
+                ctxt.dropToLevel(cc.compositeDegree() - 1);
             }
         }
         ctxt.NoiseFactor = targetSF;
@@ -601,7 +641,7 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
                 CudaCheckErrorMod;
             }
             ctxt.rescale();
-            ctxt.dropToLevel(0);
+            ctxt.dropToLevel(cc.compositeDegree() - 1);
             if constexpr (PRINT) {
                 cudaDeviceSynchronize();
                 std::cout << "Initial ";
@@ -628,24 +668,33 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
                 CudaCheckErrorMod;
             }
             if (ctxt.NoiseLevel == 2) {
-                ctxt.dropToLevel(1);
+                ctxt.dropToLevel(2 * cc.compositeDegree() - 1);
                 ctxt.rescale();
             } else {
-                ctxt.dropToLevel(0);
+                ctxt.dropToLevel(cc.compositeDegree() - 1);
             }
         }
     }
 
+    btsStageProbe("MR-bottom", ctxt);
     if (sparse_encaps) {
-        auto& sparse_context = cc.GetBootPrecomputation(slots).sparse_context;
-        auto sparse_context_use = sparse_context.lock();
-        Ciphertext sparse_ctxt(sparse_context_use);
-        auto& atob = CKKS::GetSecretSwitchingKey(ctxt.cc_, sparse_context_use, ctxt.keyID);
+        if (cc.compositeDegree() > 1) {
+            // COMPOSITESCALING: M-4 as a STANDARD hybrid keyswitch in the MAIN context at the
+            // composite bottom — the single-tower helper context cannot host a d-limb ct
+            // (its digit tables stop at k=0; see BootstrapPrecomputation::sparse_atob).
+            ctxt.keySwitch(*cc.GetBootPrecomputation(slots).sparse_atob);
+        } else {
+            auto& sparse_context = cc.GetBootPrecomputation(slots).sparse_context;
+            auto sparse_context_use = sparse_context.lock();
+            Ciphertext sparse_ctxt(sparse_context_use);
+            auto& atob = CKKS::GetSecretSwitchingKey(ctxt.cc_, sparse_context_use, ctxt.keyID);
 
-        sparse_ctxt.reinterpretContext(ctxt);
-        sparse_ctxt.keySwitch(atob);
-        ctxt.reinterpretContext(sparse_ctxt);
+            sparse_ctxt.reinterpretContext(ctxt);
+            sparse_ctxt.keySwitch(atob);
+            ctxt.reinterpretContext(sparse_ctxt);
+        }
     }
+    btsStageProbe("MR-atob", ctxt);
 
     //   std::cout << "Boot start " << std::endl;
     // auto ctxtDCRT = raised->GetElements();
@@ -688,7 +737,10 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         }
         std::cout << std::endl;
     }
-    ctxt.c0.broadcastLimb0();
+    if (cc.compositeDegree() > 1)
+        ctxt.c0.compositeModRaise();
+    else
+        ctxt.c0.broadcastLimb0();
     if constexpr (PRINT) {
         CudaCheckErrorMod;
         std::cout << "Adjustment ";
@@ -736,7 +788,10 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         }
         std::cout << std::endl;
     }
-    ctxt.c1.broadcastLimb0();
+    if (cc.compositeDegree() > 1)
+        ctxt.c1.compositeModRaise();
+    else
+        ctxt.c1.broadcastLimb0();
     if constexpr (PRINT) {
         std::cout << "Adjustment c1";
         for (auto& j : ctxt.c1.GPU) {
@@ -759,15 +814,27 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         std::cout << std::endl;
     }
 
+    btsStageProbe("MR-raised", ctxt);
     if (sparse_encaps) {
-        auto& sparse_context = cc.GetBootPrecomputation(slots).sparse_context;
+        if (cc.compositeDegree() > 1) {
+            // COMPOSITESCALING: M-2 back to the dense key, MAIN-context standard hybrid key.
+            ctxt.keySwitch(*cc.GetBootPrecomputation(slots).sparse_btoa);
+        } else {
+            auto& sparse_context = cc.GetBootPrecomputation(slots).sparse_context;
 
-        auto sparse_context_use = sparse_context.lock();
+            auto sparse_context_use = sparse_context.lock();
 
-        auto& btoa = CKKS::GetSecretSwitchingKey(sparse_context_use, ctxt.cc_, ctxt.keyID);
+            auto& btoa = CKKS::GetSecretSwitchingKey(sparse_context_use, ctxt.cc_, ctxt.keyID);
 
-        ctxt.keySwitch(btoa);
+            ctxt.keySwitch(btoa);
+        }
     }
 
+    btsStageProbe("MR-btoa", ctxt);
     ctxt.slots = cc.N / 2;
+}
+
+// Kept for API compatibility: the cached-bootstrap-graph machinery was removed, so this is a no-op.
+int FIDESlib::CKKS::BootstrapPrecapture(FIDESlib::CKKS::Context& /*cc*/) {
+    return 0;
 }

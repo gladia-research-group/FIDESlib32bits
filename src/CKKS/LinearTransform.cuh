@@ -17,6 +17,13 @@ template <CiphertextPtr ptrT, PlaintextPtr ptrU>
 void LinearTransform(CiphertextBatch<ptrT>& ctxt, int rowSize, int bStep, const PlaintextBatch<ptrU>& pts,
                      int stride = 1, int offset = 0);
 
+// MultPtBatch: outs[i] = ct * pts[i] for all i in ONE fused pointer-table kernel pass
+// (the bStep=1/gStep=1/num_LT=n mapping of LTdotProductPtBatch). No rescale — outputs are
+// NoiseLevel-2 products exactly like the serial elementwise multPt(rescale=false) path.
+// Preconditions (asserted): every pts[i] non-null at ct's level, ct.NoiseLevel == 1.
+void MultPtBatch(std::vector<std::shared_ptr<Ciphertext>>& results, Ciphertext& ct,
+                 const std::vector<Plaintext*>& pts);
+
 std::vector<int> GetLinearTransformRotationIndices(int bStep, int stride = 1, int offset = 0);
 std::vector<int> GetLinearTransformPlaintextRotationIndices(int rowSize, int bStep, int stride = 1, int offset = 0);
 

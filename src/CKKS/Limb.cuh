@@ -78,6 +78,13 @@ class Limb {
     // the staged decode path only ever hits the u64 instantiation. Used by RNSPoly::loadConstantStaged.
     void load_async_ptr(const void* src, size_t bytes, cudaStream_t stream);
 
+    // Async H2D from a host buffer holding ONE uint64_t PER COEFFICIENT — the pinned staging
+    // arena's format on EVERY chain (RawPlainText::sub_0 is vector<vector<uint64_t>>).
+    // For a u64 limb this is the plain memcpy above; for a u32 limb the source is TWICE the
+    // destination width, so it stages through scratch and narrows on device (a raw memcpy would
+    // overrun the u32 limb buffer by 2x).
+    void load_async_ptr_u64src(const void* src, size_t coeffs, cudaStream_t stream);
+
     // Async D2H into a caller-owned host buffer (must be PINNED for a truly async copy). No sync.
     // Returns the byte count written (v.size * sizeof(T)). Mirror of load_async_ptr, used by
     // RNSPoly::storeStaged for the async KV-cache offload.
