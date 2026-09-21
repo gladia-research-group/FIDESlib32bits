@@ -1,0 +1,30 @@
+############### Configuration ###################
+
+get_filename_component(FIDESLIB_CMAKE_DIR "${CMAKE_CURRENT_LIST_FILE}" PATH)
+if(NOT FIDESLIB_BINARY_DIR)
+  include("${FIDESLIB_CMAKE_DIR}/@PROJECT_NAME@Targets.cmake")
+endif()
+
+############### Macros ###################
+
+include(CMakeFindDependencyMacro)
+
+############### Exports ###################
+
+set(FIDESLIB_INCLUDE_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_INCLUDE_DIR@/@PROJECT_NAME@")
+set(FIDESLIB_LIBRARIES_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_LIBRARY_DIR@")
+set(FIDESLIB_BINARY_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_BINARY_DIR@")
+set(FIDESLIB_DATA_PATH "@CMAKE_INSTALL_PREFIX@/@INSTALL_DATA_DIR@")
+
+set(FIDESLIB_CXX_COMPILER "@CMAKE_CXX_COMPILER@")
+set(FIDESLIB_CXX_FLAGS "@FIX_OMP_FLAGS@")
+
+message(STATUS "Using FIDESlib.")
+
+############### Link dependencies ###############
+
+if (@TBB_FOUND@)
+  find_package(TBB)
+endif()
+
+find_package(CUDAToolkit)
