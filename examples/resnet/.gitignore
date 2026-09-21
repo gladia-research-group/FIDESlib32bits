@@ -1,0 +1,14 @@
+# Build directories.
+build/
+cmake-build-*/
+.venv/
+
+# IDE files.
+.idea/
+.vscode/
+
+# Weight files.
+*.bin
+
+# Key directories
+keys_*

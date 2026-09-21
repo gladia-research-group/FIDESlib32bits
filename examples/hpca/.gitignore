@@ -1,0 +1,12 @@
+# Build directories.
+build/
+cmake-build-*/
+
+# IDE files.
+.idea/
+.vscode/
+
+# Some files.
+output.png
+polynomial_plot.png
+polynomial_results.csv
