@@ -1,0 +1,19 @@
+# Build directories.
+build/
+cmake-build-*/
+
+# IDE files.
+.idea/
+.vscode/
+
+# Data files.
+data/*.csv
+times/*.csv
+weights/*.csv
+
+# Python cache files.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
