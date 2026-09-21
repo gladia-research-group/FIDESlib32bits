@@ -21,7 +21,9 @@
 
 #include <any>
 #include <atomic>
+#include <optional>
 #include <cmath>
+#include <fstream>
 #include <complex>
 #include <cstdint>
 #include <cstring>
@@ -36,12 +38,21 @@
 #include <scheme/ckksrns/ckksrns-ser.h>
 
 #include <memory>
+#include <condition_variable>
 #include <mutex>
+#include <shared_mutex>
 #include <future>
 #include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// NATIVEINT=32 uses ubint<unsigned int>; NATIVEINT=64 uses ubint<unsigned long>.
+#if NATIVEINT == 32
+#define FIDES_DCRTPOLY_FULL lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned int>>>
+#else
+#define FIDES_DCRTPOLY_FULL lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>
+#endif
 
 template <> std::map<std::string, std::vector<lbcrypto::EvalKey<lbcrypto::DCRTPoly>>> lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::s_evalMultKeyMap;
 template <>
@@ -133,8 +144,8 @@ CryptoContextImpl<DCRTPoly>::~CryptoContextImpl() {
 		plaintext_ready_events.clear();
 		plaintext_ready_events_mutex->unlock();
 	}
-	lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::ClearEvalMultKeys();
-	lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::ClearEvalAutomorphismKeys();
+	lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::ClearEvalMultKeys();
+	lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::ClearEvalAutomorphismKeys();
 }
 
 // ---- Enable features ----
@@ -352,14 +363,6 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt) {
 
 namespace {
 
-bool fhe_pin_stage() {
-	static const bool v = [] {
-		const char* e = std::getenv("FHE_PIN_STAGE");
-		return !(e && *e && std::atoi(e) == 0);
-	}();
-	return v;
-}
-
 const size_t kStageArenaBytes = [] {
 	const char* e	  = std::getenv("FHE_STAGE_ARENA_GB");
 	const int	gb	  = (e && *e) ? std::atoi(e) : 3;
@@ -374,14 +377,11 @@ struct PinnedArena {
 	std::atomic<size_t> used{0};
 };
 std::atomic<uint64_t> g_stage_overflow_pts{0};   // pts that fell back pageable since the last flip
+// Prefill chunk-weight cache: while set, ExtractRawPlaintext keeps the
+// OpenFHE-side payload even under FHE_STAGE_RELEASE_CPU, so a later chunk can RE-STAGE
+// the same plaintexts instead of re-encoding them (~2 GB/block host for coeff pts).
+std::atomic<bool> g_stage_release_suppressed{false};
 
-bool stage_stats_enabled() {
-	static const bool v = [] {
-		const char* e = std::getenv("FHE_STAGE_STATS");
-		return e && *e && std::atoi(e) != 0;
-	}();
-	return v;
-}
 struct StagedEntry {
 	FIDESlib::CKKS::RawPlainText meta;   // arena!=null ⇒ sub_0 cleared (data in arena); else sub_0 kept
 	const uint8_t*				 arena = nullptr;
@@ -391,25 +391,90 @@ struct StagedEntry {
 	// it to target_limbs on the GPU instead of uploading pre-built limbs.
 	bool						 coeff		  = false;
 	int							 target_limbs = 0;
-	// Arena generation this entry was staged under (multi-consume invalidation:
-	// the entry dies when ITS arena is recycled, i.e. two flips later — a flip-time
-	// clear is wrong under threaded prefetch, where the next block stages into the
-	// other arena while the current block still loads).
-	uint64_t					 gen = 0;
+	int							 prescale_log2 = 0;   // un-prescale ×2^k applied by the GPU lift
+	// Arena GENERATION this entry was staged under (509990c, multi-consume invalidation):
+	// the entry dies when ITS arena is recycled, i.e. kStageSlots flips later. A flip-time
+	// blanket clear is wrong under threaded prefetch, where the next block stages into the
+	// other half while the current block is still loading.
+	uint64_t					 gen           = 0;
 };
-PinnedArena g_stage_arena[2];
-int			g_stage_cur = 0;
-std::mutex	g_stage_mutex;
+// TWO halves are sufficient: a half holds HOST staging bytes, which are dead the instant the H2D
+// retires (compute reads DEVICE memory), so the release point is H2D retirement, not end of compute.
+constexpr int    kStageSlots = 2;
+PinnedArena      g_stage_arena[kStageSlots];
+std::atomic<int> g_stage_cur{0};
+std::mutex		 g_stage_mutex;
+// Bumped on every flip, under g_stage_mutex. Read lock-free by the multi-consume sweep.
 std::atomic<uint64_t> g_stage_gen{0};
 
+// A snapshot of the live staging arena, taken under g_stage_mutex.
+// stage_arena_begin writes g_stage_cur AND can cudaFreeHost/cudaMallocHost the half's base,
+// all under the mutex. An unlocked reader of `g_stage_arena[g_stage_cur]` can therefore
+// observe a base pointer the flip has already freed, and memcpy several MB through it. Nothing in the block pipeline forces the flip and the staging
+// onto the same thread (diagonal_linear flips on the MAIN thread and stages on the worker;
+// stage_plaintexts fans the same read out to an OMP team), so this is reachable, and its
+// signature is heap corruption surfacing far from here.
+// Snapshotting under the lock is sufficient: a half's base/cap are assigned once (the
+// `cap < kStageArenaBytes` branch) and `used` is atomic, so only the flip itself needs
+// serialising against the read.
+struct StageArenaView {
+	PinnedArena* a	  = nullptr;
+	uint8_t*	 base = nullptr;
+	size_t		 cap  = 0;
+	uint64_t	 gen  = 0;   // generation of THIS snapshot; stamped onto entries staged into it
+};
+StageArenaView view_of(PinnedArena& a) { return {&a, a.base, a.cap}; }
+
 // Start staging a new block: ping-pong to the other arena, (lazily, once) allocate it, reset bump.
+void stage_arena_begin();   // defined below; the owned variant wraps it
+
+// ── per-slot monitors for the staging arena ──────────────────────────────────────────────
+// The pipeline is deeper than the arena's halves, so a half could be recycled while the previous
+// owner's ASYNC H2D still reads it (silently wrong weights). A host mutex cannot express "intact
+// until the copy retires", so each half carries the id of the block that owns it: the producer
+// blocks until the half it is about to flip into is free, and the consumer releases it after that
+// block's compute. slot_owner[h] = owning block id, or -1 for free; owner < 0 = legacy unconditional flip.
+std::mutex				 g_slot_mutex;
+std::condition_variable	 g_slot_cv;
+int              g_slot_owner[kStageSlots] = {-1, -1};
+
+void stage_arena_release(int owner) {
+	if (owner < 0) return;
+	{
+		std::lock_guard<std::mutex> g(g_slot_mutex);
+		for (int h = 0; h < kStageSlots; ++h)
+			if (g_slot_owner[h] == owner) g_slot_owner[h] = -1;
+	}
+	g_slot_cv.notify_all();
+}
+
+void stage_arena_begin_owned(int owner) {
+	if (owner >= 0) {
+		std::unique_lock<std::mutex> lk(g_slot_mutex);
+		// IDEMPOTENT: a block owns at most one half. cpu_extract_block claims BEFORE the
+		// per-plaintext `pt->loaded` early-out, so a block already staged (by the cross-token
+		// prefetch) would otherwise claim a SECOND half next token — four claims against three
+		// slots, and the ring deadlocks with xwait pinned and token 1 never arriving. Re-claiming
+		// is wrong on its own terms too: the staged bytes live in the half this owner already
+		// holds, so flipping would strand them.
+		for (int h = 0; h < kStageSlots; ++h)
+			if (g_slot_owner[h] == owner) return;
+		// Block until the half we are about to flip INTO is free.
+		const int next = (g_stage_cur.load(std::memory_order_relaxed) + 1) % kStageSlots;
+		g_slot_cv.wait(lk, [&] { return g_slot_owner[next] < 0; });
+		g_slot_owner[next] = owner;
+	}
+	stage_arena_begin();
+}
+
 void stage_arena_begin() {
 	std::lock_guard<std::mutex> g(g_stage_mutex);
 	g_stage_gen.fetch_add(1, std::memory_order_relaxed);
-	g_stage_cur	   = (g_stage_cur + 1) & 1;
-	PinnedArena& a = g_stage_arena[g_stage_cur];
+	g_stage_cur.store((g_stage_cur.load(std::memory_order_relaxed) + 1) % kStageSlots,
+					  std::memory_order_relaxed);
+	PinnedArena& a = g_stage_arena[g_stage_cur.load(std::memory_order_relaxed)];
 	const uint64_t ov = g_stage_overflow_pts.exchange(0);
-	if (ov > 0 || stage_stats_enabled())
+	if (ov > 0)
 		std::fprintf(stderr, "[stage] arena flip: resetting used=%.2f GB cap=%.2f GB overflow_pts=%llu%s\n",
 					 a.used.load() / 1e9, a.cap / 1e9, static_cast<unsigned long long>(ov),
 					 ov > 0 ? " (raise FHE_STAGE_ARENA_GB)" : "");
@@ -428,14 +493,25 @@ void stage_arena_begin() {
 // arena/off/len set; on overflow/no-arena it falls back (sub_0 kept, arena=null) → pageable upload.
 // Thread-safe: the plaintext's total bytes are reserved with ONE atomic fetch_add, so an OMP team
 // can stage a block's plaintexts concurrently; the memcpys run lock-free into disjoint ranges.
-StagedEntry stage_into(PinnedArena& a, FIDESlib::CKKS::RawPlainText&& raw) {
+StagedEntry stage_into(StageArenaView a, FIDESlib::CKKS::RawPlainText&& raw, bool narrow_ok = true) {
+	// NATIVE-WIDTH staging (B12-plan step 1): a limb whose modulus fits 32 bits holds
+	// residues < 2^32, so on u32 chains the arena stores 4 bytes/coefficient instead of
+	// the historical 8 — half the pinned footprint and half the H2D bytes. The loader
+	// discriminates by entry length (4N vs 8N). Chain-agnostic: on n64 every modulus is
+	// > 2^32 and the layout is byte-identical to before. `narrow_ok=false` keeps the
+	// 8-byte slot for COEFF-staged entries, whose GPU lift reads u64 lanes by contract.
 	StagedEntry e;
-	size_t		total = 0;
-	for (const auto& limb : raw.sub_0)
-		total += limb.size() * sizeof(uint64_t);
+	e.gen = a.gen;   // the flip this entry's bytes belong to (multi-consume sweep)
+	auto limb_bytes = [&](size_t i) {
+		const bool narrow = narrow_ok && i < raw.moduli.size() && raw.moduli[i] < (1ull << 32);
+		return raw.sub_0[i].size() * (narrow ? sizeof(uint32_t) : sizeof(uint64_t));
+	};
+	size_t total = 0;
+	for (size_t i = 0; i < raw.sub_0.size(); ++i)
+		total += limb_bytes(i);
 	bool ok = (a.base != nullptr) && total > 0;
 	if (ok) {
-		const size_t base_off = a.used.fetch_add(total, std::memory_order_relaxed);
+		const size_t base_off = a.a->used.fetch_add(total, std::memory_order_relaxed);
 		if (base_off + total > a.cap) {
 			ok = false;   // reservation lost until the next flip resets the bump — arena is per block
 			g_stage_overflow_pts.fetch_add(1, std::memory_order_relaxed);
@@ -443,9 +519,16 @@ StagedEntry stage_into(PinnedArena& a, FIDESlib::CKKS::RawPlainText&& raw) {
 			e.off.reserve(raw.sub_0.size());
 			e.len.reserve(raw.sub_0.size());
 			size_t cur = base_off;
-			for (auto& limb : raw.sub_0) {
-				const size_t bytes = limb.size() * sizeof(uint64_t);
-				std::memcpy(a.base + cur, limb.data(), bytes);
+			for (size_t i = 0; i < raw.sub_0.size(); ++i) {
+				auto& limb		   = raw.sub_0[i];
+				const size_t bytes = limb_bytes(i);
+				if (bytes == limb.size() * sizeof(uint32_t)) {
+					auto* dst = reinterpret_cast<uint32_t*>(a.base + cur);
+					for (size_t k = 0; k < limb.size(); ++k)
+						dst[k] = (uint32_t)limb[k];
+				} else {
+					std::memcpy(a.base + cur, limb.data(), bytes);
+				}
 				e.off.push_back(cur);
 				e.len.push_back(bytes);
 				cur += bytes;
@@ -463,12 +546,12 @@ StagedEntry stage_into(PinnedArena& a, FIDESlib::CKKS::RawPlainText&& raw) {
 	e.meta = std::move(raw);
 	return e;
 }
-StagedEntry stage_raw(FIDESlib::CKKS::RawPlainText&& raw) {
-	// Lock-free like the original: the loader flips BEFORE staging a block, and no
-	// staging of the previous block overlaps its flip — cur/gen are stable here.
-	StagedEntry e = stage_into(g_stage_arena[g_stage_cur], std::move(raw));
-	e.gen		  = g_stage_gen.load(std::memory_order_relaxed);
-	return e;
+// The live staging half, snapshotted under g_stage_mutex — the ONLY sanctioned way to reach it.
+StageArenaView current_stage_arena() {
+	std::lock_guard<std::mutex> g(g_stage_mutex);
+	StageArenaView v = view_of(g_stage_arena[g_stage_cur.load(std::memory_order_relaxed)]);
+	v.gen            = g_stage_gen.load(std::memory_order_relaxed);
+	return v;
 }
 
 // ---- Persistent staging: for CONSTANT weights reloaded every token (lm_head tiles). Stage each
@@ -483,8 +566,14 @@ constexpr size_t kPersistArenaBytes = size_t(4) << 30;
 PinnedArena		 g_persist_arena;
 auto&		g_persist_staged = *new std::unordered_map<const void*, StagedEntry>();
 auto&		g_persist_mutex	 = *new std::mutex();
-bool										 g_stage_persistent = false;
-bool										 g_stage_multi_consume = false;
+// Atomic: written on the MAIN thread (gpt2_lm_head brackets its run_ops with
+// SetPersistentStaging) and read on the residency worker inside ExtractRawPlaintext, which
+// picks a different arena and a different map depending on it. A torn/stale read sends the
+// two threads down different staging paths for the same plaintext.
+std::atomic<bool>							 g_stage_persistent{false};
+// Same thread pattern as g_stage_persistent above (driver sets it on the MAIN thread, the
+// residency worker reads it inside LoadPlaintext), so it is atomic for the same reason.
+std::atomic<bool>							 g_stage_multi_consume{false};
 
 // Stage `raw` for plaintext `key` persistently (idempotent: no-op if already staged). Returns the
 // stored entry. Caller holds g_persist_mutex.
@@ -499,7 +588,10 @@ StagedEntry& persist_stage_locked(const void* key, FIDESlib::CKKS::RawPlainText&
 		g_persist_arena.cap	 = g_persist_arena.base ? kPersistArenaBytes : 0;
 		g_persist_arena.used = 0;
 	}
-	return g_persist_staged.emplace(key, stage_into(g_persist_arena, std::move(raw))).first->second;
+	// The persist arena is grow-once and never ping-ponged, and every caller holds
+	// g_persist_mutex, so a plain view of it is stable for the duration of the stage.
+	return g_persist_staged.emplace(key, stage_into(view_of(g_persist_arena), std::move(raw)))
+		.first->second;
 }
 
 // ---- Async KV-cache offload arena (pinned, position-keyed, reused) ----
@@ -562,12 +654,10 @@ namespace {
 std::future<void> g_stage_prewarm;
 }
 void PrewarmStageArenas() {
-	if (!fhe_pin_stage())
-		return;
 	static std::once_flag once;
 	std::call_once(once, [] {
 		g_stage_prewarm = std::async(std::launch::async, [] {
-			for (int i = 0; i < 2; ++i) {
+			for (int i = 0; i < kStageSlots; ++i) {
 				void* p = nullptr;
 				cudaMallocHost(&p, kStageArenaBytes);
 				std::lock_guard<std::mutex> g(g_stage_mutex);
@@ -584,23 +674,26 @@ void PrewarmStageArenas() {
 	});
 }
 
+void CryptoContextImpl<DCRTPoly>::SuppressStageReleaseCpu(bool suppress) {
+	g_stage_release_suppressed.store(suppress, std::memory_order_relaxed);
+}
+
 void CryptoContextImpl<DCRTPoly>::BeginStageBlock() {
-	if (fhe_pin_stage()) {
+	{
 		stage_arena_begin();
 		// Multi-consume mode keeps staged entries across loads. An entry must die
 		// exactly when ITS arena is recycled — that is THIS flip for entries staged
 		// two generations ago (same ping-pong parity). A blanket clear here is
 		// wrong under threaded prefetch: the next block stages while the current
 		// one still loads, and clearing would orphan the current block's entries
-		// (measured: coeff "consumed twice" throw, 2026-08-10). Stale survivors
-		// past their generation would alias recycled bytes (the 48856712 class),
-		// hence the sweep below.
+		// (a coeff "consumed twice" throw). Stale survivors past their generation
+		// would alias recycled bytes, hence the sweep below.
 		if (g_stage_multi_consume && prefetched_raw_mutex) {
 			const uint64_t G = g_stage_gen.load(std::memory_order_relaxed);
 			prefetched_raw_mutex->lock();
 			for (auto it = prefetched_raw.begin(); it != prefetched_raw.end();) {
 				if (it->second.type() == typeid(StagedEntry) &&
-					std::any_cast<const StagedEntry&>(it->second).gen + 2 <= G)
+					std::any_cast<const StagedEntry&>(it->second).gen + kStageSlots <= G)
 					it = prefetched_raw.erase(it);
 				else
 					++it;
@@ -608,6 +701,17 @@ void CryptoContextImpl<DCRTPoly>::BeginStageBlock() {
 			prefetched_raw_mutex->unlock();
 		}
 	}
+}
+
+// owner >= 0 arms the monitor: claim a half for this block and block until it is free.
+void CryptoContextImpl<DCRTPoly>::BeginStageBlockOwned(int owner) {
+	stage_arena_begin_owned(owner);
+}
+
+// Call once the block's compute is done — this is what makes the half reusable, and it is
+// deliberately NOT at enqueue time, which is where a mutex would have released it.
+void CryptoContextImpl<DCRTPoly>::ReleaseStageBlock(int owner) {
+	stage_arena_release(owner);
 }
 
 void CryptoContextImpl<DCRTPoly>::SetPersistentStaging(bool on) { g_stage_persistent = on; }
@@ -626,13 +730,39 @@ double CryptoContextImpl<DCRTPoly>::ScalingFactorReal(uint32_t level) const {
 	return cp->GetScalingFactorReal(level);
 }
 
-void CryptoContextImpl<DCRTPoly>::MarkCoeffStaged(Plaintext& pt, uint32_t target_level, double target_scale) {
+// Total q-limbs (PRIMES) in this context. `multiplicative_depth` counts CKKS LEVELS, and a
+// composite-scaling chain carries `d` primes per level, so `multiplicative_depth + 1` is the
+// prime count ONLY at d == 1. A coeff-staged plaintext's target_limbs is a PRIME count and
+// must therefore be derived from the element params, which are unit-correct on any chain.
+// Mixing the two made target_limbs go NEGATIVE on d=2 (26 + 1 - 34).
+// Composite degree of this context (1 on classic chains). The coeff lift stages exactly this
+// many source limbs — see MarkCoeffStaged.
+static uint32_t composite_degree_of(const std::any& cpu_ctx) {
+	const auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(cpu_ctx);
+	const auto cp = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(context->GetCryptoParameters());
+	return (cp && cp->GetCompositeDegree() > 0) ? cp->GetCompositeDegree() : 1u;
+}
+static size_t total_q_limbs(const std::any& cpu_ctx) {
+	const auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(cpu_ctx);
+	return context->GetCryptoParameters()->GetElementParams()->GetParams().size();
+}
+
+void CryptoContextImpl<DCRTPoly>::MarkCoeffStaged(Plaintext& pt, uint32_t target_level, double target_scale,
+                                                  int prescale_log2) {
 	auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
-	if (ptImpl->GetElement<lbcrypto::DCRTPoly>().GetAllElements().size() != 1)
-		OPENFHE_THROW("MarkCoeffStaged: expected a 1-limb (q0) host encode");
+	// The coeff lift reconstructs from the first `d` primes (Garner), so the host encode must
+	// leave exactly d limbs — one on a classic chain, the whole first-mod group on a composite
+	// one. A single 28-bit prime cannot carry a 2^54-scaled coefficient, so d=1 on a composite
+	// chain is not merely suboptimal, it is unrepresentable.
+	const uint32_t _d = composite_degree_of(this->cpu);
+	if (ptImpl->GetElement<lbcrypto::DCRTPoly>().GetAllElements().size() != _d)
+		OPENFHE_THROW("MarkCoeffStaged: expected a " + std::to_string(_d) +
+		              "-limb host encode (composite degree), got " +
+		              std::to_string(ptImpl->GetElement<lbcrypto::DCRTPoly>().GetAllElements().size()));
 	ptImpl->SetLevel(target_level);
 	ptImpl->SetScalingFactor(target_scale);
 	pt->coeff_staged = true;
+	pt->coeff_prescale_log2 = prescale_log2;
 }
 
 // Called from ~PlaintextImpl: drop a worker-staged entry that was never consumed. Without this,
@@ -641,9 +771,19 @@ void CryptoContextImpl<DCRTPoly>::MarkCoeffStaged(Plaintext& pt, uint32_t target
 void CryptoContextImpl<DCRTPoly>::ForgetPrefetchedRaw(const void* key) {
 	if (!prefetched_raw_mutex)
 		return;
-	prefetched_raw_mutex->lock();
-	prefetched_raw.erase(key);
-	prefetched_raw_mutex->unlock();
+	// Move the entry out and let it die AFTER the lock. A StagedEntry owns a RawPlainText,
+	// which owns an lbcrypto::Plaintext reference — dropping the last one runs a destructor
+	// that can re-enter this function, and prefetched_raw_mutex is a NON-recursive
+	// shared_mutex. RAII rather than raw lock/unlock so a throw cannot strand it either.
+	std::any dead;
+	{
+		std::unique_lock<std::shared_mutex> lk(*prefetched_raw_mutex);
+		auto it = prefetched_raw.find(key);
+		if (it == prefetched_raw.end())
+			return;
+		dead = std::move(it->second);
+		prefetched_raw.erase(it);
+	}
 }
 
 void CryptoContextImpl<DCRTPoly>::PrewarmKvArena() {
@@ -725,6 +865,10 @@ void CryptoContextImpl<DCRTPoly>::KvLoadStaged(Ciphertext<DCRTPoly>& ct, const s
 	ct->original_level = this->multiplicative_depth - ct->GetLevel();
 }
 
+
+// Kept for API compatibility: the LoadPlaintext timing probe was removed, so this is a no-op.
+extern "C" void AcqProbeReport(int /*tok*/) {}
+
 void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stream_override) {
 	if (pt->loaded || this->devices.empty())
 		return;
@@ -734,14 +878,15 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 	}
 
 	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
-	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
+	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt;
+	gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
 	const cudaStream_t load_stream = ResolvePlaintextLoadStream(stream_override);
 
 	const void* key = static_cast<const void*>(pt.get());
 
 	// Persistent staging (constant lm_head tiles): async-load from the persistent arena; stage on the
 	// first miss (tok0). The entry is never erased (constant weight) so the arena pointer is stable.
-	if (fhe_pin_stage() && g_stage_persistent) {
+	if (g_stage_persistent) {
 		std::lock_guard<std::mutex> g(g_persist_mutex);
 		auto		 it = g_persist_staged.find(key);
 		StagedEntry* e	= nullptr;
@@ -755,11 +900,14 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 				if (e->arena == nullptr)
 					OPENFHE_THROW("LoadPlaintext: coeff-staged plaintext overflowed the persistent arena");
 				e->coeff		= true;
-				e->target_limbs = static_cast<int>(this->multiplicative_depth + 1 - pt->GetLevel());
+				e->target_limbs = static_cast<int>(total_q_limbs(this->cpu) - pt->GetLevel());
+				e->prescale_log2 = pt->coeff_prescale_log2;
 			}
 		}
 		if (e->coeff) {
-			gpu_pt->loadCoeffExpand(e->meta, e->arena + e->off[0], e->len[0], e->target_limbs, load_stream);
+			gpu_pt->loadCoeffExpand(e->meta, e->arena, e->off, e->len,
+			                        (int)composite_degree_of(this->cpu), e->target_limbs, load_stream,
+			                        e->prescale_log2);
 		} else if (e->arena != nullptr) {
 			gpu_pt->loadStaged(e->meta, e->arena, e->off, e->len, load_stream);
 		} else if (load_stream != nullptr) {
@@ -781,7 +929,9 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 	FIDESlib::CKKS::RawPlainText raw_pt;
 	bool					   from_stash = false;
 	if (prefetched_raw_mutex) {
-		prefetched_raw_mutex->lock();
+		// RAII: the any_casts below can throw (a std::any holding neither type), and the raw
+		// lock/unlock pair this replaces would then have stranded the mutex for the process.
+		std::unique_lock<std::shared_mutex> lk(*prefetched_raw_mutex);
 		auto it = prefetched_raw.find(key);
 		if (it != prefetched_raw.end()) {
 			if (it->second.type() == typeid(StagedEntry)) {
@@ -802,17 +952,17 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 			if (!g_stage_multi_consume)
 				prefetched_raw.erase(it);   // single-consumption (proven default)
 		}
-		prefetched_raw_mutex->unlock();
 	}
 
 	if (have_staged && staged.coeff) {
-		gpu_pt->loadCoeffExpand(staged.meta, staged.arena + staged.off[0], staged.len[0],
-								staged.target_limbs, load_stream);
+		gpu_pt->loadCoeffExpand(staged.meta, staged.arena, staged.off, staged.len,
+								(int)composite_degree_of(this->cpu), staged.target_limbs, load_stream,
+								staged.prescale_log2);
 	} else if (have_staged && staged.arena != nullptr) {
 		gpu_pt->loadStaged(staged.meta, staged.arena, staged.off, staged.len, load_stream);
 	} else {
-		// A coeff-marked plaintext carries only its q0 limb — it MUST come through the staged
-		// path (a plain 1-limb upload at a claimed deeper level would be silently wrong).
+		// A coeff-marked plaintext carries only its first d limbs — it MUST come through the
+		// staged path (a plain short upload at a claimed deeper level would be silently wrong).
 		if (pt->coeff_staged)
 			OPENFHE_THROW("LoadPlaintext: coeff-staged plaintext has no staged entry (consumed "
 						  "twice, or staged before the arena was armed) — this is a bug");
@@ -844,7 +994,7 @@ void CryptoContextImpl<DCRTPoly>::ExtractRawPlaintext(Plaintext& pt) {
 
 	// Persistent staging (constant lm_head tiles): stage once, idempotent — the check is against
 	// g_persist_staged BEFORE the expensive GetRawPlainText so tok1+ is a true no-op.
-	if (fhe_pin_stage() && g_stage_persistent) {
+	if (g_stage_persistent) {
 		std::lock_guard<std::mutex> g(g_persist_mutex);
 		if (g_persist_staged.find(key) != g_persist_staged.end())
 			return;
@@ -855,21 +1005,25 @@ void CryptoContextImpl<DCRTPoly>::ExtractRawPlaintext(Plaintext& pt) {
 	}
 
 	{   // idempotent: skip if already extracted (shared lock, no double GetRawPlainText)
-		prefetched_raw_mutex->lock_shared();
-		const bool have = prefetched_raw.find(key) != prefetched_raw.end();
-		prefetched_raw_mutex->unlock_shared();
-		if (have)
+		std::shared_lock<std::shared_mutex> lk(*prefetched_raw_mutex);
+		if (prefetched_raw.find(key) != prefetched_raw.end())
 			return;
 	}
+	// This probe is only a fast path — it is NOT a claim on `key`. Everything below runs
+	// unlocked for milliseconds (GetRawPlainText copies several MB, stage_into copies them
+	// again), and in that window ~PlaintextImpl can call ForgetPrefetchedRaw(key) or
+	// LoadPlaintext can consume-and-erase. The insert at the end therefore re-checks under
+	// the exclusive lock instead of assuming the probe still holds; see there.
 	auto& context	   = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 	const auto& ptImpl = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
 	FIDESlib::CKKS::RawPlainText raw = FIDESlib::CKKS::GetRawPlainText(context, ptImpl);
-	if (pt->coeff_staged && raw.numRes != 1)
-		OPENFHE_THROW("ExtractRawPlaintext: coeff-staged plaintext must carry exactly one (q0) limb");
+	if (pt->coeff_staged && raw.numRes != (int)composite_degree_of(this->cpu))
+		OPENFHE_THROW("ExtractRawPlaintext: coeff-staged plaintext must carry exactly composite_degree limbs");
 	// Stage into the pinned arena (host memcpy on this worker — overlapped, no CUDA call) when
-	// FHE_PIN_STAGE; else stash the raw for a pageable upload.
-	std::any entry = fhe_pin_stage() ? std::any(stage_raw(std::move(raw)))
-									 : std::any(std::move(raw));
+	// FHE_PIN_STAGE; else stash the raw for a pageable upload. Coeff-staged entries keep the
+	// 8-byte slot (their GPU lift reads u64 lanes by contract — see stage_into narrow_ok).
+	const bool narrow_ok = !pt->coeff_staged;
+	std::any entry = std::any(stage_into(current_stage_arena(), std::move(raw), narrow_ok));
 	if (pt->coeff_staged) {
 		if (entry.type() != typeid(StagedEntry) || std::any_cast<const StagedEntry&>(entry).arena == nullptr)
 			OPENFHE_THROW("ExtractRawPlaintext: coeff-staged plaintext requires the pinned arena "
@@ -877,7 +1031,8 @@ void CryptoContextImpl<DCRTPoly>::ExtractRawPlaintext(Plaintext& pt) {
 		StagedEntry& se = std::any_cast<StagedEntry&>(entry);
 		se.coeff		= true;
 		// pt->GetLevel() reports the TARGET level (MarkCoeffStaged); limbs = depth+1 - level.
-		se.target_limbs = static_cast<int>(this->multiplicative_depth + 1 - pt->GetLevel());
+		se.target_limbs = static_cast<int>(total_q_limbs(this->cpu) - pt->GetLevel());
+		se.prescale_log2 = pt->coeff_prescale_log2;
 	}
 	// FHE_STAGE_RELEASE_CPU: once the limbs live in the pinned arena, the OpenFHE-side DCRTPoly is
 	// redundant (~4-6 MB/pt; a ViT block is ~65 GB) — drop it so staged blocks don't double-hold
@@ -888,14 +1043,29 @@ void CryptoContextImpl<DCRTPoly>::ExtractRawPlaintext(Plaintext& pt) {
 		const char* e = std::getenv("FHE_STAGE_RELEASE_CPU");
 		return e && *e && std::atoi(e) != 0;
 	}();
-	if (release_cpu && entry.type() == typeid(StagedEntry) &&
+	if (release_cpu && !g_stage_release_suppressed.load(std::memory_order_relaxed) &&
+		entry.type() == typeid(StagedEntry) &&
 		std::any_cast<const StagedEntry&>(entry).arena != nullptr) {
 		auto& pt_nc = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
 		pt_nc->GetElement<lbcrypto::DCRTPoly>() = lbcrypto::DCRTPoly();
 	}
-	prefetched_raw_mutex->lock();
-	prefetched_raw[key] = std::move(entry);
-	prefetched_raw_mutex->unlock();
+	// Publish. `operator[] = std::move(entry)` was wrong twice over: it DESTROYS whatever the
+	// key already held while the exclusive lock is held (that destructor can drop the last
+	// lbcrypto::Plaintext reference and re-enter ForgetPrefetchedRaw on this same
+	// non-recursive mutex), and it silently overwrites an entry that appeared while we were
+	// working — including one belonging to a DIFFERENT plaintext that the allocator has since
+	// placed at this address, which is precisely the address-recycling bug class
+	// ForgetPrefetchedRaw exists to prevent. try_emplace instead: first writer wins, and our
+	// loser copy is destroyed after the lock is released.
+	{
+		std::any loser;
+		{
+			std::unique_lock<std::shared_mutex> lk(*prefetched_raw_mutex);
+			// try_emplace leaves `entry` untouched when it does not insert, by contract.
+			if (!prefetched_raw.try_emplace(key, std::move(entry)).second)
+				loser = std::move(entry);   // someone published first — keep theirs, drop ours
+		}
+	}
 }
 
 void CryptoContextImpl<DCRTPoly>::LoadCiphertext(Ciphertext<DCRTPoly>& ct) {
@@ -993,18 +1163,9 @@ bool CryptoContextImpl<DCRTPoly>::StoreDeviceCiphertext(Ciphertext<DCRTPoly>& ct
 		OPENFHE_THROW("CryptoContext not loaded to any device");
 	}
 
-	// FHE_TIME_KV diagnostic: split the offload into store(D2H)/moduli(OpenFHE)/evict to find the
-	// 2.7 s; print + reset every 24 cts (~one token's worth). Zero overhead when off.
-	static const bool kvbrk = [] { const char* e = std::getenv("FHE_TIME_KV"); return e && *e && std::atoi(e) != 0; }();
-	static double g_store = 0, g_mod = 0, g_evict = 0;
-	static int	  g_n	  = 0;
-	auto _t = std::chrono::steady_clock::now();
-	auto _lap = [&] { auto n = std::chrono::steady_clock::now(); double d = std::chrono::duration<double, std::milli>(n - _t).count(); _t = n; return d; };
-
 	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
 	FIDESlib::CKKS::RawCipherText raw_ct;
 	ct_gpu->store(raw_ct, stream);	// drain-free device -> host
-	if (kvbrk) g_store += _lap();
 
 	auto& context	  = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 	const auto& chain = context->GetCryptoParameters()->GetElementParams()->GetParams();
@@ -1012,19 +1173,10 @@ bool CryptoContextImpl<DCRTPoly>::StoreDeviceCiphertext(Ciphertext<DCRTPoly>& ct
 	raw_ct.moduli.reserve(raw_ct.numRes);
 	for (int i = 0; i < raw_ct.numRes; ++i)
 		raw_ct.moduli.push_back(chain[i]->GetModulus().ConvertToInt());
-	if (kvbrk) g_mod += _lap();
 
 	const uint32_t key = ct->gpu;
 	if (!this->EvictDeviceCiphertext(key)) {
 		OPENFHE_THROW("StoreDeviceCiphertext: could not evict ciphertext from device");
-	}
-	if (kvbrk) {
-		g_evict += _lap();
-		if (++g_n % 24 == 0) {
-			std::fprintf(stderr, "[storebrk] store=%.1f moduli=%.1f evict=%.1f ms (per ~24 cts)\n", g_store, g_mod, g_evict);
-			std::fflush(stderr);
-			g_store = g_mod = g_evict = 0;
-		}
 	}
 	if (offloaded_ciphertexts_mutex)
 		offloaded_ciphertexts_mutex->lock();
@@ -1089,40 +1241,16 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
 	int doubleAngleIts = 3;
 
 	if (this->keyDist == fideslib::SPARSE_ENCAPSULATED) {
-		coeffchebyshev = { 0.24554573401685137,
-			-0.047919064883347899,
-			0.28388702040840819,
-			-0.029944538735513584,
-			0.35576522619036460,
-			0.015106561885073030,
-			0.29532946674499999,
-			0.071203602333739374,
-			-0.10347347339668074,
-			0.044997590512555294,
-			-0.42750712431925747,
-			-0.090342129729094875,
-			0.36762876269324946,
-			0.049318066039335348,
-			-0.14535986272411980,
-			-0.015106938483063579,
-			0.035951935499240355,
-			0.0031036582188686437,
-			-0.0062644606607068463,
-			-0.00046609430477154916,
-			0.00082128798852385086,
-			0.000053910533892372678,
-			-0.000084551549768927401,
-			-4.9773801787288514e-6,
-			7.0466620439083618e-6,
-			3.7659807574103204e-7,
-			-4.8648510153626034e-7,
-			-2.3830267651437146e-8,
-			2.8329709716159918e-8,
-			1.2817720050334158e-9,
-			-1.4122220430105397e-9,
-			-5.9306213139085216e-11,
-			6.3298928388417848e-11 };
-		doubleAngleIts = lbcrypto::FHECKKSRNS::R_SPARSE;
+		// r=5 / degree-14 refit; must stay in lockstep with GetRawParams' ENCAPS branch (this copy only
+		// feeds `modall`, i.e. the level plan).
+		{
+			coeffchebyshev = { -5.73829476916553172e-01, 2.63718536771466207e-02, -9.15574236933522245e-01,
+				-3.08975417541565676e-02, 2.85601052580403802e-01, 4.83129148738224799e-03,
+				-2.74350673185783482e-02, -3.16919293037672828e-04, 1.31295181914509542e-03,
+				1.15825536926191591e-05, -3.79010152666429525e-05, -2.71035793019274615e-07,
+				7.33952552563662122e-07, 4.41686895092293209e-09, -1.03169742989480305e-08 };
+			doubleAngleIts = 5;
+		}
 	} else if (this->keyDist == fideslib::SPARSE_TERNARY) {
 		coeffchebyshev = lbcrypto::FHECKKSRNS::g_coefficientsSparse;
 		doubleAngleIts = lbcrypto::FHECKKSRNS::R_SPARSE;
@@ -1133,29 +1261,13 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
 		OPENFHE_THROW("Unsupported key distribution");
 	}
 
-	// FIDESLIB_ARCSINE = reserve + enable everywhere (isolation probes);
-	// FIDESLIB_ARCSINE_RESERVE = reserve ONLY, correction stays off until a
-	// caller scopes it on via setArcsineOverride (production: cutmax argmax).
+
+	// FIDESLIB_SPARSE_ARCSINE = dual-slots mode: the arcsine correction's 3 levels are reserved ONLY on
+	// sparse-slot precomps (slots < N/2); the full-slot precomp stays vanilla. Must match ApproxModEval.cu.
 	int arcsineLvls = 0;
-	const auto env_on = [](const char* n) {
-		const char* e = std::getenv(n);
-		return e && *e && *e != '0';
-	};
-	if (env_on("FIDESLIB_ARCSINE") || env_on("FIDESLIB_ARCSINE_RESERVE")) {
-		arcsineLvls = 3;  // measured: applyArcsineCorrection consumes 3 levels (job 48598682)
-		if (const char* al = std::getenv("FIDESLIB_ARCSINE_LEVELS"); al && *al)
-			arcsineLvls = std::atoi(al);
-	}
-	// FIDESLIB_SPARSE_ARCSINE = dual-slots mode: the arcsine reservation rides
-	// ONLY sparse-slot precomps (slots < N/2); the full-slot precomp stays
-	// byte-identical vanilla (reserve-without-consume is fatal, job 48603930).
-	if (env_on("FIDESLIB_SPARSE_ARCSINE")) {
-		arcsineLvls = 0;
-		if (slots < context->GetRingDimension() / 2) {
+	if (const char* e = std::getenv("FIDESLIB_SPARSE_ARCSINE"); e && *e && *e != '0') {
+		if (slots < context->GetRingDimension() / 2)
 			arcsineLvls = 3;
-			if (const char* al = std::getenv("FIDESLIB_ARCSINE_LEVELS"); al && *al)
-				arcsineLvls = std::atoi(al);
-		}
 	}
 	int32_t modall = static_cast<int>(lbcrypto::GetMultiplicativeDepthByCoeffVector(coeffchebyshev, false)) + doubleAngleIts + arcsineLvls;
 
@@ -1189,11 +1301,11 @@ bool CryptoContextImpl<DCRTPoly>::SerializeEvalMultKey(std::ostream& ser, const 
 	bool res;
 	switch (sertype) {
 	case fideslib::SerType::BINARY:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::SerializeEvalMultKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::SerializeEvalMultKey(
 		  ser, lbcrypto::SerType::BINARY, keyTag);
 		break;
 	case fideslib::SerType::JSON:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::SerializeEvalMultKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::SerializeEvalMultKey(
 		  ser, lbcrypto::SerType::JSON, keyTag);
 		break;
 	default: OPENFHE_THROW("Unsupported serialization type");
@@ -1206,11 +1318,11 @@ bool CryptoContextImpl<DCRTPoly>::SerializeEvalAutomorphismKey(std::ostream& ser
 	bool res;
 	switch (sertype) {
 	case SerType::BINARY:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::SerializeEvalAutomorphismKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::SerializeEvalAutomorphismKey(
 		  ser, lbcrypto::SerType::BINARY, keyTag);
 		break;
 	case SerType::JSON:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::SerializeEvalAutomorphismKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::SerializeEvalAutomorphismKey(
 		  ser, lbcrypto::SerType::JSON, keyTag);
 		break;
 	default: OPENFHE_THROW("Unsupported serialization type");
@@ -1230,11 +1342,11 @@ bool CryptoContextImpl<DCRTPoly>::DeserializeEvalMultKey(std::istream& ser, cons
 	bool res;
 	switch (sertype) {
 	case SerType::BINARY:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::DeserializeEvalMultKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::DeserializeEvalMultKey(
 		  ser, lbcrypto::SerType::BINARY);
 		break;
 	case SerType::JSON:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::DeserializeEvalMultKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::DeserializeEvalMultKey(
 		  ser, lbcrypto::SerType::JSON);
 		break;
 	default: OPENFHE_THROW("Unsupported serialization type");
@@ -1252,11 +1364,11 @@ bool CryptoContextImpl<DCRTPoly>::DeserializeEvalAutomorphismKey(std::istream& s
 	bool res;
 	switch (sertype) {
 	case SerType::BINARY:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::DeserializeEvalAutomorphismKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::DeserializeEvalAutomorphismKey(
 		  ser, lbcrypto::SerType::BINARY);
 		break;
 	case SerType::JSON:
-		res = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>::DeserializeEvalAutomorphismKey(
+		res = lbcrypto::CryptoContextImpl<FIDES_DCRTPOLY_FULL>::DeserializeEvalAutomorphismKey(
 		  ser, lbcrypto::SerType::JSON);
 		break;
 	default: OPENFHE_THROW("Unsupported serialization type");
@@ -1428,7 +1540,8 @@ DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, con
 		if (cpu_levels < gpu_levels) {
 			// Create a fresh ciphertext at the top level with enough space
 			std::vector<double> dummy(1, 0.0);
-			auto pt_dummy = context->MakeCKKSPackedPlaintext(dummy, 1, this->multiplicative_depth - ct_gpu->getLevel());
+			// OpenFHE's encode `level` param counts primes dropped (composite-safe): cc.L - limb.
+			auto pt_dummy = context->MakeCKKSPackedPlaintext(dummy, 1, ct_gpu->cc.L - ct_gpu->getLevel());
 			auto& skImpl  = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
 			ct_cpu		  = context->Encrypt(skImpl, pt_dummy);
 		}
@@ -1468,6 +1581,149 @@ DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, con
 
 DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(const PrivateKey<DCRTPoly>& sk, Ciphertext<DCRTPoly>& ct, Plaintext* pt) {
 	return Decrypt(ct, sk, pt);
+}
+
+namespace {
+// Pinned snapshot ring for async magnitude capture. Ciphertext::store() drains the
+// whole DEVICE twice per call (~11 ms/node measured — THE capture wall); storeStaged
+// is a genuinely async D2H into pinned memory. Fixed-size slots + freelist; the
+// producer only enqueues copies and records an event, the decrypt worker waits the
+// event and reconstructs the RawCipherText host-side.
+struct MagSnap {
+	FIDESlib::CKKS::StagedCtMeta meta;
+	size_t		slot_off = 0;
+	int			slot_idx = -1;
+	cudaEvent_t ev		 = nullptr;
+	bool		cpu_only = false;
+	FIDESlib::CKKS::RawCipherText cpu_raw;   // fallback for non-GPU cts
+};
+struct MagRing {
+	uint8_t*		 base = nullptr;
+	size_t			 slot_bytes = 0;
+	int				 nslots		= 0;
+	std::vector<int> freelist;
+	std::mutex		 mtx;
+	std::condition_variable cv;
+	cudaStream_t	 stream = nullptr;
+	void init(size_t slot_bytes_) {
+		if (base) return;
+		const char* e  = std::getenv("FHE_MAG_RING_GB");
+		const size_t gb = (e && *e && std::atoi(e) > 0) ? (size_t)std::atoi(e) : 6;
+		slot_bytes		= slot_bytes_;
+		nslots			= (int)std::max<size_t>(4, (gb << 30) / slot_bytes);
+		cudaMallocHost(&base, (size_t)nslots * slot_bytes);
+		for (int i = nslots - 1; i >= 0; --i)
+			freelist.push_back(i);
+		cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+	}
+	int acquire() {
+		std::unique_lock<std::mutex> lk(mtx);
+		cv.wait(lk, [&] { return !freelist.empty(); });
+		int s = freelist.back();
+		freelist.pop_back();
+		return s;
+	}
+	void release(int s) {
+		{
+			std::lock_guard<std::mutex> lk(mtx);
+			freelist.push_back(s);
+		}
+		cv.notify_one();
+	}
+};
+MagRing g_mag_ring;
+}	// namespace
+
+std::shared_ptr<void> CryptoContextImpl<DCRTPoly>::StoreRaw(const Ciphertext<DCRTPoly>& ct) {
+	auto snap = std::shared_ptr<MagSnap>(new MagSnap(), [](MagSnap* s) {
+		if (s->ev) cudaEventDestroy(s->ev);
+		if (s->slot_idx >= 0) g_mag_ring.release(s->slot_idx);
+		delete s;
+	});
+	if (ct->loaded) {
+		auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
+		const int keep = -1;   // full snapshot
+		const size_t slot_limbs = (size_t)(ct_gpu->cc.L + 1 + ct_gpu->cc.K + 1);
+		g_mag_ring.init((size_t)2 * slot_limbs * ct_gpu->cc.N * sizeof(uint64_t));
+		snap->slot_idx = g_mag_ring.acquire();
+		snap->slot_off = (size_t)snap->slot_idx * g_mag_ring.slot_bytes;
+		ct_gpu->storeStagedOrdered(g_mag_ring.base + snap->slot_off, snap->meta, g_mag_ring.stream, keep);
+		cudaEventCreateWithFlags(&snap->ev, cudaEventDisableTiming);
+		cudaEventRecord(snap->ev, g_mag_ring.stream);
+	} else {
+		snap->cpu_only	  = true;
+		snap->cpu_raw.numRes = 0;   // DecryptStoredRaw refuses
+	}
+	return snap;
+}
+
+void CryptoContextImpl<DCRTPoly>::DecryptStoredRaw(const std::shared_ptr<void>& raw_in,
+												   const PrivateKey<DCRTPoly>& sk, Plaintext* pt) {
+	auto snap = std::static_pointer_cast<MagSnap>(raw_in);
+	if (!snap || snap->cpu_only) {
+		OPENFHE_THROW("DecryptStoredRaw: empty snapshot (ct was not GPU-resident at StoreRaw)");
+	}
+	// Wait for the async D2H (worker blocks; the producer never did), then rebuild the
+	// RawCipherText host-side: the staged bytes are each limb's device words verbatim
+	// (native width — widen u32 lanes), the same content Ciphertext::store() emits.
+	cudaEventSynchronize(snap->ev);
+	auto raw	= std::make_shared<FIDESlib::CKKS::RawCipherText>();
+	raw->numRes = snap->meta.numRes;
+	raw->N		= snap->meta.N;
+	raw->Noise	= snap->meta.Noise;
+	raw->NoiseLevel = snap->meta.NoiseLevel;
+	raw->keyid	= snap->meta.keyid;
+	raw->slots	= snap->meta.slots;
+	auto widen = [&](const std::vector<size_t>& off, const std::vector<size_t>& len,
+					 std::vector<std::vector<uint64_t>>& sub) {
+		sub.resize(off.size());
+		for (size_t i = 0; i < off.size(); ++i) {
+			const uint8_t* src = g_mag_ring.base + snap->slot_off + off[i];
+			if (len[i] == (size_t)snap->meta.N * sizeof(uint32_t)) {
+				const auto* s32 = reinterpret_cast<const uint32_t*>(src);
+				sub[i].resize(snap->meta.N);
+				for (int k = 0; k < snap->meta.N; ++k)
+					sub[i][k] = s32[k];
+			} else {
+				sub[i].assign(reinterpret_cast<const uint64_t*>(src),
+							  reinterpret_cast<const uint64_t*>(src) + len[i] / sizeof(uint64_t));
+			}
+		}
+	};
+	widen(snap->meta.off0, snap->meta.len0, raw->sub_0);
+	widen(snap->meta.off1, snap->meta.len1, raw->sub_1);
+
+	// (The magnitude-only tower truncation happens at STORE time, deg-aware — see
+	// StoreRaw. The snapshot already holds exactly the towers to decode.)
+	auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+	auto& skImpl  = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+
+	// Container prototypes per limb count (GetOpenFHECipherText truncates raw to the
+	// container size). Encrypt once per distinct count, Clone per call — all CPU.
+	static std::mutex proto_mtx;
+	static std::map<int, lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> protos;
+	lbcrypto::Ciphertext<lbcrypto::DCRTPoly> holder;
+	{
+		std::lock_guard<std::mutex> lk(proto_mtx);
+		auto it = protos.find(raw->numRes);
+		if (it == protos.end()) {
+			std::vector<double> dummy(1, 0.0);
+			// OpenFHE's encode `level` counts primes dropped: total - numRes.
+			const int total = (int)context->GetCryptoParameters()->GetElementParams()->GetParams().size();
+			auto pt_dummy = context->MakeCKKSPackedPlaintext(dummy, 1, std::max(0, total - (int)raw->numRes));
+			it = protos.emplace(raw->numRes, context->Encrypt(skImpl, pt_dummy)).first;
+		}
+		holder = it->second->Clone();
+	}
+	FIDESlib::CKKS::GetOpenFHECipherText(holder, *raw);
+
+	lbcrypto::Plaintext ptImpl;
+	context->Decrypt(skImpl, holder, &ptImpl);
+
+	*pt			  = std::make_shared<PlaintextImpl>();
+	(*pt)->cpu	  = std::make_any<lbcrypto::Plaintext>(std::move(ptImpl));
+	(*pt)->loaded = false;
+	(*pt)->gpu	  = 0;
 }
 
 // ---- Operations ----
@@ -2021,6 +2277,82 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(Plaintext& pt, const 
 	return EvalMult(ct1, pt);
 }
 
+std::vector<Ciphertext<DCRTPoly>> CryptoContextImpl<DCRTPoly>::EvalMultPtBatch(const Ciphertext<DCRTPoly>& ct1,
+                                                                               std::vector<Plaintext>& pts) {
+
+	std::vector<Ciphertext<DCRTPoly>> results;
+	results.reserve(pts.size());
+
+	// Fall back to CPU (and to the serial path on empty input).
+	if (this->devices.empty()) {
+		for (auto& pt : pts)
+			results.push_back(EvalMult(ct1, pt));
+		return results;
+	}
+
+	// GPU path.
+	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct1));
+	for (auto& pt : pts) {
+		this->LoadPlaintext(pt);
+		this->WaitPlaintextReady(pt->gpu);
+	}
+
+	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct1->gpu));
+
+	std::vector<std::shared_ptr<FIDESlib::CKKS::Ciphertext>> results_gpu;
+	results_gpu.reserve(pts.size());
+	std::vector<FIDESlib::CKKS::Plaintext*> pts_gpu;
+	pts_gpu.reserve(pts.size());
+
+	for (auto& pt : pts) {
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
+		results_gpu.push_back(
+			std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu)));
+		pts_gpu.push_back(std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(this->GetDevicePlaintext(pt->gpu)).get());
+		results.push_back(std::move(result));
+	}
+
+	FIDESlib::CKKS::MultPtBatch(results_gpu, *ct_gpu, pts_gpu);
+
+	return results;
+}
+
+void CryptoContextImpl<DCRTPoly>::EvalMultCtAccumBatch(Ciphertext<DCRTPoly>& acc,
+                                                       const std::vector<Ciphertext<DCRTPoly>>& as,
+                                                       const std::vector<Ciphertext<DCRTPoly>>& bs) {
+
+	// GPU-only: the CPU fallback would be the serial loop, which the wrapper keeps anyway.
+	if (this->devices.empty()) {
+		OPENFHE_THROW("EvalMultCtAccumBatch: GPU-only (serial fallback lives in the caller)");
+	}
+
+	this->LoadCiphertext(acc);
+	for (auto& ct : as)
+		this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+	for (auto& ct : bs)
+		this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+
+	auto acc_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(acc->gpu));
+
+	std::vector<const FIDESlib::CKKS::Ciphertext*> as_gpu, bs_gpu;
+	as_gpu.reserve(as.size());
+	bs_gpu.reserve(bs.size());
+	std::vector<std::shared_ptr<FIDESlib::CKKS::Ciphertext>> keepalive;
+	keepalive.reserve(as.size() + bs.size());
+	for (auto& ct : as) {
+		auto g = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
+		as_gpu.push_back(g.get());
+		keepalive.push_back(std::move(g));
+	}
+	for (auto& ct : bs) {
+		auto g = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
+		bs_gpu.push_back(g.get());
+		keepalive.push_back(std::move(g));
+	}
+
+	acc_gpu->multAccumulateBatch(as_gpu, bs_gpu);
+}
+
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRTPoly>& ct1, double scalar) {
 
 	// Fall back to CPU.
@@ -2071,11 +2403,8 @@ void CryptoContextImpl<DCRTPoly>::EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Pla
 }
 
 bool CryptoContextImpl<DCRTPoly>::LazyCpuShadowEnabled() {
-	// BAKED ON (2026-07-21, user ruling — no longer tunable): the lazy CPU shadow is
-	// value-validated on both arms (ViT e2e 49902068/49902164, GPT-2 planned decode A/B
-	// 49902926 top1-identical) and strictly faster (ct×pt mult 659→35 µs, ViT block
-	// 45→20 s, GPT-2 decode −15 %). The old FIDESLIB_LAZY_CPU_SHADOW env is ignored;
-	// the CloneEmpty shadow with the loud-throw re-upload guards is the only behavior.
+	// Always on: fresh GPU-op outputs carry a metadata-only CPU shadow (CloneEmpty) with
+	// loud-throw re-upload guards, never a deep copy.
 	return true;
 }
 
@@ -2288,7 +2617,7 @@ CryptoContextImpl<DCRTPoly>::EvalFastRotation(const Ciphertext<DCRTPoly>& ct, co
 
 		auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 		auto& ctImpl  = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
-		auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(precomp);
+		auto casted	  = std::static_pointer_cast<std::vector<FIDES_DCRTPOLY_FULL>>(precomp);
 		Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
 		result->cpu					= std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(context->EvalFastRotation(ctImpl, index, m, casted));
 		return result;
@@ -2313,7 +2642,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalFastRotationExt(const Ciph
 
 		auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 		auto& ctImpl  = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
-		auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(digits);
+		auto casted	  = std::static_pointer_cast<std::vector<FIDES_DCRTPOLY_FULL>>(digits);
 		Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
 		result->cpu					= std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(context->EvalFastRotationExt(ctImpl, index, casted, addFirst));
 		return result;
@@ -2340,7 +2669,7 @@ CryptoContextImpl<DCRTPoly>::EvalFastRotation(const Ciphertext<DCRTPoly>& ct, co
 	if (this->devices.empty()) {
 		auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 		auto& ctImpl  = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
-		auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(precomp);
+		auto casted	  = std::static_pointer_cast<std::vector<FIDES_DCRTPOLY_FULL>>(precomp);
 
 		for (const auto& index : indices) {
 			Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
@@ -2382,7 +2711,7 @@ CryptoContextImpl<DCRTPoly>::EvalFastRotationExt(const Ciphertext<DCRTPoly>& ct,
 	if (this->devices.empty()) {
 		auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 		auto& ctImpl  = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
-		auto casted	  = std::static_pointer_cast<std::vector<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<unsigned long>>>>>(digits);
+		auto casted	  = std::static_pointer_cast<std::vector<FIDES_DCRTPOLY_FULL>>(digits);
 
 		for (const auto& index : indices) {
 			Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ct);
@@ -2520,7 +2849,8 @@ void CryptoContextImpl<DCRTPoly>::DropToLevel(Ciphertext<DCRTPoly>& ciphertext, 
 	// REMAINING depth (device=mult_depth-host_level), so convert the OpenFHE target level.
 	this->LoadCiphertext(ciphertext);
 	auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu));
-	ct_gpu->dropToLevel(static_cast<int>(this->multiplicative_depth) - static_cast<int>(level));
+	// level counts primes dropped (OpenFHE convention, composite-safe): target limb = cc.L - level.
+	ct_gpu->dropToLevel(static_cast<int>(ct_gpu->cc.L) - static_cast<int>(level));
 }
 
 void CryptoContextImpl<DCRTPoly>::SetLevel(Ciphertext<DCRTPoly>& ct, size_t level) {

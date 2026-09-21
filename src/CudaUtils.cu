@@ -2,104 +2,23 @@
 // Created by carlosad on 25/03/24.
 //
 
+#include <atomic>
+#include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #include <cassert>
 #include <list>
+#include <mutex>
 #include <string>
 #include "CudaUtils.cuh"
 
 #include <iostream>
-#include <cub/detail/nvtx3.hpp>
 
 //#include "driver_types.h"
 #include "CKKS/Context.cuh"
 #define DISABLE_STREAMS false
 
 namespace FIDESlib {
-
-struct my_domain {
-    static constexpr char const* name{"FIDESlib"};
-};
-
-nvtx3::domain const& D = nvtx3::domain::get<my_domain>();
-
-std::map<std::string, std::pair<std::unique_ptr<nvtx3::unique_range_in<my_domain>>, int>> lifetimes_map;
-
-/* FIDESLIB_NVTX (default 0): NVTX ranges are a profiling aid, but they were also the last
- * un-audited SHARED-STATE writer on the two-ct path — the LIFETIME category mutates the
- * unguarded `lifetimes_map` std::map on every Ciphertext construction/destruction, so two
- * host threads corrupt the map (S7/FAILURE 2.33 class). Gated off by default; opt in with
- * FIDESLIB_NVTX=1 for single-threaded nsys runs. (Ported from rational32, where the same
- * gate measured wall-NEUTRAL — this is a correctness/hygiene gate, not a perf lever.) */
-bool cudaNvtxEnabled() {
-    static const bool v = [] {
-        const char* e = std::getenv("FIDESLIB_NVTX");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
-    return v;
-}
-
-void CudaNvtxStart(const std::string msg, NVTX_CATEGORIES cat, int val) {
-    if (!cudaNvtxEnabled())
-        return;
-
-    if (cat == FUNCTION) {
-        using namespace nvtx3;
-        int size = msg.size();
-        const event_attributes attr{msg,
-                                    rgb{(uint8_t)(255 - 101 * msg[size / 6]), (uint8_t)(255 - 101 * msg[size * 3 / 6]),
-                                        (uint8_t)(255 - 101 * msg[size * 5 / 6])},
-                                    payload{val}, category{static_cast<unsigned int>(cat)}};
-
-        nvtxDomainRangePushEx_impl_init_v3(D, reinterpret_cast<const nvtxEventAttributes_t*>(&attr));
-        //nvtxRangePushEx(reinterpret_cast<const nvtxEventAttributes_t*>(&attr));
-    } else if (cat == LIFETIME) {
-
-        using namespace nvtx3;
-        int size = msg.size();
-        auto& [r, i] = lifetimes_map[msg];
-        std::string m = std::to_string(i + 1) + std::string(" x ") + msg;
-        const event_attributes attr{m,
-                                    rgb{(uint8_t)(255 - 101 * msg[size / 6]), (uint8_t)(255 - 101 * msg[size * 3 / 6]),
-                                        (uint8_t)(255 - 101 * msg[size * 5 / 6])},
-                                    payload{i + 1}, category{static_cast<unsigned int>(cat)}};
-        i = i + 1;
-        if (!r) {
-            r = std::make_unique<unique_range_in<my_domain>>(attr);
-        } else {
-            *r = unique_range_in<my_domain>(attr);
-        }
-    }
-    //nvtxRangePushA(msg.c_str());
-}
-
-void CudaNvtxStop(const std::string msg, NVTX_CATEGORIES cat) {
-    if (!cudaNvtxEnabled())
-        return;
-    if (cat == FUNCTION) {
-        nvtxDomainRangePop(D);
-    } else if (cat == LIFETIME) {
-        using namespace nvtx3;
-        int size = msg.size();
-
-        auto& [r, i] = lifetimes_map[msg];
-        std::string m = std::to_string(i - 1) + std::string(" x ") + msg;
-        const event_attributes attr{m,
-                                    rgb{(uint8_t)(255 - 101 * msg[size / 6]), (uint8_t)(255 - 101 * msg[size * 3 / 6]),
-                                        (uint8_t)(255 - 101 * msg[size * 5 / 6])},
-                                    payload{i - 1}, category{static_cast<unsigned int>(cat)}};
-
-        i = i - 1;
-        if (i <= 0) {
-            if (r) {
-                r.reset();
-            }
-        } else {
-            *r = unique_range_in<my_domain>(attr);
-        }
-
-        //nvtxRangePushEx(reinterpret_cast<const nvtxEventAttributes_t*>(&attr));
-    }
-}
 
 int getNumDevices() {
     int d;
@@ -328,11 +247,14 @@ void initGPUprop() {
     }
 }
 
-std::mutex mempool_lock[8];
+/* Deliberately never destroyed: the static context cache (another TU) calls GPUfree from its own
+ * destructor, and static destruction order across TUs is unspecified, so the pool must outlive it.
+ * Cost is one 8-element pool per process, reclaimed by the OS at exit. */
+std::mutex* const mempool_lock = new std::mutex[8];
 
-std::map<int, std::vector<void*>> size_to_memory[8];
+std::map<int, std::vector<void*>>* const size_to_memory = new std::map<int, std::vector<void*>>[8];
 
-FIDESlib::Stream s[8];
+FIDESlib::Stream* const s = new FIDESlib::Stream[8];
 //void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     void* ptr = nullptr;
@@ -350,10 +272,8 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     }
 
     if (cache && (bytes & (bytes - 1)) == 0) {
-        // S7 thread-safety (2026-08-03): the WHOLE pooled path holds the lock — the map
-        // operator[] (node insert), the empty-check/refill/pop sequence and the shared
-        // per-id event were all racy under concurrent host threads. Cold path; the lock
-        // is nanoseconds against a 28 ms bootstrap.
+        // The whole pooled path holds the lock: the map insert, the refill/pop sequence and the
+        // shared per-id event are all racy under concurrent host threads.
         std::lock_guard<std::mutex> guard(mempool_lock[id]);
         std::vector<void*>& free_limb = size_to_memory[id][bytes];
 
@@ -429,7 +349,6 @@ void CUDART_CB streamCallback(void* userData) {
 }
 
 void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
-
     uint64_t MBs = 1024;
 
     if (bytes < 64 * 1024) {
@@ -443,7 +362,7 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
     }
 
     if (cache && (bytes & (bytes - 1)) == 0) {
-        // S7 thread-safety: same full-lock rule as GPUmalloc (map insert + shared event).
+        // Same full-lock rule as GPUmalloc (map insert + shared event).
         std::lock_guard<std::mutex> guard(mempool_lock[id]);
         if (s[id].ptr() == nullptr) {
             s[id].init();

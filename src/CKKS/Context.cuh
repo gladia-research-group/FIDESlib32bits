@@ -14,6 +14,8 @@
 #include <cassert>
 #include <iostream>
 #include <list>
+#include <mutex>
+#include <unordered_map>
 
 #ifdef NCCL
 #include "nccl.h"
@@ -79,8 +81,9 @@ class ContextData {
     std::vector<int> GPUrank;
 #endif
 
-    std::unique_ptr<RNSPoly> key_switch_aux = nullptr;
-    std::unique_ptr<RNSPoly> key_switch_aux2 = nullptr;
+    // Shared keyswitch workspaces, built lazily on first use (construction is mutex-guarded).
+    std::unique_ptr<RNSPoly> key_switch_aux;
+    std::unique_ptr<RNSPoly> key_switch_aux2;
     std::array<std::unique_ptr<RNSPoly>, 2> moddown_aux = {nullptr};
     std::vector<Stream> top_limb_stream;
     std::vector<uint64_t*> top_limb_buffer;
@@ -151,6 +154,39 @@ class ContextData {
     std::vector<uint64_t> ElemForEvalMult(int level, const double operand, int level_in = -1);
     std::vector<uint64_t> ElemForEvalAddOrSub(const int level, const double operand, const int noise_deg);
     std::vector<double>& GetCoeffsChebyshev();
+
+    /** Per-call correction-factor override for Bootstrap (armed by the wrapper's
+     *  CorrectionScope): -1 = use the per-slots precomputation value. Runtime-only —
+     *  nothing precomputed (keys, CtS/StC matrices, levels) depends on the correction
+     *  factor; it materializes as the 2^-c raise adjust + the 2^c restore inside ONE
+     *  bootstrap call, so mixing values across bootstraps in one execution is safe.
+     *  OUT-OF-LINE ACCESSORS ONLY from outside the library: ContextData carries
+     *  #ifdef NCCL members, so its field offsets differ between the fideslib build and
+     *  consumers compiled without the same define — direct field access from the wrapper
+     *  silently reads/writes the wrong offset (cost a GPU-job round-trip to find). */
+    void setCorrectionFactorOverride(int cf);
+    int getCorrectionFactorOverride() const;
+    int correctionFactorOverride = -1;
+
+    /** Bootstrap input pre-scale (armed per call by the wrapper, same discipline as the
+     *  correction-factor override): the next Bootstrap multiplies its input by this
+     *  factor for FREE — it rides constantEvalMult, an arbitrary double the input is
+     *  multiplied by anyway (any restore is the caller's business). 1.0 = neutral. Runtime-only, no
+     *  precomputation depends on it. OUT-OF-LINE ACCESSORS ONLY (see above). */
+    void setBtsPreScale(double f);
+    double getBtsPreScale() const;
+    double btsPreScale = 1.0;
+
+    /** COMPOSITESCALING support (d = primes per CKKS level; 1 on classic chains). */
+    int compositeDegree() const { return param.compositeDegree; }
+    /** Scaling factor read at a LIMB index. On composite chains OpenFHE stores a SENTINEL
+     *  1.0 at every index off the level grid (m_scalingFactorsReal); the import reverses
+     *  indices, so the grid condition is (L - limbTop) % d == 0. Reading off-grid is
+     *  always a bug — this accessor makes it loud instead of a silent scale of 1. */
+    double sfAtLimb(int limbTop) const;
+    /** Product of the compositeDegree ModReduceFactor entries dropped when rescaling a
+     *  ciphertext whose top limb is limbTop (single factor on classic chains). */
+    double modReduceProduct(int limbTop) const;
     int GetDoubleAngleIts();
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
     bool HasBootPrecomputation(int slots);
@@ -184,6 +220,31 @@ class ContextData {
     friend void DeregisterCryptoContextGPU(Context cc);
     friend Context GetCurrentContext();
     friend void SetCurrentContext(Context&);
+
+    /** Memo for ElemForEvalMult: the per-scalar bigint CRT expansion is pure given
+     *  (level, level_in, operand) plus context-construction-time state (primes, scaling
+     *  factors, compositeDegree), so entries live for the context lifetime with no
+     *  invalidation. The operand is keyed on its EXACT bit pattern — the output is a
+     *  bit-exact CRT residue vector, any tolerance-matching would silently break the
+     *  bit-exactness-vs-OpenFHE property. level_in is normalized (-1 -> level) before
+     *  hashing so the two spellings of the same branch share an entry. Appended at the
+     *  END of the class: library-internal only (out-of-line-accessor rule above). */
+    struct ElemMemoKey {
+        int level;
+        int level_in;
+        uint64_t operand_bits;
+        bool operator==(const ElemMemoKey&) const = default;
+    };
+    struct ElemMemoKeyHash {
+        size_t operator()(const ElemMemoKey& k) const {
+            uint64_t h = k.operand_bits ^ ((uint64_t(uint32_t(k.level)) << 32) | uint32_t(k.level_in));
+            h *= 0x9E3779B97F4A7C15ull;
+            return size_t(h ^ (h >> 32));
+        }
+    };
+    std::mutex elem_memo_mutex;
+    std::unordered_map<ElemMemoKey, std::vector<uint64_t>, ElemMemoKeyHash> elem_memo;
+
 };
 
 Context GenCryptoContextGPU(const Parameters& param, const std::vector<int>& devs);

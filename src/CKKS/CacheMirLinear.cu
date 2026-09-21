@@ -237,7 +237,7 @@ std::vector<int> getCacheMirInterleavedRotationIndices(int d, int numSlots) {
 // Set m=(i+j)%d, k=(m+d_idx)%d:  diagW[d_idx][m] = W[m, (m+d_idx)%d] (forward diagonal)
 //
 // Wait: y[m] = sum_k W[m,k]*x[k]. With k=(m+d_idx)%d: W[m, (m+d_idx)%d] * x[(m+d_idx)%d].
-// But Rot(ct, d_idx*K)[K*i+j] = x[(i+j+d_idx)%d] = x[(m + d_idx)%d]. ✓
+// But Rot(ct, d_idx*K)[K*i+j] = x[(i+j+d_idx)%d] = x[(m + d_idx)%d], as required.
 
 CacheMirInterleavedPrecomp encodeCacheMirInterleavedWeights(
     FIDESlib::CKKS::Context&                   gctx,

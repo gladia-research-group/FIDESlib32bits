@@ -109,8 +109,10 @@ namespace FIDESlib::CKKS {
     // COEFF-mode load: the arena holds ONE q0 EVAL limb of a host-side 1-limb encode; the GPU
     // expands it to `target_limbs` limbs (INTT → broadcastLimb0 → NTT — the ModRaise sequence).
     // `meta` supplies Noise/NoiseLevel/slots for the TARGET level (set by the encoder).
-    void loadCoeffExpand(const RawPlainText& meta, const uint8_t* src, size_t len, int target_limbs,
-                         cudaStream_t stream);
+    void loadCoeffExpand(const RawPlainText& meta, const uint8_t* arena,
+                         const std::vector<size_t>& off, const std::vector<size_t>& len,
+                         int src_limbs, int target_limbs,
+                         cudaStream_t stream, int prescale_log2 = 0);
     /**
      * @brief Store this plaintext into a raw representation.
      *

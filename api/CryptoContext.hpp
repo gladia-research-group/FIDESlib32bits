@@ -94,11 +94,16 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// overwrites the plaintext's level + scaling factor to the target's and sets coeff_staged.
 	/// Staged loads then expand it to the target limbs ON THE GPU (INTT → broadcastLimb0 → NTT),
 	/// replacing the host-side per-limb CRT+NTT that dominates MakeCKKSPackedPlaintext (~4.6x).
-	void MarkCoeffStaged(Plaintext& pt, uint32_t target_level, double target_scale);
+	void MarkCoeffStaged(Plaintext& pt, uint32_t target_level, double target_scale,
+	                     int prescale_log2 = 0);
 	/// @brief Begin staging a residency block under FHE_PIN_STAGE: ping-pong to the next pinned
 	/// arena and reset it. Call once before the per-plaintext ExtractRawPlaintext calls of a block
 	/// (from the residency worker). No-op when FHE_PIN_STAGE is off.
 	void BeginStageBlock();
+	// Monitor-gated variants: claim/release one staging-arena half per block, so a half
+	// is never recycled while a previous owner's async H2D still reads it. owner < 0 = legacy.
+	void BeginStageBlockOwned(int owner);
+	void ReleaseStageBlock(int owner);
 	/// @brief Toggle PERSISTENT staging (FHE_PIN_STAGE): while on, LoadPlaintext/ExtractRawPlaintext
 	/// stage a plaintext once into a grow-once arena keyed by identity and async-load it every token
 	/// without re-extracting — for CONSTANT weights reloaded per token (lm_head tiles). Off ⇒ the
@@ -186,6 +191,18 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	DecryptResult Decrypt(Ciphertext<DCRTPoly>& ct, const PrivateKey<DCRTPoly>& sk, Plaintext* pt);
 	DecryptResult Decrypt(const PrivateKey<DCRTPoly>& sk, Ciphertext<DCRTPoly>& ct, Plaintext* pt);
 
+	/// @brief Deferred-decryption pair (graph-capture magnitude probes). StoreRaw does
+	/// the D2H download NOW (the value at this instant) and nothing else — the cheap,
+	/// main-thread half. DecryptStoredRaw is pure CPU (container from a per-limb-count
+	/// prototype cache + OpenFHE decrypt) and is safe to call from worker threads
+	/// concurrently with GPU compute. The handle is an opaque RawCipherText.
+	/// Prefill chunk-weight cache: while suppressed, staged plaintexts KEEP their
+	/// OpenFHE-side payload (FHE_STAGE_RELEASE_CPU ignored) so they can be re-staged by a
+	/// later chunk instead of re-encoded. Global toggle; pair suppress(true)/(false).
+	void SuppressStageReleaseCpu(bool suppress);
+	std::shared_ptr<void> StoreRaw(const Ciphertext<DCRTPoly>& ct);
+	void DecryptStoredRaw(const std::shared_ptr<void>& raw, const PrivateKey<DCRTPoly>& sk, Plaintext* pt);
+
 	// ---- Operations ----
 
 	Ciphertext<DCRTPoly> EvalNegate(const Ciphertext<DCRTPoly>& ct);
@@ -225,6 +242,15 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	Ciphertext<DCRTPoly> EvalMult(const Ciphertext<DCRTPoly>& ct1, const Ciphertext<DCRTPoly>& ct2);
 	Ciphertext<DCRTPoly> EvalMult(const Ciphertext<DCRTPoly>& ct1, Plaintext& pt);
 	Ciphertext<DCRTPoly> EvalMult(Plaintext& pt, const Ciphertext<DCRTPoly>& ct1);
+	// Batched ct×pt: returns outs[i] = ct1 * pts[i], all products issued in one fused
+	// GPU kernel pass (MultPtBatch). Semantics per output are identical to EvalMult(ct, pt):
+	// no rescale, NoiseLevel-2 products. Requires every pt at ct1's level.
+	std::vector<Ciphertext<DCRTPoly>> EvalMultPtBatch(const Ciphertext<DCRTPoly>& ct1,
+	                                                  std::vector<Plaintext>& pts);
+	// Batched ct×ct accumulate: acc += Σ_j as[j]*bs[j] with ONE relinearization (acc must be
+	// the NoiseLevel-2 lane-0 product; all as/bs NoiseLevel-1 at acc's level). GPU-only.
+	void EvalMultCtAccumBatch(Ciphertext<DCRTPoly>& acc, const std::vector<Ciphertext<DCRTPoly>>& as,
+	                          const std::vector<Ciphertext<DCRTPoly>>& bs);
 	Ciphertext<DCRTPoly> EvalMult(const Ciphertext<DCRTPoly>& ct1, double scalar);
 	Ciphertext<DCRTPoly> EvalMult(double scalar, const Ciphertext<DCRTPoly>& ct1);
 	void EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Plaintext& pt);
@@ -232,7 +258,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void CopyCiphertextDevice(Ciphertext<DCRTPoly>& dst, const Ciphertext<DCRTPoly>& src);
 
 	Ciphertext<DCRTPoly> MakeGpuResultLike(const Ciphertext<DCRTPoly>& src);
-	/// Always true (baked 2026-07-21): fresh GPU-op outputs carry a metadata-only CPU shadow
+	/// Always true: fresh GPU-op outputs carry a metadata-only CPU shadow
 	/// (CloneEmpty), never a deep copy. The FIDESLIB_LAZY_CPU_SHADOW env is no longer read.
 	static bool LazyCpuShadowEnabled();
 	void EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, double scalar);

@@ -25,6 +25,11 @@ class RNSPoly {
     explicit RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>& data);
     RNSPoly(RNSPoly&& src) noexcept;
 
+    /** Buffer-ownership swap between two polys of the same context (no device traffic).
+     *  LimbPartition objects travel wholesale with their uid/stream/buffers; the only
+     *  per-poly back-pointer, `level`, is re-seated on both sides. */
+    void swap(RNSPoly& other) noexcept;
+
     void grow(int level, bool single_malloc = false, bool constant = false);
 
     void load(const std::vector<std::vector<uint64_t>>& data, const std::vector<uint64_t>& moduli);
@@ -108,6 +113,12 @@ class RNSPoly {
     void dropToLevel(int level);
     void addMult(const RNSPoly& poly, const RNSPoly& poly1);
     void broadcastLimb0();
+    /** COMPOSITESCALING ModRaise (call after grow()): CRT-extend the bottom
+     *  cc.compositeDegree() limbs to the whole current basis (OpenFHE ExtendCiphertext).
+     *  Constants are derived from cc.prime on the fly (host-side, trivial cost). */
+    void compositeModRaise();
+    // Centred-aggregate CRT lift from the first d limbs (coeff plaintexts, d==2).
+    void coeffLiftCentered();
     void evalLinearWSum(uint32_t i, std::vector<const RNSPoly*>& vector1, std::vector<uint64_t>& vector2);
     void loadConstant(const std::vector<std::vector<uint64_t>>& vector1, const std::vector<uint64_t>& vector2);
     void loadConstant(const std::vector<std::vector<uint64_t>>& vector1, const std::vector<uint64_t>& vector2,
@@ -120,11 +131,16 @@ class RNSPoly {
                             cudaStream_t stream);
     // Async D2H of limbs 0..level into a PINNED arena starting at `base + cursor`; appends each
     // limb's (offset,length) to off/len and advances cursor. No sync. KV-cache offload (storeStaged).
+    // max_limbs > 0 copies only the FIRST max_limbs limbs (magnitude-probe snapshots:
+    // the low-index towers are the ones a level drop keeps, so a prefix is a valid ct).
     void storeStaged(uint8_t* base, size_t& cursor, std::vector<size_t>& off, std::vector<size_t>& len,
-                     cudaStream_t stream);
+                     cudaStream_t stream, int max_limbs = -1);
     // Async H2D reconstruction from a PINNED arena. Mirrors load() (constant=false → regular limbs,
     // NOT loadConstant's shared constant buffer), sourcing limb i from `base + off[i]`. No sync.
     // Ciphertext (no special/modup) only: asserts numRes == limbsize.
+    // CIPHERTEXT (KV) staging only: the KV arena is written by storeStaged at NATIVE limb width,
+    // so this stays a raw memcpy. The PLAINTEXT arena is u64-per-coefficient and goes through
+    // loadConstantStaged / loadCoeffExpand, which narrow.
     void loadStaged(const uint8_t* base, const std::vector<size_t>& off, const std::vector<size_t>& len,
                     const std::vector<uint64_t>& moduli, cudaStream_t stream);
     // COEFF-mode weight load: the pinned source holds ONE q0 (prime-0) EVAL limb of a plaintext
@@ -132,7 +148,18 @@ class RNSPoly {
     // the proven ModRaise sequence: upload limb0 → INTT → grow(target) → broadcastLimb0
     // (centered SwitchModulus from q0) → NTT. Limbs grow NON-constant (aux needed for NTT).
     // Requires |coeff| < q0/2 (the encoder guards). Single-GPU only.
-    void loadCoeffExpand(const uint8_t* src, size_t len, int target_limbs, cudaStream_t stream);
+    // MULTI-LIMB coeff lift. `src_limbs` source limbs are uploaded from the
+    // pinned arena and CRT-reconstructed into `target_limbs`. src_limbs==1 keeps the original
+    // centred SwitchModulus (broadcastLimb0); src_limbs==d uses compositeModRaise's Garner
+    // reconstruction. The lift's capacity is the PRODUCT of the source primes, so on a
+    // composite chain only src_limbs==d gives a usable bound (one 28-bit prime cannot carry
+    // a 2^54-scaled coefficient).
+    // prescale_log2 (MarkCoeffStaged): host values were encoded ÷2^k to fit the centered-lift
+    // bound; after the lift every limb is multiplied back by (2^k mod q_i) — exact integer
+    // un-prescale, no scale/level change.
+    void loadCoeffExpand(const uint8_t* arena, const std::vector<size_t>& off,
+                         const std::vector<size_t>& len, int src_limbs, int target_limbs,
+                         cudaStream_t stream, int prescale_log2 = 0);
     void rotateModupDotKSK(RNSPoly& poly, RNSPoly& poly1, const KeySwitchingKey& key);
     void squareModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey& key);
     void generatePartialSpecialLimbs();
@@ -146,6 +173,7 @@ class RNSPoly {
     void gatherAllLimbs();
     void generateGatherLimbs();
     void copyShallow(const RNSPoly& poly);
+
     RNSPoly& modup_ksk_moddown_mgpu(const KeySwitchingKey& key, bool moddown);
     void rescaleDouble(RNSPoly& poly);
 
@@ -171,6 +199,12 @@ class RNSPoly {
     static void fusedHoistedRotateBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                         const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
                                         const std::vector<int>& indexes, int stride, double usage, bool c0_modup);
+
+    // acc0 += Σ a0[j]·b0[j]; acc1 += Σ a0[j]·b1[j]+a1[j]·b0[j]; acc2 = Σ a1[j]·b1[j]
+    // (FHE_LANE_BATCH phase 2 — batched binomial ct×ct accumulate ahead of ONE keyswitch).
+    static void binomialMultAccumBatch(RNSPoly& acc0, RNSPoly& acc1, RNSPoly& acc2,
+                                       const std::vector<const RNSPoly*>& a0, const std::vector<const RNSPoly*>& a1,
+                                       const std::vector<const RNSPoly*>& b0, const std::vector<const RNSPoly*>& b1);
 };
 }  // namespace FIDESlib::CKKS
 #endif  //FIDESLIB_CKKS_RNSPOLY_CUH

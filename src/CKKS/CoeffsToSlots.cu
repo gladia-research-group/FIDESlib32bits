@@ -6,6 +6,7 @@
 #include <vector>
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
+#include "CKKS/Bootstrap.cuh"
 #include "CKKS/CoeffsToSlots.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/LinearTransform.cuh"
@@ -185,6 +186,17 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
     int steps = 0;
     for (BootstrapPrecomputation::LTstep& step :
          (decode ? cc.GetBootPrecomputation(slots).StC : cc.GetBootPrecomputation(slots).CtS)) {
+        // Stage-divergence harness: stash the ciphertext ENTERING each LT stage so intra-CtS/StC
+        // noise injection is attributable per stage. Inert unless a caller installed the stash.
+        if (g_btsStageStash) {
+            cudaDeviceSynchronize();
+            auto c = std::make_shared<Ciphertext>(ctxt.cc_);
+            c->copy(ctxt);
+            g_btsStageStash->emplace_back(
+                std::string(decode ? "StC-stage-" : "CtS-stage-") + std::to_string(steps),
+                std::move(c));
+        }
+        ++steps;
         // computes the NTTs for each CRT limb (for the hoisted automorphisms used later on)
 
         if constexpr (AFFINE_LT && BATCHED) {

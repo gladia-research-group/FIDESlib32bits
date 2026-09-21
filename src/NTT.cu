@@ -8,14 +8,54 @@
 #include "ModMult.cuh"
 #include "NTT.cuh"
 
-//#include <cooperative_groups.h>
+// Evict-first loads for the NTT's read-once global streams: every data limb is read exactly once
+// per stage, so keeping those lines resident only evicts streams that ARE reused in co-resident
+// kernels. Loads only — the inter-stage buffer stores must stay normal (read through L2).
+#ifndef FIDESLIB_NTT_LDCS
+#define FIDESLIB_NTT_LDCS 1
+#endif
+#if FIDESLIB_NTT_LDCS
+#define FIDESLIB_NTT_STREAM_LD(p) __ldcs(p)
+#else
+#define FIDESLIB_NTT_STREAM_LD(p) (*(p))
+#endif
+
+// ORBIT-MAJOR PROBE (diagnostic, produces incorrect results by design): applies a 64 B-chunk
+// permutation perm(c) = c*37 mod 2^12 at the NTT's two boundary crossings (stage-2 output
+// stores, inverse stage-1 input loads) to price an orbit-major eval-domain layout.
+#ifndef FIDESLIB_EVAL_PERM_PROBE
+#define FIDESLIB_EVAL_PERM_PROBE 0
+#endif
+// idx2 = int2 index (8 B): chunk = idx2>>3. idx4 = int4 index (16 B): chunk = idx4>>2.
+__device__ __forceinline__ int evalPerm2(const int idx2) {
+#if FIDESLIB_EVAL_PERM_PROBE
+    return (idx2 & 7) | ((((idx2 >> 3) * 37) & 4095) << 3);
+#else
+    return idx2;
+#endif
+}
+__device__ __forceinline__ int evalPerm4(const int idx4) {
+#if FIDESLIB_EVAL_PERM_PROBE
+    return (idx4 & 3) | ((((idx4 >> 2) * 37) & 4095) << 2);
+#else
+    return idx4;
+#endif
+}
+
+#include <cooperative_groups.h>
+#include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 #include "NTTfusions.cuh"
 #include "NTThelper.cuh"
 
-//namespace cg = cooperative_groups;
+namespace cg = cooperative_groups;
 
 namespace FIDESlib {
 
@@ -89,12 +129,20 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
             for (int i = 0; i < M; ++i) {
                 if constexpr (sizeof(T) == 8) {
                     int4 aux;
-                    aux = ((int4*)dat)[OFFSET_2T(i)];
+                    aux = FIDESLIB_NTT_STREAM_LD((const int4*)dat + evalPerm4(OFFSET_2T(i)));  // orbit probe
                     ((int4*)(A(i)))[j >> 1] = aux;
                 } else {
                     int2 aux;
-                    aux = ((int2*)dat)[OFFSET_2T(i)];
-                    ((int2*)(A(i)))[j >> 1] = aux;
+                    aux = FIDESLIB_NTT_STREAM_LD((const int2*)dat + evalPerm2(OFFSET_2T(i)));  // orbit probe
+                    // swizzled: logical j / j+1 live at pos / pos^1 (same quad, lane bit 0),
+                    // so the 8-B store stays aligned — only the pair ORDER can flip.
+                    const int pos = swz_pos<T>(i, j);
+                    if (pos & 1) {
+                        const int t_ = aux.x;
+                        aux.x = aux.y;
+                        aux.y = t_;
+                    }
+                    ((int2*)(A(i)))[pos >> 1] = aux;
                 }
             }
         }
@@ -107,8 +155,46 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
     __syncthreads();
 
     if constexpr (second) {
+        // EOT: the middle-scale exponent is affine in i, so hoist the base and iterate.
+        [[maybe_unused]] T eot_tw[2], eot_step[2];
+#if FIDESLIB_NTT_EOT
+        {
+            const uint32_t logBD_ = 32 - __clz(blockDim.x);
+            const uint32_t mask_lo_exp = (((C_.N) >> 1) | ((C_.N >> (logBD_)) - 1));
+            const uint32_t clzN = __clz(C_.N) + 2;
+            const uint32_t block_pos0 = blockIdx.x * M;  // the i = 0 term
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const uint32_t br_j = __brev(j + k) >> (32 - logBD_);
+                const uint32_t exp = block_pos0 * br_j;
+                const uint32_t hi_exp_br = __brev(exp << clzN) & (blockDim.x - 1);
+                const uint32_t lo_exp = exp & mask_lo_exp;
+                if constexpr (algo == 3) {
+                    eot_tw[k] = modmult<algo>(((T*)G_->inv_psi_no[primeid])[lo_exp << 1], psi[hi_exp_br], primeid,
+                                              psi_shoup[hi_exp_br]);
+                } else {
+                    eot_tw[k] = modmult<algo>(psi[hi_exp_br], ((T*)G_->inv_psi_no[primeid])[lo_exp << 1], primeid);
+                }
+                // The per-i ratio is w^(-br_j). NOTE it comes from the FORWARD table at the
+                // complementary exponent, w^(N-br_j): `psi_no` is a clean power series
+                // (`psi_no[0] == 1`), whereas `inv_psi_no` is NOT — `inv_psi_no[0] != 1` and
+                // `inv_psi_no[2e]` is not even a root of unity, so it is only meaningful in
+                // combination with the `psi[hi]` factor of the split formula. Verified on device:
+                // psi_no[2*(N-br_j)] reproduces the measured ratio exactly, and psi_no[2*br_j] is
+                // its modular inverse. br_j == 0 would index 2N (one past the table) and its
+                // exponent is constant in i anyway, so the ratio is 1.
+                eot_step[k] = br_j ? ((T*)G_->psi_no[primeid])[(C_.N - br_j) << 1] : (T)1;
+            }
+        }
+#endif
         for (int i = 0; i < M; ++i) {
             T psi_aux[2];
+#if FIDESLIB_NTT_EOT
+            psi_aux[0] = eot_tw[0];
+            psi_aux[1] = eot_tw[1];
+            eot_tw[0] = modmult<ALGO_BARRETT>(eot_tw[0], eot_step[0], primeid);
+            eot_tw[1] = modmult<ALGO_BARRETT>(eot_tw[1], eot_step[1], primeid);
+#else
             if constexpr (0) {
                 if constexpr (sizeof(T) == 8) {
                     ((int4*)psi_aux)[0] = ((int4*)G_->inv_psi_middle_scale)[OFFSET_2T(i)];
@@ -129,7 +215,10 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
                     uint32_t hi_exp_br = __brev(exp << clzN) & (blockDim.x - 1);
                     uint32_t lo_exp = exp & mask_lo_exp;
 
-                    if constexpr (algo == 3) {
+                    if constexpr (FIDESLIB_NTT_TWIDDLE_ABLATE) {
+                        // Diagnostic traffic ablation (incorrect results by design), see NTThelper.cuh.
+                        psi_aux[k] = psi[1];
+                    } else if constexpr (algo == 3) {
                         psi_aux[k] = modmult<algo>(((T*)G_->inv_psi_no[primeid])[lo_exp << 1], psi[hi_exp_br], primeid,
                                                    psi_shoup[hi_exp_br]);
                     } else {
@@ -137,13 +226,14 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
                     }
                 }
             }
+#endif
 
             if constexpr (algo == FIDESlib::ALGO_SHOUP) {
-                A(i)[j] = modmult<FIDESlib::ALGO_BARRETT>(A(i)[j], psi_aux[0], primeid);
-                A(i)[j + 1] = modmult<FIDESlib::ALGO_BARRETT>(A(i)[j + 1], psi_aux[1], primeid);
+                AS(i, j) = modmult<FIDESlib::ALGO_BARRETT>(AS(i, j), psi_aux[0], primeid);
+                AS(i, j + 1) = modmult<FIDESlib::ALGO_BARRETT>(AS(i, j + 1), psi_aux[1], primeid);
             } else {
-                A(i)[j] = modmult<algo>(A(i)[j], psi_aux[0], primeid);
-                A(i)[j + 1] = modmult<algo>(A(i)[j + 1], psi_aux[1], primeid);
+                AS(i, j) = modmult<algo>(AS(i, j), psi_aux[0], primeid);
+                AS(i, j + 1) = modmult<algo>(AS(i, j + 1), psi_aux[1], primeid);
             }
         }
     }
@@ -151,6 +241,54 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
     int m = 1;
     int maskPsi = (blockDim.x - 1);
     uint32_t log_psi = 0;
+
+    // Mirror image of the NTT side — the FIRST NTT_SHFL_STAGES inverse stages
+    // (m = 1..16) are intra-warp, so they run on registers with one __shfl_xor between stages.
+    // The pair exchange is an involution, hence the same helper; only the stage order flips.
+#if FIDESLIB_NTT_WARP_SHFL
+    const bool use_shfl = (blockDim.x >= (1u << NTT_SHFL_STAGES));
+#else
+    constexpr bool use_shfl = false;
+#endif
+    if (use_shfl) {
+        T psis[NTT_SHFL_STAGES];
+        [[maybe_unused]] T psis_shoup[NTT_SHFL_STAGES];
+#pragma unroll
+        for (int k = 0; k < NTT_SHFL_STAGES; ++k) {
+            const int psiid = (tid & maskPsi) >> log_psi;
+            psis[k] = psi[psiid];
+            if constexpr (algo == 3)
+                psis_shoup[k] = psi_shoup[psiid];
+            maskPsi &= (maskPsi << 1);
+            ++log_psi;
+        }
+
+        __syncwarp();
+        // Entry pair = the m = 1 assignment (j, j+1) — exactly what this thread's load wrote.
+        // Exit pair = the m = 16 assignment, i.e. the same insert-a-0-bit index the shared loop
+        // would have used at that stage.
+        constexpr int m_out = 1 << (NTT_SHFL_STAGES - 1);
+        const int j1_out = ((m_out - 1) & tid) | ((~(m_out - 1) & tid) << 1);
+        for (int i = 0; i < M; ++i) {
+            T a0 = AS(i, j);
+            T a1 = AS(i, j + 1);
+#pragma unroll
+            for (int k = 0; k < NTT_SHFL_STAGES; ++k) {
+                if (k)  // re-assign the pair for the stage being entered
+                    warp_pair_exchange<T>(a0, a1, tid, k - 1);
+                if constexpr (algo == 3) {
+                    GS_butterfly<T, algo>(a0, a1, psis[k], primeid, psis_shoup[k]);
+                } else {
+                    GS_butterfly<T, algo>(a0, a1, psis[k], primeid);
+                }
+            }
+            // Hand the pair back to shared for the m >= 32 stages, whose first act is a
+            // __syncthreads() — that is what makes it visible to the rest of the block.
+            AS(i, j1_out) = a0;
+            AS(i, j1_out + m_out) = a1;
+        }
+        m = 1 << NTT_SHFL_STAGES;
+    }
 
     for (; m < blockDim.x; m <<= 1, maskPsi &= (maskPsi << 1), ++log_psi) {
         if (m >= warpSize)
@@ -170,8 +308,8 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
             psiaux_shoup = psi_shoup[psiid];
 
         for (int i = 0; i < M; ++i) {
-            T& a0 = A(i)[j1];
-            T& a1 = A(i)[j2];
+            T& a0 = AS(i, j1);
+            T& a1 = AS(i, j2);
             if constexpr (algo == 3) {
                 GS_butterfly<T, algo>(a0, a1, psiaux, primeid, psiaux_shoup);
             } else {
@@ -183,17 +321,21 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
     __syncthreads();
     for (int i = 0; i < M; ++i) {
         T aux[2];
-        aux[0] = A(i)[tid];
-        aux[1] = A(i)[tid + m];
-        A(i)[tid] = modadd(aux[0], aux[1], primeid);
-        A(i)[tid + m] = modsub(aux[0], aux[1], primeid);
+        aux[0] = AS(i, tid);
+        aux[1] = AS(i, tid + m);
+        AS(i, tid) = modadd(aux[0], aux[1], primeid);
+        AS(i, tid + m) = modsub(aux[0], aux[1], primeid);
     }
 
     // Obs: Almacenamos el array transpuesto ambas veces
     // Idea: calcular full_psi en función de ambos arrays psi
     // Idea: incluir N_inv en full_psi
 
-    if constexpr (sizeof(T) == 8 && second && NEGACYCLIC) {
+    // n32: the negacyclic post-scale was sizeof(T)==8-gated — the U32 INTT silently produced a
+    // non-negacyclic (wrong-basis) "coefficient" domain. Internally consistent (round trips and
+    // element-wise ops still work), but the KSK dot then mixes GPU-NTT digits with OpenFHE-eval
+    // key data in MISMATCHED bases -> keyswitch garbage. The helper is T-generic; apply for U32.
+    if constexpr (second && NEGACYCLIC) {
         backward_negacyclic_scale<T, algo, M>(buffer, primeid, psi, psi_shoup, Globals);
     }
 
@@ -207,11 +349,16 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
             const int col_init = j & ~2;
             for (int i = 0; i < M; ++i) {
                 int4 aux;
+#if FIDESLIB_NTT_TRANSPOSE_ABLATE
+                // Diagnostic transposed-index ablation (incorrect results by design), see NTThelper.cuh.
+                const int pos_trasp = 2 * (blockIdx.x * (blockDim.x * M) + i * blockDim.x + tid);
+#else
                 const int pos_trasp = (M * gridDim.x) * (col_init + i) + M * blockIdx.x + (j & 2);
+#endif
                 const int pos_res = (col_init + i);
                 assert(pos_trasp < gridDim.x * 2 * blockDim.x * M);
-                ((T*)&aux)[0] = A((j & 2))[pos_res];
-                ((T*)&aux)[1] = A((j & 2) + 1)[pos_res];
+                ((T*)&aux)[0] = AS((j & 2), pos_res);
+                ((T*)&aux)[1] = AS((j & 2) + 1, pos_res);
 
                 ((int4*)res)[pos_trasp >> 1] = aux;
             }
@@ -219,14 +366,22 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
             const int col_init = j & ~2;
             for (int i = 0; i < M / 2; ++i) {
                 int4 aux;
+#if FIDESLIB_NTT_TRANSPOSE_ABLATE
+                // Diagnostic transposed-index ablation (incorrect results by design), see NTThelper.cuh.
+                const int pos_trasp = 2 * (blockIdx.x * (blockDim.x * (M / 2)) + i * blockDim.x + tid);
+#else
                 const int pos_trasp = (M / 2) * ((gridDim.x) * (col_init + i) + blockIdx.x) + (j & 2);
+#endif
                 const int pos_res = (col_init + i);
                 assert(pos_trasp < gridDim.x * 2 * blockDim.x * M);
-                aux.x = A(2 * (j & 2))[pos_res];
-                aux.y = A(2 * (j & 2) + 1)[pos_res];
-                aux.z = A(2 * (j & 2) + 2)[pos_res];
-                aux.w = A(2 * (j & 2) + 3)[pos_res];
-                ((int4*)res)[pos_trasp >> 2] = aux;
+                aux.x = AS(2 * (j & 2), pos_res);
+                aux.y = AS(2 * (j & 2) + 1, pos_res);
+                aux.z = AS(2 * (j & 2) + 2, pos_res);
+                aux.w = AS(2 * (j & 2) + 3, pos_res);
+                // int4 slot = 2*(gridDim*(col)+bx) + (j&2)/2: >>1 keeps the (j&2) pair offset
+                // ((4X+(j&2))>>2 collapses both j&2 threads onto one slot — write race + half
+                // the outputs never written). Mirrors the u32 transposed LOAD in NTT__ (>>1).
+                ((int4*)res)[pos_trasp >> 1] = aux;
             }
         }
     }
@@ -289,6 +444,28 @@ __global__ void INTT_(const Global::Globals* Globals, void** __restrict__ dat, c
 
 //#define COOPERATIVE_GROUPS 1
 
+// NTT_RESCALE2: per-coefficient combine for the fused composite double drop.
+// Inputs are coeff-domain residues: x2c mod q_b (the second-from-top limb), va mod q_a (top).
+// Reproduces the two sequential OpenFHE drops exactly:
+//   w = qinv[a->b]*x2c + K[a->b]*SwitchMod_{a->b}(va)   (the once-divided q_b top — bit-equal
+//       to INTT(drop-1's output at limb b), because the drop formula is elementwise-linear and
+//       the modular NTT is exact)
+//   u = (K[a->j]*qinv[b->j])*SwitchMod_{a->j}(va) + K[b->j]*SwitchMod_{b->j}(w)
+// so that NTT(u) + qinv[a->j]*qinv[b->j]*x_j equals drop2(drop1(x))_j exactly (per-prime
+// scalars commute with the NTT). K = QlQlInvModqlDivqlModq. Constants are block-uniform.
+template <typename T, ALGO algo_>
+__device__ __forceinline__ T rescale2_combine(const T x2c, const T va, const int ra, const int rb, const int pj,
+                                              const T qinv_ab, const T K_ab, const T C1, const T K_bj) {
+    constexpr ALGO algo = algo_ == ALGO_SHOUP ? ALGO_BARRETT : algo_;
+    T va_b = va;
+    CKKS::SwitchModulus(va_b, ra, rb);
+    T w = modadd(modmult<algo>(qinv_ab, x2c, rb), modmult<algo>(K_ab, va_b, rb), rb);
+    T va_j = va;
+    CKKS::SwitchModulus(va_j, ra, pj);
+    CKKS::SwitchModulus(w, rb, pj);
+    return modadd(modmult<algo>(C1, va_j, pj), modmult<algo>(K_bj, w, pj), pj);
+}
+
 template <typename T, bool second, ALGO algo, NTT_MODE mode>
 __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restrict__ dat, const int primeid,
                                       T* __restrict__ res, const T* __restrict__ pt, const int primeid_rescale,
@@ -315,6 +492,21 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
     assert(((uint64_t)G_->psi[primeid] & 0b1111ul) == 0);
     assert(G_->psi_shoup[primeid] != nullptr);
     assert(((uint64_t)G_->psi_shoup[primeid] & 0b1111ul) == 0);
+
+    // NTT_RESCALE2 stage 1: block-uniform constants for the fused double drop.
+    // ra = top prime (primeid_rescale), rb = ra - 1 (level-ordered q ids, asserted host-side).
+    [[maybe_unused]] const int r2_ra = primeid_rescale, r2_rb = primeid_rescale - 1;
+    [[maybe_unused]] T r2_qinv_ab{}, r2_K_ab{}, r2_C1{}, r2_K_bj{};
+    if constexpr (mode == NTT_RESCALE2 && !second) {
+        constexpr ALGO algo_c = algo == ALGO_SHOUP ? ALGO_BARRETT : algo;
+        assert(primeid_rescale >= 1 && primeid < r2_rb);
+        r2_qinv_ab = (T)G_->q_inv[MAXP * r2_ra + r2_rb];
+        r2_K_ab = (T)G_->QlQlInvModqlDivqlModq[MAXP * r2_ra + r2_rb];
+        const T qinv_bj = (T)G_->q_inv[MAXP * r2_rb + primeid];
+        const T K_aj = (T)G_->QlQlInvModqlDivqlModq[MAXP * r2_ra + primeid];
+        r2_K_bj = (T)G_->QlQlInvModqlDivqlModq[MAXP * r2_rb + primeid];
+        r2_C1 = modmult<algo_c>(K_aj, qinv_bj, primeid);
+    }
 #ifdef COOPERATIVE_GROUPS
     cg::grid_group grid = cg::this_grid();
     for (int second_ = 0; second_ < 2; ++second_) {
@@ -329,15 +521,29 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 const int col_init = j & ~2;
                 for (int i = 0; i < M; i += 1) {
                     int4 aux;
+#if FIDESLIB_NTT_TRANSPOSE_ABLATE
+                    // Diagnostic transposed-index ablation (incorrect results by design), see NTThelper.cuh.
+                    const int pos_transp = 2 * (blockIdx.x * (blockDim.x * M) + i * blockDim.x + tid);
+#else
                     const int pos_transp = M * gridDim.x * (col_init + i) + M * blockIdx.x + (j & 2);
+#endif
                     const int pos_res = (col_init + i);
                     //((int4*)aux)[0] = ((int4*)dat)[pos_transp >> 1];
-                    aux = ((int4*)dat)[pos_transp >> 1];
+                    aux = FIDESLIB_NTT_STREAM_LD((const int4*)dat + (pos_transp >> 1));
                     //aux[0] = dat[pos_transp];
                     //aux[1] = dat[pos_transp + 1];
+                    if constexpr (mode == NTT_RESCALE2 && !second) {
+                        // fused double drop: dat = qb limb (x2c), pt = qa top (va), both coeff
+                        // domain, loaded with the identical transposed pattern (coalesced).
+                        const int4 aux2 = FIDESLIB_NTT_STREAM_LD((const int4*)pt + (pos_transp >> 1));
+                        ((T*)&aux)[0] = rescale2_combine<T, algo>(((T*)&aux)[0], ((const T*)&aux2)[0], r2_ra, r2_rb,
+                                                                  primeid, r2_qinv_ab, r2_K_ab, r2_C1, r2_K_bj);
+                        ((T*)&aux)[1] = rescale2_combine<T, algo>(((T*)&aux)[1], ((const T*)&aux2)[1], r2_ra, r2_rb,
+                                                                  primeid, r2_qinv_ab, r2_K_ab, r2_C1, r2_K_bj);
+                    }
                     if constexpr (1) {
-                        A(j & 2)[pos_res] = ((uint64_t*)&aux)[0];
-                        A((j & 2) + 1)[pos_res] = ((uint64_t*)&aux)[1];
+                        AS(j & 2, pos_res) = ((uint64_t*)&aux)[0];
+                        AS((j & 2) + 1, pos_res) = ((uint64_t*)&aux)[1];
                     } else {
                         temp[0][i & 1] = ((uint64_t*)&aux)[0];
                         temp[1][i & 1] = ((uint64_t*)&aux)[1];
@@ -355,18 +561,43 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 int4 temp[4];
                 for (int i = 0; i < M / 2; i += 1) {
                     int4 aux;
+#if FIDESLIB_NTT_TRANSPOSE_ABLATE
+                    // Diagnostic transposed-index ablation (incorrect results by design), see NTThelper.cuh.
+                    const int pos_transp = 2 * (blockIdx.x * (blockDim.x * (M / 2)) + i * blockDim.x + tid);
+#else
                     const int pos_transp = (M / 2) * (gridDim.x * (col_init + i) + blockIdx.x) + (j & 2);
+#endif
                     //                   const int pos_res = (col_init + i);
-                    aux = ((int4*)dat)[pos_transp >> 1];
+                    aux = FIDESLIB_NTT_STREAM_LD((const int4*)dat + (pos_transp >> 1));
+                    if constexpr (mode == NTT_RESCALE2 && !second) {
+                        // fused double drop: dat = qb limb (x2c), pt = qa top (va), both coeff
+                        // domain, loaded with the identical transposed pattern (coalesced).
+                        const int4 aux2 = FIDESLIB_NTT_STREAM_LD((const int4*)pt + (pos_transp >> 1));
+                        aux.x = (int)rescale2_combine<T, algo>((T)aux.x, (T)aux2.x, r2_ra, r2_rb, primeid, r2_qinv_ab,
+                                                               r2_K_ab, r2_C1, r2_K_bj);
+                        aux.y = (int)rescale2_combine<T, algo>((T)aux.y, (T)aux2.y, r2_ra, r2_rb, primeid, r2_qinv_ab,
+                                                               r2_K_ab, r2_C1, r2_K_bj);
+                        aux.z = (int)rescale2_combine<T, algo>((T)aux.z, (T)aux2.z, r2_ra, r2_rb, primeid, r2_qinv_ab,
+                                                               r2_K_ab, r2_C1, r2_K_bj);
+                        aux.w = (int)rescale2_combine<T, algo>((T)aux.w, (T)aux2.w, r2_ra, r2_rb, primeid, r2_qinv_ab,
+                                                               r2_K_ab, r2_C1, r2_K_bj);
+                    }
                     ((T*)&temp[0])[i] = aux.x;
                     ((T*)&temp[1])[i] = aux.y;
                     ((T*)&temp[2])[i] = aux.z;
                     ((T*)&temp[3])[i] = aux.w;
                 }
-                ((int4*)A(2 * (j & 2)))[col_init >> 2] = temp[0];
-                ((int4*)A(2 * (j & 2)) + 1)[col_init >> 2] = temp[1];
-                ((int4*)A(2 * (j & 2)) + 2)[col_init >> 2] = temp[2];
-                ((int4*)A(2 * (j & 2)) + 3)[col_init >> 2] = temp[3];
+                // temp[t] belongs to shared ROW 2*(j&2)+t (the r-lane), int4 slot col_init/4.
+                // A plain `(int4*)A(...) + t` would offset by t int4s WITHIN row 2*(j&2),
+                // leaving rows +1..+3 unwritten and smearing row 0's columns.
+                // Swizzled: the quad stays one aligned int4, so the vector store survives; the
+                // slot moves (swz_quad) and the four register lanes get permuted (swz_perm4).
+#pragma unroll
+                for (int t_ = 0; t_ < 4; ++t_) {
+                    const int row = 2 * (j & 2) + t_;
+                    ((int4*)A(row))[swz_quad<T>(row, col_init)] =
+                        swz_perm4(temp[t_], swz_lx<T>(row, col_init));
+                }
             }
 
             __syncthreads();
@@ -377,13 +608,14 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 if constexpr (!second) {
                     assert(primeid_rescale >= 0);
                     for (int i = 0; i < M; i += 1) {
-                        CKKS::SwitchModulus(A(i)[tid], primeid_rescale, primeid);
-                        CKKS::SwitchModulus(A(i)[tid + blockDim.x], primeid_rescale, primeid);
+                        CKKS::SwitchModulus(AS(i, tid), primeid_rescale, primeid);
+                        CKKS::SwitchModulus(AS(i, tid + blockDim.x), primeid_rescale, primeid);
                     }
                 }
             }
 
-            if constexpr (sizeof(T) == 8 && !second && NEGACYCLIC) {
+            // n32: same as the INTT side — the forward negacyclic pre-scale must run for U32 too.
+            if constexpr (!second && NEGACYCLIC) {
                 forward_negacyclic_scale<T, algo, M>(buffer, primeid, psi, psi_barret, Globals);
             }
 
@@ -402,17 +634,26 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
         A[tid | m] = modsub(aux[0], aux[1], primeid);
          */
                 // T aux[2]; // esto causa error de alineamiento lol
-                T aux0 = A(i)[tid];
-                T aux1 = A(i)[tid + m];
-                A(i)[tid] = modadd(aux0, aux1, primeid);
-                A(i)[tid + m] = modsub(aux0, aux1, primeid);
+                T aux0 = AS(i, tid);
+                T aux1 = AS(i, tid + m);
+                AS(i, tid) = modadd(aux0, aux1, primeid);
+                AS(i, tid + m) = modsub(aux0, aux1, primeid);
             }
 
             m >>= 1;
             maskPsi |= (maskPsi >> 1);
             int log_psi = __ffs(blockDim.x) - 2;  // Ojo al logaritmo.
 
-            for (; m >= 1 /*warpSize*/; m >>= 1, log_psi--, maskPsi |= (maskPsi >> 1)) {
+            // The last NTT_SHFL_STAGES stages are intra-warp and run in registers
+            // (see NTThelper.cuh). The shared-memory loop then stops at m = 2^NTT_SHFL_STAGES.
+#if FIDESLIB_NTT_WARP_SHFL
+            const bool use_shfl = (blockDim.x >= (1u << NTT_SHFL_STAGES));
+#else
+            constexpr bool use_shfl = false;
+#endif
+            const int m_stop = use_shfl ? (1 << NTT_SHFL_STAGES) : 1;
+
+            for (; m >= m_stop; m >>= 1, log_psi--, maskPsi |= (maskPsi >> 1)) {
                 const int mask = m - 1;
                 int j1 = (mask & tid) | ((~mask & tid) << 1);
                 int j2 = j1 + m;
@@ -426,10 +667,8 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                     __syncwarp();
 
                 for (int i = 0; i < M; i += 1) {
-                    T* A = (T*)(buffer + (i << (logBD)));
-
-                    T& aux1 = A[j1];
-                    T& aux2 = A[j2];
+                    T& aux1 = AS(i, j1);
+                    T& aux2 = AS(i, j2);
                     if constexpr (algo == 3) {
                         CT_butterfly<T, algo>(aux1, aux2, psiaux, primeid, psiaux_barret);
                     } else {
@@ -438,6 +677,47 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 }
             }
 
+            if (use_shfl) {
+                // m == 2^(NTT_SHFL_STAGES-1) == 16 here (blockDim.x is a power of two >= 32).
+                // The twiddles are row-invariant, so hoist all five out of the row loop; that
+                // keeps only two data registers live per row instead of 2*M.
+                T psis[NTT_SHFL_STAGES];
+                [[maybe_unused]] T psis_shoup[NTT_SHFL_STAGES];
+#pragma unroll
+                for (int k = 0; k < NTT_SHFL_STAGES; ++k) {
+                    const int psiid = (tid & maskPsi) >> log_psi;
+                    psis[k] = psi[psiid];
+                    if constexpr (algo == 3)
+                        psis_shoup[k] = psi_barret[psiid];
+                    log_psi--;
+                    maskPsi |= (maskPsi >> 1);
+                }
+
+                // Entry pair = the m = 16 assignment; the warp's own lanes wrote it at m = 32.
+                const int j1_in = ((m - 1) & tid) | ((~(m - 1) & tid) << 1);
+                __syncwarp();
+                for (int i = 0; i < M; i += 1) {
+                    T a0 = AS(i, j1_in);
+                    T a1 = AS(i, j1_in + m);
+#pragma unroll
+                    for (int k = 0; k < NTT_SHFL_STAGES; ++k) {
+                        if (k)  // re-assign the pair for the stage being entered
+                            warp_pair_exchange<T>(a0, a1, tid, NTT_SHFL_STAGES - 1 - k);
+                        if constexpr (algo == 3) {
+                            CT_butterfly<T, algo>(a0, a1, psis[k], primeid, psis_shoup[k]);
+                        } else {
+                            CT_butterfly<T, algo>(a0, a1, psis[k], primeid);
+                        }
+                    }
+                    // After m = 1 the thread holds exactly (j, j+1) — what the epilogue reads.
+                    AS(i, j) = a0;
+                    AS(i, j + 1) = a1;
+                }
+            }
+
+            // Everything in this `if constexpr (0)` block is DEAD and was NOT converted to
+            // the swizzled accessor (AS / swz_*). Re-enabling any of it against a u32 limb
+            // without swizzling its A(i)[..] indices will silently read the wrong elements.
             if constexpr (0) {
                 if constexpr (1) {
                     assert(m <= warpSize);
@@ -567,11 +847,39 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
 
             // Idea: calcular full_psi en función de ambos arrays psi
             if (!second) {
+                // EOT: the middle-scale exponent is affine in i, so hoist the base and iterate.
+                [[maybe_unused]] T eot_tw[2], eot_step[2];
+#if FIDESLIB_NTT_EOT
+                {
+                    const uint32_t logBD_ = 32 - __clz(blockDim.x);
+                    const uint32_t mask_lo_exp = (((C_.N) >> 1) | ((C_.N >> (logBD_)) - 1));
+                    const uint32_t clzN = __clz(C_.N) + 2;
+                    const uint32_t block_pos0 = blockIdx.x * M;  // the i = 0 term
+#pragma unroll
+                    for (int k = 0; k < 2; ++k) {
+                        const uint32_t br_j = __brev(j + k) >> (32 - logBD_);
+                        const uint32_t exp = block_pos0 * br_j;
+                        const uint32_t hi_exp_br = __brev(exp << clzN) & (blockDim.x - 1);
+                        const uint32_t lo_exp = exp & mask_lo_exp;
+                        if constexpr (algo == 3) {
+                            eot_tw[k] = modmult<algo>(((T*)G_->psi_no[primeid])[lo_exp * 2], psi[hi_exp_br], primeid,
+                                                      psi_barret[hi_exp_br]);
+                        } else {
+                            eot_tw[k] = modmult<algo>(psi[hi_exp_br], ((T*)G_->psi_no[primeid])[lo_exp * 2], primeid);
+                        }
+                        eot_step[k] = ((T*)G_->psi_no[primeid])[br_j * 2];  // W(br_j), the per-i ratio
+                    }
+                }
+#endif
 
                 for (int i = 0; i < M; i += 1) {
-                    const T* A = (T*)(buffer + (i << (logBD)));
                     int4 aux;
-
+#if FIDESLIB_NTT_EOT
+                    ((T*)&aux)[0] = eot_tw[0];
+                    ((T*)&aux)[1] = eot_tw[1];
+                    eot_tw[0] = modmult<ALGO_BARRETT>(eot_tw[0], eot_step[0], primeid);
+                    eot_tw[1] = modmult<ALGO_BARRETT>(eot_tw[1], eot_step[1], primeid);
+#else
                     {  // Low bandwidth
                         // index = j* bit_reverse(k, auxWidth), where j := blockIdx.x & k := 2*threadIdx.x + 1/0
                         const uint32_t logBD = 32 - __clz(blockDim.x);
@@ -598,7 +906,10 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
 
                             //assert(aux[k] == ((T*)G_::psi_middle_scale[primeid])[OFFSET_T(i) + k]);
 
-                            if constexpr (algo == 3) {
+                            if constexpr (FIDESLIB_NTT_TWIDDLE_ABLATE) {
+                                // Diagnostic traffic ablation (incorrect results by design), see NTThelper.cuh.
+                                ((T*)&aux)[k] = psi[1];
+                            } else if constexpr (algo == 3) {
                                 ((T*)&aux)[k] = modmult<algo>(((T*)G_->psi_no[primeid])[lo_exp * 2], psi[hi_exp_br],
                                                               primeid, psi_barret[hi_exp_br]);
                             } else {
@@ -607,19 +918,20 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                             }
                         }
                     }
+#endif
 
                     if constexpr (algo == ALGO_SHOUP) {
-                        ((T*)&aux)[0] = modmult<ALGO_BARRETT>(A[j], (T)((T*)&aux)[0], primeid);
-                        ((T*)&aux)[1] = modmult<ALGO_BARRETT>(A[j + 1], (T)((T*)&aux)[1], primeid);
+                        ((T*)&aux)[0] = modmult<ALGO_BARRETT>(AS(i, j), (T)((T*)&aux)[0], primeid);
+                        ((T*)&aux)[1] = modmult<ALGO_BARRETT>(AS(i, j + 1), (T)((T*)&aux)[1], primeid);
                     } else {
-                        ((T*)&aux)[0] = modmult<algo>(A[j], (T)((T*)&aux)[0], primeid);
-                        ((T*)&aux)[1] = modmult<algo>(A[j + 1], (T)((T*)&aux)[1], primeid);
+                        ((T*)&aux)[0] = modmult<algo>(AS(i, j), (T)((T*)&aux)[0], primeid);
+                        ((T*)&aux)[1] = modmult<algo>(AS(i, j + 1), (T)((T*)&aux)[1], primeid);
                     }
 
                     if constexpr (sizeof(T) == 8) {
-                        ((int4*)res)[OFFSET_2T(i)] = aux;
+                        ((int4*)res)[evalPerm4(OFFSET_2T(i))] = aux;  // orbit probe
                     } else {
-                        ((int2*)res)[OFFSET_2T(i)] = ((int2*)&aux)[0];
+                        ((int2*)res)[evalPerm2(OFFSET_2T(i))] = ((int2*)&aux)[0];  // orbit probe
                     }
                 }
 
@@ -627,6 +939,9 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
 
                 if constexpr (mode == NTT_RESCALE) {
                     rescale_fusion<T, algo, M>(buffer, logBD, j, primeid, primeid_rescale, res, Globals);
+                }
+                if constexpr (mode == NTT_RESCALE2) {
+                    rescale2_fusion<T, algo, M>(buffer, logBD, j, primeid, primeid_rescale, res, Globals);
                 }
                 if constexpr (mode == NTT_MULTPT) {
                     multpt_fusion<T, algo, M>(buffer, logBD, j, primeid, primeid_rescale, res, pt, Globals);
@@ -641,11 +956,19 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                     ksk_dot_acc_fusion<T, algo, M>(buffer, logBD, j, primeid, res, res2, pt, kskb);
                 } else {
                     for (int i = 0; i < M; i += 1) {
-                        const T* A = (T*)(buffer + (i << (logBD)));
                         if constexpr (sizeof(T) == 8) {
-                            ((int4*)res)[OFFSET_2T(i)] = ((int4*)A)[tid];
+                            ((int4*)res)[evalPerm4(OFFSET_2T(i))] = ((int4*)A(i))[tid];  // orbit probe
                         } else {
-                            ((int2*)res)[OFFSET_2T(i)] = ((int2*)A)[tid];
+                            // swizzled: logical j / j+1 sit at pos / pos^1, so the 8-B load
+                            // stays aligned; undo the pair order before writing out.
+                            const int pos = swz_pos<T>(i, j);
+                            int2 out = ((int2*)A(i))[pos >> 1];
+                            if (pos & 1) {
+                                const int t_ = out.x;
+                                out.x = out.y;
+                                out.y = t_;
+                            }
+                            ((int2*)res)[evalPerm2(OFFSET_2T(i))] = out;  // orbit probe
                         }
                     }
                 }
@@ -683,19 +1006,29 @@ __global__ void NTT_(const Global::Globals* Globals, void** __restrict__ dat, co
     const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
 
     assert(primeid >= 0 && primeid < MAXP);
+    // NTT_RESCALE2 stage 1 reads BOTH coeff-domain top limbs: dat[0] = qb limb, dat[1] = qa
+    // top (rides the otherwise-unused pt slot into NTT__).
     if (ISU64(primeid)) {
         NTT__<uint64_t, second, algo, mode>(
             Globals,
-            (mode == NTT_RESCALE || mode == NTT_MULTPT) && !second ? (uint64_t*)dat[0] : (uint64_t*)dat[blockIdx.y],
-            primeid, (uint64_t*)res[blockIdx.y], pt ? (uint64_t*)pt[blockIdx.y] : nullptr, primeid_rescale,
-            res2 ? (uint64_t*)res2[blockIdx.y] : nullptr, kskb ? (uint64_t*)kskb[blockIdx.y] : nullptr);
+            (mode == NTT_RESCALE || mode == NTT_MULTPT || mode == NTT_RESCALE2) && !second ? (uint64_t*)dat[0]
+                                                                                           : (uint64_t*)dat[blockIdx.y],
+            primeid, (uint64_t*)res[blockIdx.y],
+            (mode == NTT_RESCALE2 && !second) ? (uint64_t*)dat[1]
+                                              : (pt ? (uint64_t*)pt[blockIdx.y] : nullptr),
+            primeid_rescale, res2 ? (uint64_t*)res2[blockIdx.y] : nullptr,
+            kskb ? (uint64_t*)kskb[blockIdx.y] : nullptr);
 
     } else {
         NTT__<uint32_t, second, algo, mode>(
             Globals,
-            (mode == NTT_RESCALE || mode == NTT_MULTPT) && !second ? (uint32_t*)dat[0] : (uint32_t*)dat[blockIdx.y],
-            primeid, (uint32_t*)res[blockIdx.y], pt ? (uint32_t*)pt[blockIdx.y] : nullptr, primeid_rescale,
-            res2 ? (uint32_t*)res2[blockIdx.y] : nullptr, kskb ? (uint32_t*)kskb[blockIdx.y] : nullptr);
+            (mode == NTT_RESCALE || mode == NTT_MULTPT || mode == NTT_RESCALE2) && !second ? (uint32_t*)dat[0]
+                                                                                           : (uint32_t*)dat[blockIdx.y],
+            primeid, (uint32_t*)res[blockIdx.y],
+            (mode == NTT_RESCALE2 && !second) ? (uint32_t*)dat[1]
+                                              : (pt ? (uint32_t*)pt[blockIdx.y] : nullptr),
+            primeid_rescale, res2 ? (uint32_t*)res2[blockIdx.y] : nullptr,
+            kskb ? (uint32_t*)kskb[blockIdx.y] : nullptr);
     }
 }
 
@@ -705,6 +1038,8 @@ __global__ void NTT_(const Global::Globals* Globals, void** __restrict__ dat, co
         void** __restrict__ res, void** __restrict__ pt, const int __grid_constant__ primeid_rescale,      \
         void** __restrict__ res2, void** __restrict__ kskb);
 #include "ntt_types.inc"
+
+
 
 #undef VVV
 

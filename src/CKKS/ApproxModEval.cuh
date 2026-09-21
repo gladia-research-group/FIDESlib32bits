@@ -24,9 +24,8 @@ void multIntScalar(Ciphertext& ctxt, uint64_t op);
 
 void approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post);
 
-/** Runtime scope for the arcsine EvalMod correction: 1 = force on, 0 = force
- *  off, -1 = FIDESLIB_ARCSINE env default. Levels must be reserved at context
- *  build (FIDESLIB_ARCSINE or FIDESLIB_ARCSINE_RESERVE). */
+/** Runtime scope for the arcsine EvalMod correction: 1 = force on, 0 = force off, -1 = default (off).
+ *  The 3 levels it consumes must be reserved at context build (FIDESLIB_SPARSE_ARCSINE). */
 void setArcsineOverride(int v);
 
 }  // namespace FIDESlib::CKKS

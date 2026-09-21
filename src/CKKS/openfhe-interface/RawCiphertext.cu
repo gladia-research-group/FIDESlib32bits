@@ -3,10 +3,13 @@
 //
 #include <bit>
 #include <cassert>
+#include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <type_traits>
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/KskSeedExpand.cuh"
 #include "CKKS/openfhe-interface/ParameterSwitch.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "Math.cuh"
@@ -248,6 +251,7 @@ FIDESlib::CKKS::RawParams FIDESlib::CKKS::GetRawParams(lbcrypto::CryptoContext<l
     //result.L = cc->params->m_params->m_params.size() - 1;
     const auto cryptoParams = std::dynamic_pointer_cast<CryptoParametersCKKSRNS>(cc->GetCryptoParameters());
     result.scalingTechnique = cryptoParams->GetScalingTechnique();
+    result.compositeDegree = cryptoParams->GetCompositeDegree();
     //result.qbit = cc->params->m_params->m_params->;
     //auto aux = cc->GetCryptoParameters()->GetParamsPK()->GetParamPartition();
 
@@ -409,20 +413,19 @@ FIDESlib::CKKS::RawParams FIDESlib::CKKS::GetRawParams(lbcrypto::CryptoContext<l
 
     if (cc->GetScheme()->m_FHE) {
         if (boot_conf == FIDESlib::ENCAPS) {
-            // lbcrypto::FHECKKSRNS::g_coefficientsSparseEncapsulated
-            result.coefficientsCheby = {
-                0.24554573401685137,    -0.047919064883347899,   0.28388702040840819,      -0.029944538735513584,
-                0.35576522619036460,    0.015106561885073030,    0.29532946674499999,      0.071203602333739374,
-                -0.10347347339668074,   0.044997590512555294,    -0.42750712431925747,     -0.090342129729094875,
-                0.36762876269324946,    0.049318066039335348,    -0.14535986272411980,     -0.015106938483063579,
-                0.035951935499240355,   0.0031036582188686437,   -0.0062644606607068463,   -0.00046609430477154916,
-                0.00082128798852385086, 0.000053910533892372678, -0.000084551549768927401, -4.9773801787288514e-6,
-                7.0466620439083618e-6,  3.7659807574103204e-7,   -4.8648510153626034e-7,   -2.3830267651437146e-8,
-                2.8329709716159918e-8,  1.2817720050334158e-9,   -1.4122220430105397e-9,   -5.9306213139085216e-11,
-                6.3298928388417848e-11};  // degree 32
+            // r=5 double-angles with a degree-14 Chebyshev refit of (2pi)^(-1/32)*cos(2pi(16y-0.25)/32);
+            // depth-equivalent to the degree-32 / r=3 pair (the two extra squarings are exact).
+            {
+                result.coefficientsCheby = {
+                    -5.73829476916553172e-01, 2.63718536771466207e-02,  -9.15574236933522245e-01,
+                    -3.08975417541565676e-02, 2.85601052580403802e-01,  4.83129148738224799e-03,
+                    -2.74350673185783482e-02, -3.16919293037672828e-04, 1.31295181914509542e-03,
+                    1.15825536926191591e-05,  -3.79010152666429525e-05, -2.71035793019274615e-07,
+                    7.33952552563662122e-07,  4.41686895092293209e-09,  -1.03169742989480305e-08};  // degree 14, r=5
+                result.doubleAngleIts = 5;
+            }
             result.bootK = 16.0;
             result.sparse_encaps = true;
-            result.doubleAngleIts = lbcrypto::FHECKKSRNS::R_SPARSE;
             //result.bootK = 1.0;  // do not divide by k as we already did it during precomputation
         } else if (boot_conf == FIDESlib::ENCAPS_2) {
             result.coefficientsCheby = {
@@ -480,7 +483,6 @@ FIDESlib::CKKS::RawParams FIDESlib::CKKS::GetRawParams(lbcrypto::CryptoContext<l
             result.doubleAngleIts = 7;
         }
 
-        ;
     }
 
     result.p = cryptoParams->GetPlaintextModulus();
@@ -513,7 +515,11 @@ FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetKeySwitchKey(
     }
     keytag = ek->GetKeyTag();
 
-    return RawKeySwitchKey(std::move(a_moduli), std::move(a), std::move(b), std::move(keytag));
+    RawKeySwitchKey raw(std::move(a_moduli), std::move(a), std::move(b), std::move(keytag));
+#ifdef OPENFHE_HAS_KSKA_SEED
+    raw.a_seed = ek->GetASeed();   // key seed for on-GPU regeneration of the `a` half
+#endif
+    return raw;
 }
 
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetEvalKeySwitchKey(const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys) {
@@ -1044,41 +1050,67 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
     AddRotationKeys(publicKey, GPUcc_, indexes);
 
     if (GPUcc.param.raw->sparse_encaps) {
-        auto cc_switch = CKKS::createSwitchableContextBasedOnContext(cc, 1, 1, cc->GetRingDimension() / 2);
-
         auto& evalKeys = cc->GetEvalAutomorphismKeyMap(publicKey->GetKeyTag());
 
-        FIDESlib::CKKS::RawParams raw_param2 = FIDESlib::CKKS::GetRawParams(cc_switch);
-        //FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), devices};
-        FIDESlib::CKKS::Context cc_switch_ = CKKS::GenCryptoContextGPU(GPUcc.param.adaptTo(raw_param2), GPUcc.GPUid);
-        FIDESlib::CKKS::ContextData& GPUcc2 = *cc_switch_;
+        if (GPUcc.compositeDegree() > 1) {
+            // COMPOSITESCALING: both secret-switching keys are MAIN-context standard hybrid
+            // keys (see BootstrapPrecomputation::sparse_atob) — no helper GPU context at all.
+            result.sparse_atob = std::make_unique<FIDESlib::CKKS::KeySwitchingKey>(GPUcc_);
+            {
+                std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
+                    std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
+                        evalKeys[2 * GPUcc.N - 2]);
+                FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetKeySwitchKey(res);
+                result.sparse_atob->Initialize(rawKskEval);
+            }
+            result.sparse_btoa = std::make_unique<FIDESlib::CKKS::KeySwitchingKey>(GPUcc_);
+            {
+                std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
+                    std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
+                        evalKeys[2 * GPUcc.N - 4]);
+                FIDESlib::CKKS::RawKeySwitchKey rawKskEval2 = FIDESlib::CKKS::GetKeySwitchKey(res);
+                result.sparse_btoa->Initialize(rawKskEval2);
+            }
+            // result.sparse_context stays unset: the d>1 raise never enters the helper path,
+            // and an accidental .lock() should fail loudly rather than hand back a live context.
+        } else {
+            auto cc_switch = CKKS::createSwitchableContextBasedOnContext(cc, 1, 1, cc->GetRingDimension() / 2);
 
-        //std::cout << "Add atob key" << std::endl;
-        FIDESlib::CKKS::KeySwitchingKey ksk_atob(cc_switch_);
+            FIDESlib::CKKS::RawParams raw_param2 = FIDESlib::CKKS::GetRawParams(cc_switch);
+            //FIDESlib::CKKS::Context GPUcc{fideslibParams.adaptTo(raw_param), devices};
+            FIDESlib::CKKS::Context cc_switch_ =
+                CKKS::GenCryptoContextGPU(GPUcc.param.adaptTo(raw_param2), GPUcc.GPUid);
+            FIDESlib::CKKS::ContextData& GPUcc2 = *cc_switch_;
 
-        {
-            std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
-                std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(evalKeys[2 * GPUcc.N - 2]);
-            FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetKeySwitchKey(res);
-            ksk_atob.Initialize(rawKskEval);
+            //std::cout << "Add atob key" << std::endl;
+            FIDESlib::CKKS::KeySwitchingKey ksk_atob(cc_switch_);
+
+            {
+                std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
+                    std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
+                        evalKeys[2 * GPUcc.N - 2]);
+                FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetKeySwitchKey(res);
+                ksk_atob.Initialize(rawKskEval);
+            }
+            //std::cout << "Add btoa key" << std::endl;
+            FIDESlib::CKKS::KeySwitchingKey ksk_btoa(GPUcc_);
+            {
+                std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
+                    std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
+                        evalKeys[2 * GPUcc.N - 4]);
+                FIDESlib::CKKS::RawKeySwitchKey rawKskEval2 = FIDESlib::CKKS::GetKeySwitchKey(res);
+                ksk_btoa.Initialize(rawKskEval2);
+            }
+
+            CKKS::AddSecretSwitchingKey(std::move(ksk_atob), std::move(ksk_btoa));
+
+            result.sparse_context = cc_switch_;
         }
-        //std::cout << "Add btoa key" << std::endl;
-        FIDESlib::CKKS::KeySwitchingKey ksk_btoa(GPUcc_);
-        {
-            std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
-                std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(evalKeys[2 * GPUcc.N - 4]);
-            FIDESlib::CKKS::RawKeySwitchKey rawKskEval2 = FIDESlib::CKKS::GetKeySwitchKey(res);
-            ksk_btoa.Initialize(rawKskEval2);
-        }
-
-        CKKS::AddSecretSwitchingKey(std::move(ksk_atob), std::move(ksk_btoa));
-
-        result.sparse_context = cc_switch_;
     }
 
     std::cout << "Rotation keys loaded: " << GPUcc.precom.keys.begin()->second.rot_keys.size() << " ~ "
               << 2 * ((long long)GPUcc.precom.keys.begin()->second.rot_keys.size() * GPUcc.dnum *
-                      (GPUcc.L + GPUcc.K + 1) * GPUcc.N * 8 / (1 << 20))
+                      (GPUcc.L + GPUcc.K + 1) * GPUcc.N * (NATIVEINT / 8) / (1 << 20))
               << "MB" << std::endl;
 }
 

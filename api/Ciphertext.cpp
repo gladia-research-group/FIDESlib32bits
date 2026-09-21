@@ -1,5 +1,6 @@
 #include "Ciphertext.hpp"
 #include "CKKS/Ciphertext.cuh"
+#include "CKKS/Context.cuh"  // full ContextData: the level<->limb conversions read cc.L
 #include "Definitions.hpp"
 
 #include <iostream>
@@ -53,7 +54,13 @@ CiphertextImpl<DCRTPoly>::CiphertextImpl(const Ciphertext<DCRTPoly>& other) : Ci
 // ---- Clone ----
 
 Ciphertext<DCRTPoly> CiphertextImpl<DCRTPoly>::Clone() const {
-	Ciphertext<DCRTPoly> clone = std::make_shared<CiphertextImpl<DCRTPoly>>(*this);
+	// GPU-resident ciphertexts clone with the metadata-only CPU shadow (the BAKED-ON
+	// lazy-shadow discipline; CloneEmpty carries all scalar value-metadata — slots,
+	// level, noiseScaleDeg, scalingFactor — so only the ELEMENTS stay lazy). The old
+	// deep host copy made clone ~40x its device cost (788 us wrapper vs 18 us lazy;
+	// the delta was host DCRTPoly memcpy). A ciphertext that is NOT loaded lives on
+	// the CPU: the deep copy remains the only correct behavior there.
+	Ciphertext<DCRTPoly> clone = std::make_shared<CiphertextImpl<DCRTPoly>>(*this, /*lazy_cpu_shadow=*/this->loaded);
 	return clone;
 }
 
@@ -67,10 +74,12 @@ size_t CiphertextImpl<DCRTPoly>::GetLevel() const {
 		return ct->GetLevel();
 	}
 
-	// GPU path. Depth is reversed in FIDESlib, must do depth = maxDepth - depth
+	// GPU path. FIDESlib's level is the TOP LIMB INDEX; OpenFHE's ciphertext level counts
+	// PRIMES DROPPED (also under COMPOSITESCALING, where one CKKS level = d primes). The
+	// exact conversion at every composite degree is against the chain's top limb index
+	// cc.L, not multiplicative_depth (they coincide only on classic FLEXIBLEAUTO chains).
 	auto ct_gpu	  = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->parent_context->GetDeviceCiphertext(this->gpu));
-	auto maxDepth = this->parent_context->multiplicative_depth;
-	return maxDepth - ct_gpu->getLevel();
+	return static_cast<size_t>(ct_gpu->cc.L - ct_gpu->getLevel());
 }
 
 size_t CiphertextImpl<DCRTPoly>::GetNoiseScaleDeg() const {
@@ -135,10 +144,10 @@ void CiphertextImpl<DCRTPoly>::SetLevel(size_t level) {
 		return;
 	}
 
-	// GPU path.
+	// GPU path. level counts primes dropped (OpenFHE convention, composite-safe);
+	// target limb index = cc.L - level.
 	auto ct_gpu	  = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->parent_context->GetDeviceCiphertext(this->gpu));
-	auto maxDepth = this->parent_context->multiplicative_depth;
-	ct_gpu->dropToLevel(maxDepth - level);
+	ct_gpu->dropToLevel(static_cast<int>(ct_gpu->cc.L) - static_cast<int>(level));
 }
 
 // ---- Operators ----

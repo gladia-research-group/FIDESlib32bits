@@ -20,6 +20,10 @@ class RawParams;
 class Parameters {
    public:
     int logN, L, dnum, K = -1;
+    // COMPOSITESCALING: primes per CKKS level (1 = classic). MUST participate in
+    // operator< — contexts differing only in compositeDegree are different contexts;
+    // omitting it would silently serve a cached d=1 context from map_param_context.
+    int compositeDegree = 1;
     std::vector<PrimeRecord> primes;
     std::vector<PrimeRecord> Sprimes;
     std::vector<double> ModReduceFactor;
@@ -46,6 +50,12 @@ class Parameters {
         if (dnum < b.dnum) {
             return true;
         } else if (dnum > b.dnum) {
+            return false;
+        }
+
+        if (compositeDegree < b.compositeDegree) {
+            return true;
+        } else if (compositeDegree > b.compositeDegree) {
             return false;
         }
 

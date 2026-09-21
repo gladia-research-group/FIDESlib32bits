@@ -32,6 +32,12 @@ struct Constants {
     uint64_t type;
     uint64_t primes[MAXP];
     uint64_t prime_better_barret_mu[MAXP];
+    /* Lazy-reduction BConv: floor(2^64 / p). Neal_reduce_32 cannot reduce an
+     * ACCUMULATOR — its `rx = c >> (qbit-2)` truncates to uint32_t, bounding its input at
+     * ~2^56, i.e. exactly one 28x28 product. Deferring the reduction across a BConv dot
+     * needs a reducer valid on the whole u64 range, which is what this constant is for.
+     * See modreduce_lazy() in ModMult.cuh. 512 B added to the 64 KB bank. */
+    uint64_t prime_mu64[MAXP];
     uint32_t prime_bits[MAXP];
     uint8_t table[MAXP * MAXP * 8];
 
@@ -69,6 +75,14 @@ struct Constants {
         void* none;
     };
 };
+
+// The struct lives in CUDA __constant__ memory — a 64 KB bank. If it ever outgrows it
+// (e.g. someone raises MAXP), fail at compile time instead of at kernel-launch time.
+// NOTE for a future MAXP bump: `uint8_t table[MAXP*MAXP*8]` is DEAD (only read under
+// `if constexpr (USING_CONSTANTS_TABLE)` with the constant 0, never written) and is ~77 %
+// of the struct — delete it first. `type` is a single uint64_t (1 bit per prime id) and
+// must become an array past MAXP=64 (with ISU64/HISU64 and both setters updated).
+static_assert(sizeof(Constants) <= 65536, "Constants must fit the 64 KB __constant__ bank");
 
 constexpr int PARTITION(int id, int j) {
     return (offsetof(Constants, primeid_partition) - offsetof(Constants, primeid_partition)) / sizeof(int) + id * MAXP +
@@ -157,6 +171,19 @@ struct Global {
         uint64_t DecompAndModUp_pre_scale_shoup[MAXD * MAXP * MAXP];
         uint64_t DecompAndModUp_matrix[MAXP * MAXD * MAXP * MAXP];
         uint64_t DecompAndModUp_matrix_shoup[MAXP * MAXD * MAXP * MAXP];
+
+        // Width-typed (u32) shadow copies of the conversion matrices, filled ONLY on
+        // all-U32 chains (hC_.type == 0) and read ONLY by the C_.type == 0 fast paths in
+        // Conv.cu. On such chains every matrix entry is a residue < 2^28 and every *_shoup
+        // companion carries the 2^32-scaled convention, so the narrow copy is exact; the
+        // u64 originals stay authoritative for u64/mixed chains and debug dumps. Halves
+        // the constant stream pulled through L2 by the two hottest base-conversion
+        // kernels (DecompAndModUpConv / ModDown2). Cost: +~16 MB device per GPU
+        // (allocated for every chain; unfilled off the U32 path).
+        uint32_t ModDown_matrix32[MAXP * MAXP];
+        uint32_t ModDown_matrix_shoup32[MAXP * MAXP];
+        uint32_t DecompAndModUp_matrix32[MAXP * MAXD * MAXP * MAXP];
+        uint32_t DecompAndModUp_matrix_shoup32[MAXP * MAXD * MAXP * MAXP];
     };
 
     Globals* globals[MAXD];

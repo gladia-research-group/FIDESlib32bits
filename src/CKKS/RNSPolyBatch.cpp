@@ -149,6 +149,27 @@ void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<
         }
     }
 }
+void RNSPoly::binomialMultAccumBatch(RNSPoly& acc0, RNSPoly& acc1, RNSPoly& acc2,
+                                     const std::vector<const RNSPoly*>& a0, const std::vector<const RNSPoly*>& a1,
+                                     const std::vector<const RNSPoly*>& b0, const std::vector<const RNSPoly*>& b1) {
+    assert(!acc0.isModUp() && !acc1.isModUp());
+#pragma omp parallel for num_threads(acc0.cc.GPUid.size())
+    for (size_t i = 0; i < acc0.cc.GPUid.size(); ++i) {
+        assert(omp_get_num_threads() == (int)acc0.cc.GPUid.size());
+        std::vector<const LimbPartition*> pa0, pa1, pb0, pb1;
+        pa0.reserve(a0.size());
+        pa1.reserve(a1.size());
+        pb0.reserve(b0.size());
+        pb1.reserve(b1.size());
+        for (auto j : a0) pa0.push_back(&j->GPU[i]);
+        for (auto j : a1) pa1.push_back(&j->GPU[i]);
+        for (auto j : b0) pb0.push_back(&j->GPU[i]);
+        for (auto j : b1) pb1.push_back(&j->GPU[i]);
+        LimbPartition::binomialMultAccumBatch(acc0.GPU[i], acc1.GPU[i], acc2.GPU[i], pa0, pa1, pb0, pb1);
+    }
+    acc2.SetModUp(false);  // mirror serial binomialMult's moddown=true epilogue for the ks-aux input
+}
+
 void RNSPoly::fusedHoistedRotateBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                       const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
                                       const std::vector<int>& indexes, int stride, double usage, bool c0_modup) {

@@ -17,6 +17,11 @@ namespace FIDESlib::CKKS {
 
 extern bool MEMCPY_PEER;
 extern bool GRAPH_CAPTURE;
+/* FIDESLIB_KSK_REGEN level (0 off / 1 hoisted / 2 both `a`-readers, the default / 3 = 2 + stage-A smem arm).
+ * One definition: the key-loading path and the launch gates must agree, since at >=2 nothing reads the
+ * `a` rows and releasing them (adoptKskASeed) is only legal then. */
+int kskRegenLevel();
+
 class LimbPartition {
    public:
     ContextData& cc;
@@ -55,13 +60,57 @@ class LimbPartition {
     std::vector<VectorGPU<void*>> DIGITlimbptr;
     // std::vector<VectorGPU<void*>> DIGITauxptr;
     VectorGPU<void*> GATHERptr;
+    // Concatenation of all digits' DECOMPlimbptr entries (digit-major, slot-minor, i.e. entry
+    // (start_d + i) == DECOMPlimbptr[d][i]) so modup can run ONE wide INTT over all source limbs
+    // instead of dnum small per-digit launches. Subview of bufferAUXptrs; filled once in
+    // generateAllDecompAndDigit alongside DECOMPlimbptr.
+    VectorGPU<void*> DECOMPALLptr;
 
     uint64_t* bufferDECOMPandDIGIT = nullptr;
     uint64_t* bufferSPECIAL = nullptr;
     uint64_t* bufferLIMB = nullptr;
     uint64_t* bufferGATHER = nullptr;
+
+    /** Byte count and allocation ROUTE for the buffers handed back to GPUfree. GPUfree derives the
+     *  free-list bucket from `bytes` (bytes=0 files the block in the 1 KB bucket, stranding it), so it
+     *  must get the count GPUmalloc was given; a cudaMalloc'ed buffer must not go to cudaFreeAsync. */
+    size_t bufferSPECIALbytes = 0;
+    bool bufferSPECIALcudaMalloc = false;
+    size_t bufferLIMBbytes = 0;
     void* bufferDECOMPandDIGIT_handle = nullptr;
     void* bufferGATHER_handle = nullptr;
+
+    /** Persistent per-purpose device scratch for the short-lived pointer tables and operand vectors the
+     *  ops below upload each call: one slot per purpose (never shared), grow-only, plain cudaMalloc/cudaFree.
+     *  Reuse across calls is serialised by this partition's stream `s`, like the malloc/free pair it replaced. */
+    enum ScratchSlot {
+        SC_BATCH_ADD,
+        SC_BATCH_MULTPT,
+        SC_BATCH_ADDSCALAR,
+        SC_BATCH_MULTSCALAR,
+        SC_BATCH_BINOMIAL,
+        SC_BATCH_LTDOT,
+        SC_BATCH_HOISTROT,
+        SC_MGPU_DOTKSK,
+        SC_MGPU_HOISTROT,
+        SC_MGPU_MODDOWN,
+        SC_SCALAR_MULT,
+        SC_SCALAR_ADD,
+        SC_SCALAR_SUB,
+        SC_LINWSUM_W,
+        SC_LINWSUM_PS,
+        SC_N
+    };
+    struct DevScratch {
+        void* p = nullptr;
+        size_t bytes = 0;
+    };
+    DevScratch scratch_[SC_N];
+    /** Persistent scratch for `slot`, at least `bytes` big. Returns nullptr when bytes == 0 or the
+     *  allocation fails; the caller must then fall back to its per-call allocation. */
+    void* scratchGet(int slot, size_t bytes);
+    void scratchFreeAll();
+
 
     /*
     LimbPartition(LimbPartition && lp) :
@@ -118,8 +167,15 @@ class LimbPartition {
     void moddown(LimbPartition& auxLimbs, bool ntt, bool free_special_limbs);
 
     void rescale();
+    /** Fused composite DOUBLE prime drop (bit-identical to two rescale() calls,
+     * ~half the kernel work). Returns false if the shape doesn't fit — caller must then fall
+     * back to the sequential per-prime loop. See the definition for the eligibility rules. */
+    bool rescale2();
 
     void freeSpecialLimbs();
+    /** Release bufferSPECIAL with the byte count and the allocation route it was created with.
+     *  Split out because the destructor needs the identical logic. */
+    void freeSpecialBuffer();
 
     using OptReference = LimbPartition*;
     using OptConstReference = const LimbPartition*;
@@ -175,6 +231,30 @@ class LimbPartition {
     // q_band (chain position), digits unused at ct level <= q_band skipped.
     // -1 = full key. Guarded in dotKSK.
     int key_q_band = -1;
+    // KSK bit-packing: when >0, this partition holds KEY material whose
+    // limbptr/DIGITlimbptr device tables point at key_pack_bits-bit packed streams carved
+    // from bufferKSKPACK; the dense DECOMP/DIGIT Limb storage is freed (DECOMPlimb/DIGITlimb
+    // cleared). Only the fusedDotKSK_2_/hoistedRotateDotKSK_2_ KSK_PACKED=true arms may read
+    // these tables. All-u32 (type==0) single-GPU chains only.
+    int key_pack_bits = 0;
+    uint64_t* bufferKSKPACK = nullptr;
+    size_t bufferKSKPACKbytes = 0;
+    void packKeyLimbs(int bits);
+    // In-kernel regen: the 256-bit seed this KEY partition's `a` rows were expanded from
+    // (recorded by expandKskADigits). When set — and FIDESLIB_KSK_REGEN >= 1 — the dot kernels'
+    // REGEN arms regenerate kska(digit, p, slot) in registers from this seed (KskSeedExpand.cuh,
+    // bit-identical to the expanded rows) instead of streaming the `a` half of the key from DRAM.
+    uint32_t ksk_seed[8] = {};
+    bool ksk_seed_set = false;
+    // At FIDESLIB_KSK_REGEN>=2 EVERY reader of this chain's `a` rows regenerates them, so the rows
+    // are never materialized — adoptKskASeed() records the seed and releases the storage instead.
+    // The device pointer tables survive holding nullptr; anything that would READ them must throw first.
+    bool ksk_a_released = false;
+    void adoptKskASeed(const std::vector<uint32_t>& seed, int q_band = -1);
+    // Load-time expansion: fill this KEY partition's `a` DECOMP/DIGIT limbs on-GPU from the
+    // 256-bit seed instead of H2D-copying them (bit-identical; builds the same limbptr mapping
+    // loadDecompDigit would).
+    void expandKskADigits(const std::vector<uint32_t>& seed);
 
     void mult1AddMult23Add4(const LimbPartition& partition1, const LimbPartition& partition2,
                             const LimbPartition& partition3, const LimbPartition& partition4);
@@ -195,7 +275,7 @@ class LimbPartition {
     void multModupDotKSK(LimbPartition& c1, const LimbPartition& c1tilde, LimbPartition& c0,
                          const LimbPartition& c0tilde, const LimbPartition& ksk_a, const LimbPartition& ksk_b);
 
-    int getLimbSize(int level);
+    int getLimbSize(int level) const;
     void automorph(const int index, const int br, LimbPartition* src, bool ext);
 
     void modupInto(LimbPartition& partition, LimbPartition& partition1);
@@ -208,6 +288,13 @@ class LimbPartition {
     void dropLimb();
     void addMult(const LimbPartition& partition, const LimbPartition& partition1);
     void broadcastLimb0();
+    /** COMPOSITESCALING ModRaise: CRT-extend the bottom d limbs across ALL current limbs
+     *  (call after grow()). qhatinv[k] = (Q0/q_k)^{-1} mod q_k; qhat is the flattened
+     *  (Q0/q_k) mod q_i table with stride = current limb count. Single-GPU only. */
+    void compositeModRaise(int d, const std::vector<uint64_t>& qhatinv, const std::vector<uint64_t>& qhat);
+    // Centred-aggregate CRT lift for coeff plaintexts (d==2); see coeffLiftCentered2_.
+    void coeffLiftCentered(uint64_t q0, uint64_t q1, uint64_t q0inv_mod_q1, uint64_t Qhalf,
+                           const std::vector<uint64_t>& Q0_mod_qi);
     void evalLinearWSum(uint32_t n, std::vector<const LimbPartition*> ps, std::vector<uint64_t>& weights);
     void rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, const LimbPartition& ksk_a,
                            const LimbPartition& ksk_b);
@@ -263,6 +350,14 @@ class LimbPartition {
     static void LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
                                     const std::vector<LimbPartition*>& pt, int bStep, int gStep, int stride,
                                     double usage, bool ext);
+
+    // acc0 += Σ a0[j]·b0[j]; acc1 += Σ a0[j]·b1[j]+a1[j]·b0[j]; acc2 = Σ a1[j]·b1[j].
+    // One binomialMultAccum_ launch per partition (FHE_LANE_BATCH phase 2).
+    static void binomialMultAccumBatch(LimbPartition& acc0, LimbPartition& acc1, LimbPartition& acc2,
+                                       const std::vector<const LimbPartition*>& a0,
+                                       const std::vector<const LimbPartition*>& a1,
+                                       const std::vector<const LimbPartition*>& b0,
+                                       const std::vector<const LimbPartition*>& b1);
 
     static void fusedHoistedRotateBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
                                         const std::vector<LimbPartition*>& ksk_a,

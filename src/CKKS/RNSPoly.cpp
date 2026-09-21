@@ -2,6 +2,8 @@
 // Created by carlosad on 25/04/24.
 //
 #include <errno.h>
+#include <cstdio>
+#include <cstdlib>
 
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -82,6 +84,17 @@ RNSPoly::RNSPoly(RNSPoly&& src) noexcept
         g.level = &(this->level);
     }
     //src.setLevel(-2);
+}
+
+void RNSPoly::swap(RNSPoly& other) noexcept {
+    assert(&cc == &other.cc);
+    std::swap(level, other.level);
+    std::swap(modUp, other.modUp);
+    GPU.swap(other.GPU);
+    for (auto& g : GPU)
+        g.level = &this->level;
+    for (auto& g : other.GPU)
+        g.level = &other.level;
 }
 
 int RNSPoly::getLevel() const {
@@ -178,6 +191,15 @@ void RNSPoly::binomialMult(RNSPoly& c1, RNSPoly& in, const RNSPoly& d0, const RN
 }
 
 void RNSPoly::add(const RNSPoly& p) {
+#if FIDESLIB_COPY_CENSUS
+    {
+        void* bt[4];
+        const int n = backtrace(bt, 4);
+        void* site = (n > 2) ? bt[2] : (n > 1 ? bt[1] : nullptr);
+        std::lock_guard<std::mutex> g(g_copy_mu);
+        g_add_sites[site]++;
+    }
+#endif
 
     if (p.isModUp() && !this->isModUp()) {
         //std::cout << "Adapt non modup destination add" << std::endl;
@@ -253,6 +275,22 @@ void RNSPoly::sync() {
 
 void RNSPoly::rescale() {
     //    assert(GPU.size() == 1 && "Rescale Multi-GPU not implemented.");
+    // d=2 single-GPU fast path — ONE fused double-drop pass (bit-identical to the
+    // two-pass loop below; LimbPartition::rescale2 falls back by returning false when the
+    // shape doesn't fit, e.g. constant/aux-less limbs or <3 limbs).
+    if (cc.compositeDegree() == 2 && GPU.size() == 1) {
+        if (GPU[0].rescale2()) {
+            level -= 2;
+            return;
+        }
+    }
+    // COMPOSITESCALING: one CKKS level = cc.compositeDegree() primes, and OpenFHE's
+    // composite ModReduce is literally a d-fold loop of the single-prime drop
+    // (ckksrns-leveledshe.cpp, DropLastElementAndScale per dropped prime) — so the GPU
+    // composite rescale is the same d-fold loop of the existing kernel. The level MUST be
+    // decremented between iterations: LimbPartition::rescale() finds the top limb through
+    // *level, so two calls at the same level would drop (divide by) the same prime twice.
+    for (int r_ = 0; r_ < cc.compositeDegree(); ++r_) {
     if (GPU.size() == 1) {
         for (auto& i : GPU) {
             i.rescale();
@@ -283,10 +321,25 @@ void RNSPoly::rescale() {
         }
         level -= 1;
     }
+    }  // composite loop
 }
 
 void RNSPoly::rescaleDouble(RNSPoly& poly) {
     //    assert(GPU.size() == 1 && "Rescale Multi-GPU not implemented.");
+    // d=2 single-GPU fast path — one fused double-drop pass per component (each on
+    // its own partition stream, so c0/c1 overlap). Both components have identical shape, so
+    // eligibility cannot diverge; enforce that loudly rather than continue inconsistent.
+    if (cc.compositeDegree() == 2 && GPU.size() == 1) {
+        if (GPU[0].rescale2()) {
+            if (!poly.GPU[0].rescale2())
+                throw std::runtime_error("rescaleDouble: c0 took the fused double-drop but c1 did not");
+            level -= 2;
+            poly.level -= 2;
+            return;
+        }
+    }
+    // COMPOSITESCALING: d-fold loop, levels decremented between iterations (see rescale()).
+    for (int r_ = 0; r_ < cc.compositeDegree(); ++r_) {
     if (0 && GPU.size() == 1) {
         for (auto& i : GPU) {
             i.rescale();
@@ -342,6 +395,7 @@ void RNSPoly::rescaleDouble(RNSPoly& poly) {
             poly.level -= 1;
         }
     }
+    }  // composite loop
 }
 
 void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
@@ -357,6 +411,22 @@ void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
                 assert(omp_get_num_threads() == (int)GPU.size());
                 GPU.at(i).multElement(p.GPU.at(i));
                 GPU.at(i).rescaleMGPU();
+            }
+            --level;
+        }
+        // COMPOSITESCALING: the fused multPt/rescaleMGPU dropped ONE prime; a composite
+        // level is cc.compositeDegree() primes, so finish the remaining d-1 drops with
+        // plain rescale iterations (level decremented between drops, see rescale()).
+        for (int r_ = 1; r_ < cc.compositeDegree(); ++r_) {
+            if (GPU.size() == 1) {
+                for (auto& i : GPU)
+                    i.rescale();
+            } else {
+#pragma omp parallel for num_threads(GPU.size())
+                for (size_t i = 0; i < GPU.size(); ++i) {
+                    assert(omp_get_num_threads() == (int)GPU.size());
+                    GPU.at(i).rescaleMGPU();
+                }
             }
             --level;
         }
@@ -691,6 +761,15 @@ void RNSPoly::multScalar(std::vector<uint64_t>& vector1) {
     }
 }
 void RNSPoly::add(const RNSPoly& a, const RNSPoly& b) {
+#if FIDESLIB_COPY_CENSUS
+    {
+        void* bt[4];
+        const int n = backtrace(bt, 4);
+        void* site = (n > 2) ? bt[2] : (n > 1 ? bt[1] : nullptr);
+        std::lock_guard<std::mutex> g(g_copy_mu);
+        g_add_sites[site]++;
+    }
+#endif
     assert(level <= a.level);
     assert(level <= b.level);
 #pragma omp parallel for num_threads(cc.GPUid.size())
@@ -729,7 +808,82 @@ void RNSPoly::subScalar(std::vector<uint64_t>& vector1) {
         GPU[i].subScalar(vector1);
     }
 }
+// DIAGNOSTIC CENSUS (FIDESLIB_COPY_CENSUS=1, default 0): attribute every RNSPoly::copy to its
+// CALL SITE, to see what an in-place/move refactor could remove. Results are correct; this only counts.
+// Return addresses are resolved offline with addr2line against the same binary.
+#ifndef FIDESLIB_COPY_CENSUS
+#define FIDESLIB_COPY_CENSUS 0
+#endif
+#if FIDESLIB_COPY_CENSUS
+#include <execinfo.h>
+#include <dlfcn.h>
+#include <cxxabi.h>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <utility>
+namespace {
+std::mutex g_copy_mu;
+std::map<void*, long> g_copy_sites;
+std::map<void*, long> g_add_sites;
+struct CopyCensusDump {
+    ~CopyCensusDump() {
+        std::lock_guard<std::mutex> g(g_copy_mu);
+        long tot = 0;
+        for (auto& kv : g_copy_sites) tot += kv.second;
+        std::fprintf(stderr, "[copycensus] total RNSPoly::copy = %ld across %zu sites\n", tot,
+                     g_copy_sites.size());
+        long atot = 0;
+        for (auto& kv : g_add_sites) atot += kv.second;
+        std::fprintf(stderr, "[addcensus] total RNSPoly::add = %ld across %zu sites\n", atot,
+                     g_add_sites.size());
+        {
+            std::vector<std::pair<void*, long>> av(g_add_sites.begin(), g_add_sites.end());
+            std::sort(av.begin(), av.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            for (auto& kv : av) {
+                Dl_info info{};
+                size_t off = 0;
+                if (dladdr(kv.first, &info) && info.dli_fbase)
+                    off = (size_t)((char*)kv.first - (char*)info.dli_fbase);
+                std::fprintf(stderr, "[addcensus] %6ld  +0x%zx\n", kv.second, off);
+            }
+        }
+        std::vector<std::pair<void*, long>> v(g_copy_sites.begin(), g_copy_sites.end());
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+        for (auto& kv : v) {
+            Dl_info info{};
+            const char* nm = "?";
+            char* dem = nullptr;
+            size_t off = 0;
+            if (dladdr(kv.first, &info) && info.dli_sname) {
+                int st = 0;
+                dem = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &st);
+                nm = st == 0 && dem ? dem : info.dli_sname;
+            }
+            if (info.dli_fbase)
+                off = (size_t)((char*)kv.first - (char*)info.dli_fbase);
+            std::fprintf(stderr, "[copycensus] %6ld  +0x%zx  %s\n", kv.second, off, nm);
+            std::free(dem);
+        }
+    }
+} g_copy_dump;
+}  // namespace
+#endif
+
 void RNSPoly::copy(const RNSPoly& poly) {
+#if FIDESLIB_COPY_CENSUS
+    {
+        // frame 2 skips RNSPoly::copy and Ciphertext::copy, landing on the real caller
+        void* bt[4];
+        const int n = backtrace(bt, 4);
+        void* site = (n > 2) ? bt[2] : (n > 1 ? bt[1] : nullptr);
+        std::lock_guard<std::mutex> g(g_copy_mu);
+        g_copy_sites[site]++;
+    }
+#endif
     //std::cout << "Copy level: " << poly.level << std::endl;
     this->dropToLevel(poly.level);
     this->grow(poly.level);
@@ -928,15 +1082,25 @@ void RNSPoly::loadConstantStaged(const uint8_t* arena_base, const std::vector<si
     for (int i = 0; i < limbsize; ++i) {
         assert(moduli[i] == cc.prime.at(i).p);
         cudaSetDevice(GPU[cc.limbGPUid[i].x].device);
-        SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y],
-               load_async_ptr(arena_base + byte_off[i], byte_len[i], stream));
+        // Arena entries are NATIVE-width when the modulus fits 32 bits (stage_into
+        // narrows on u32 chains — entry length 4N) and u64 otherwise (8N). The 4N form
+        // matches the limb word exactly, so the raw async copy suffices; the 8N form
+        // narrows on device. Discriminate by length: coefficients per limb == cc.N.
+        if (byte_len[i] == (size_t)cc.N * sizeof(uint32_t)) {
+            SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y],
+                   load_async_ptr(arena_base + byte_off[i], byte_len[i], stream));
+        } else {
+            SWITCH(GPU[cc.limbGPUid[i].x].limb[cc.limbGPUid[i].y],
+                   load_async_ptr_u64src(arena_base + byte_off[i],
+                                         byte_len[i] / sizeof(uint64_t), stream));
+        }
     }
 }
 
 void RNSPoly::storeStaged(uint8_t* base, size_t& cursor, std::vector<size_t>& off,
-                          std::vector<size_t>& len, cudaStream_t stream) {
+                          std::vector<size_t>& len, cudaStream_t stream, int max_limbs) {
     assert(cc.GPUid.size() == 1);
-    const int n = level + 1;
+    const int n = (max_limbs > 0) ? std::min(max_limbs, level + 1) : (level + 1);
     off.resize(n);
     len.resize(n);
     for (int i = 0; i < n; ++i) {
@@ -980,17 +1144,29 @@ void RNSPoly::loadStaged(const uint8_t* base, const std::vector<size_t>& off,
     }
 }
 
-void RNSPoly::loadCoeffExpand(const uint8_t* src, size_t len, int target_limbs, cudaStream_t stream) {
-    // See RNSPoly.cuh. Mirrors ModRaise's raise mechanic (INTT → grow → broadcastLimb0 → NTT),
-    // sourcing limb 0 from the pinned arena instead of an existing ciphertext limb.
+void RNSPoly::loadCoeffExpand(const uint8_t* arena, const std::vector<size_t>& off,
+                              const std::vector<size_t>& len, int src_limbs, int target_limbs,
+                              cudaStream_t stream, int prescale_log2) {
+    // See RNSPoly.cuh. Mirrors ModRaise's raise mechanic (INTT → grow → raise → NTT), sourcing
+    // the first `src_limbs` limbs from the pinned arena instead of an existing ciphertext.
+    //
+    // src_limbs == 1  : centred SwitchModulus from q0 (the classic d=1 path, unchanged).
+    // src_limbs == d  : Garner CRT via compositeModRaise — the ONLY usable form on a composite
+    //                   chain, because one 28-bit prime cannot represent a 2^54-scaled
+    //                   coefficient.
     assert(cc.GPUid.size() == 1);
     assert(level == -1 && "loadCoeffExpand expects a freshly constructed poly");
     assert(target_limbs >= 1 && target_limbs - 1 <= cc.L);
-    assert(len == sizeof(uint64_t) * static_cast<size_t>(cc.N));
+    assert(src_limbs >= 1 && src_limbs <= target_limbs);
+    assert(src_limbs == 1 || src_limbs == cc.compositeDegree());
+    assert((int)off.size() >= src_limbs && (int)len.size() >= src_limbs);
 
-    grow(0, false, /*constant=*/false);   // limb 0 (q0) WITH aux — NTT/INTT need the scratch
-    cudaSetDevice(GPU[cc.limbGPUid[0].x].device);
-    SWITCH(GPU[cc.limbGPUid[0].x].limb[cc.limbGPUid[0].y], load_async_ptr(src, len, stream));
+    grow(src_limbs - 1, false, /*constant=*/false);   // limbs 0..src_limbs-1 WITH aux
+    for (int k = 0; k < src_limbs; ++k) {
+        cudaSetDevice(GPU[cc.limbGPUid[k].x].device);
+        SWITCH(GPU[cc.limbGPUid[k].x].limb[cc.limbGPUid[k].y],
+               load_async_ptr_u64src(arena + off[k], len[k] / sizeof(uint64_t), stream));
+    }
 
     // The limb kernels below run on the partition stream — bridge the upload once.
     cudaStream_t ps = GPU.at(0).s.ptr();
@@ -1002,10 +1178,27 @@ void RNSPoly::loadCoeffExpand(const uint8_t* src, size_t len, int target_limbs, 
         cudaEventDestroy(ev);   // deferred by the driver until the wait completes
     }
 
-    INTT(cc.batch, true);                             // EVAL@q0 → coefficient form
-    if (target_limbs > 1) {
+    INTT(cc.batch, true);                             // EVAL@sources → coefficient form
+    if (target_limbs > src_limbs) {
         grow(target_limbs - 1, false, /*constant=*/false);
-        broadcastLimb0();                             // centered SwitchModulus q0 → q_i
+        if (src_limbs == 1)
+            broadcastLimb0();                         // centered SwitchModulus q0 → q_i
+        else
+            coeffLiftCentered();                      // Garner + AGGREGATE centring vs Q0/2
+    }
+    if (prescale_log2 > 0) {
+        // Un-prescale (MarkCoeffStaged): the host encode divided the values by 2^k so the
+        // centered lift bound held; multiply every limb back by (2^k mod q_i). Exact on the
+        // integers the lift reconstructed (m·2^k < q-product trivially), domain-agnostic
+        // (a scalar multiply commutes with NTT) — done here in coefficient form.
+        std::vector<uint64_t> sc(target_limbs);
+        for (int i = 0; i < target_limbs; ++i) {
+            const uint64_t qi = cc.prime[i].p;
+            uint64_t v = 1 % qi;
+            for (int b = 0; b < prescale_log2; ++b) v = (v * 2) % qi;
+            sc[i] = v;
+        }
+        multScalar(sc);
     }
     NTT(cc.batch, true);                              // all limbs back to EVAL
 }
@@ -1022,6 +1215,74 @@ void RNSPoly::broadcastLimb0() {
             GPU.at(i).broadcastLimb0_mgpu();
         }
     }
+}
+
+// host mulmod for the composite CRT constants (primes < 2^60, product fits __int128)
+static uint64_t host_mulmod(uint64_t a, uint64_t b, uint64_t m) {
+    return (uint64_t)(((__uint128_t)a * b) % m);
+}
+static uint64_t host_powmod(uint64_t base, uint64_t exp, uint64_t m) {
+    uint64_t r = 1;
+    base %= m;
+    while (exp) {
+        if (exp & 1)
+            r = host_mulmod(r, base, m);
+        base = host_mulmod(base, base, m);
+        exp >>= 1;
+    }
+    return r;
+}
+
+void RNSPoly::compositeModRaise() {
+    const int d = cc.compositeDegree();
+    assert(d > 1);
+    assert(cc.GPUid.size() == 1 && "composite ModRaise is single-GPU only");
+
+    const int limbsize = level + 1;
+    // qhatinv[k] = (Q0/q_k)^{-1} mod q_k, via Fermat (q_k prime);
+    // qhat[k*limbsize + i] = (Q0/q_k) mod q_i.
+    std::vector<uint64_t> qhatinv(d), qhat((size_t)d * limbsize);
+    for (int k = 0; k < d; ++k) {
+        const uint64_t qk = cc.prime[k].p;
+        uint64_t qhat_mod_qk = 1;
+        for (int j = 0; j < d; ++j)
+            if (j != k)
+                qhat_mod_qk = host_mulmod(qhat_mod_qk, cc.prime[j].p % qk, qk);
+        qhatinv[k] = host_powmod(qhat_mod_qk, qk - 2, qk);
+        for (int i = 0; i < limbsize; ++i) {
+            const uint64_t qi = cc.prime[i].p;
+            uint64_t v = 1;
+            for (int j = 0; j < d; ++j)
+                if (j != k)
+                    v = host_mulmod(v, cc.prime[j].p % qi, qi);
+            qhat[(size_t)k * limbsize + i] = v;
+        }
+    }
+
+    for (size_t i = 0; i < cc.GPUid.size(); ++i) {
+        GPU.at(i).compositeModRaise(d, qhatinv, qhat);
+    }
+}
+void RNSPoly::coeffLiftCentered() {
+    const int d = cc.compositeDegree();
+    if (d != 2)
+        throw std::runtime_error("coeffLiftCentered: only composite degree 2 is implemented "
+                                 "(d=" + std::to_string(d) + "); a wider lift needs a "
+                                 "multi-word aggregate, not a u64 one");
+    assert(cc.GPUid.size() == 1 && "centred coeff lift is single-GPU only");
+
+    const int limbsize = level + 1;
+    const uint64_t q0 = cc.prime[0].p, q1 = cc.prime[1].p;
+    // q0^{-1} mod q1 by Fermat (q1 prime); Q0 = q0*q1 fits u64 for NATIVEINT<=32 primes.
+    const uint64_t q0inv = host_powmod(q0 % q1, q1 - 2, q1);
+    const __uint128_t Q0 = (__uint128_t)q0 * q1;
+    const uint64_t Qhalf = (uint64_t)(Q0 >> 1);
+    std::vector<uint64_t> Q0_mod_qi(limbsize);
+    for (int i = 0; i < limbsize; ++i)
+        Q0_mod_qi[i] = (uint64_t)(Q0 % (__uint128_t)cc.prime[i].p);
+
+    for (size_t i = 0; i < cc.GPUid.size(); ++i)
+        GPU.at(i).coeffLiftCentered(q0, q1, q0inv, Qhalf, Q0_mod_qi);
 }
 void RNSPoly::evalLinearWSum(uint32_t n, std::vector<const RNSPoly*>& vec, std::vector<uint64_t>& elem) {
 #pragma omp parallel for num_threads(cc.GPUid.size())

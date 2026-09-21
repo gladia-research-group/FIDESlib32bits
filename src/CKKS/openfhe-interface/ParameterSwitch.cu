@@ -38,9 +38,34 @@ lbcrypto::CryptoContext<lbcrypto::DCRTPoly> createSwitchableContextBasedOnContex
     //int scale = param.GetScalingFactorIntBig(0).GetMSB();
     //double factor = std::log2(param.GetScalingFactorRealBig(0));
     //double rounded = std::round(param.GetScalingFactorReal(factor));
-    int scale = init_elem_param->GetParams().at(1)->GetModulus().GetMSB();
+    // The helper's scale mirrors the source chain's FIRST SCALE PRIME. Three composite traps:
+    // (1) read the composite degree from init_param, NOT from the local `param` copy —
+    //     CryptoParametersCKKSRNS's copy path DROPS the composite fields (measured: source
+    //     degree 2, copy degree 1; NumPartQ is dropped the same way);
+    // (2) under composite the first `compositeDegree` primes are the (split) first modulus,
+    //     so the first scale prime lives at index compositeDegree (== 1 on classic chains);
+    // (3) composite prime pairs straddle 2^(scale/d) to average the target scale, so any
+    //     individual prime's MSB can equal MAX_MODULUS_SIZE, which the FLEXIBLEAUTO
+    //     validation rejects (needs < MAX). This is a keygen-only depth-`limbs-1` context,
+    //     so the exact scale is not load-bearing: clamp into the legal range.
+    const int srcCompositeDegree = (int)init_param->GetCompositeDegree();
+    int scale = init_elem_param->GetParams().at(srcCompositeDegree)->GetModulus().GetMSB();
+    if (srcCompositeDegree > 1 && scale >= (int)MAX_MODULUS_SIZE)
+        scale = (int)MAX_MODULUS_SIZE - 1;
     parameters.SetScalingModSize(scale);
-    parameters.SetScalingTechnique(param.GetScalingTechnique());
+    // COMPOSITESCALING source chains: this helper context is the sparse-encapsulation
+    // switching-key context — depth `limbs-1` (usually 0), SINGLE-prime by construction
+    // (its scale is one prime's MSB). Inheriting COMPOSITESCALING* here would need a
+    // composite degree + register word size it has no business having (and CCParams
+    // defaults to degree 1 / regWord = NATIVEINT, which OpenFHE rejects at NATIVEINT=32:
+    // "composite degree == 1 with register size < 64"). Build it FLEXIBLEAUTO instead —
+    // for a keygen-only context the scaling technique does not affect the keys.
+    {
+        auto st = init_param->GetScalingTechnique();  // from the ORIGINAL (see above)
+        if (st == lbcrypto::COMPOSITESCALINGAUTO || st == lbcrypto::COMPOSITESCALINGMANUAL)
+            st = lbcrypto::FLEXIBLEAUTO;
+        parameters.SetScalingTechnique(st);
+    }
     parameters.SetSecretKeyDist(hamming_weight == cc->GetRingDimension() / 2 ? lbcrypto::UNIFORM_TERNARY
                                                                              : lbcrypto::SPARSE_TERNARY);
     parameters.SetSecurityLevel(param.GetStdLevel());
@@ -72,7 +97,20 @@ createContextSwitchingKeys(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cca,
         std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cca->GetCryptoParameters())->GetScalingTechnique();
 
     std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> atob;
-    if (scaling != lbcrypto::FLEXIBLEAUTOEXT) {
+    const int srcCompositeDegree = (int)std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(
+                                       cca->GetCryptoParameters())
+                                       ->GetCompositeDegree();
+    if (srcCompositeDegree > 1) {
+        // COMPOSITESCALING: the M-4 (dense->sparse) key is a STANDARD hybrid key in the MAIN
+        // context — the single-tower helper context cannot represent the d-limb composite
+        // bottom (same convention as the openfhe-1.4.2-native32-bootstrap.patch CPU fix).
+        // skNew's element was sampled on cca's params above; rewrap it as a cca key.
+        auto skNewMain = std::make_shared<lbcrypto::PrivateKeyImpl<lbcrypto::DCRTPoly>>(cca);
+        skNewMain->SetPrivateElement(skNew->GetPrivateElement());
+        skNewMain->SetKeyTag(a->GetKeyTag());
+        atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
+            cca->GetScheme()->KeySwitchGen(a, skNewMain));
+    } else if (scaling != lbcrypto::FLEXIBLEAUTOEXT) {
         atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
             ccb->GetScheme()->KeySwitchGen(a, skNew));
     } else {

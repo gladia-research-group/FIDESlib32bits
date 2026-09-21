@@ -62,6 +62,68 @@ void DotProductPtInternal(std::vector<std::shared_ptr<Ciphertext>>& result, cons
         }
     }
 }
+
+// outs[i] = ct * pts[i] in one fused kernel pass. See LinearTransform.cuh.
+void MultPtBatch(std::vector<std::shared_ptr<Ciphertext>>& results, Ciphertext& ct,
+                 const std::vector<Plaintext*>& pts) {
+    CudaNvtxRange r(std::string{sc::current().function_name()});
+    assert(results.size() == pts.size());
+
+    // Serial EvalMult(ct,pt) never mutates the input: a NoiseLevel-2 input is rescaled on
+    // the result COPY, once per lane. Mirror that with ONE rescaled copy shared by every
+    // lane (numerically identical, input untouched). The wrapper guarantees the pts were
+    // encoded at the post-rescale level (encode_at_cached's pending_rescale_primes).
+    Ciphertext scratch(ct.cc_);
+    Ciphertext* src = &ct;
+    if (ct.NoiseLevel == 2) {
+        scratch.copy(ct);
+        scratch.rescale();
+        src = &scratch;
+    }
+    Ciphertext& in_ct = *src;
+
+    for (auto* p : pts) {
+        assert(p != nullptr);
+        assert(p->c0.getLevel() == in_ct.getLevel());
+        assert(p->NoiseLevel == 1);
+    }
+
+    // Results were copied from the ORIGINAL ct; on the rescale path they carry one extra
+    // composite level of limbs the kernel must not index — drop them to the source level.
+    if (src != &ct)
+        for (auto& i : results)
+            i->dropToLevel(in_ct.getLevel());
+
+    // The batch kernel launches on the input's c0 partition stream and only waits
+    // results[0]/pts[0] internally — gather every result's streams AND the input's c1
+    // streams into results[0] first (LinearTransform's pre-sync pattern, plus the c1 leg
+    // the serial per-partition path never needed), and fan back out afterwards.
+    for (auto& i : results) {
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+            results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+        }
+    }
+    for (size_t j = 0; j < in_ct.c1.GPU.size(); ++j)
+        results[0]->c0.GPU[j].s.wait(in_ct.c1.GPU[j].s);
+
+    std::vector<Ciphertext*> in(pts.size(), &in_ct);
+    DotProductPtInternal<Ciphertext*, Plaintext*>(results, in, pts, /*red_n=*/1,
+                                                  /*pt_reuse_stride=*/1, /*pt_different_stride=*/1,
+                                                  /*ext=*/false);
+
+    for (auto& i : results) {
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            i->c0.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+            i->c1.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+        }
+    }
+    // The kernel READ in_ct's c1 limbs on the c0 partition stream; make c1's stream carry
+    // that dependency so a scratch input's stream-ordered free (or any later writer)
+    // cannot overtake the read.
+    for (size_t j = 0; j < in_ct.c1.GPU.size(); ++j)
+        in_ct.c1.GPU[j].s.wait(in_ct.c0.GPU[j].s);
+}
 }  // namespace FIDESlib::CKKS
 
 void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, const std::vector<Plaintext*>& pts,
@@ -195,7 +257,7 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                 }
 
                 //results[0]->modDown(false);
-                ctxt.copy(*results[0]);
+                ctxt.takeFrom(*results[0]);  // results[0] dies at scope end — swap, don't copy
             } else {
 
                 assert(rowSize == pts.size());
@@ -435,7 +497,7 @@ void FIDESlib::CKKS::ConvolutionTransform(Ciphertext& ctxt, int rowSize, int bSt
 			if (blockResults[0]->c1.isModUp())
 				blockResults[0]->modDown(false);
 
-			ctxt.copy(*blockResults[0]);
+			ctxt.takeFrom(*blockResults[0]);  // blockResults dies at scope end
 		}
 	}
 }
@@ -646,7 +708,7 @@ void FIDESlib::CKKS::SpecialConvolutionTransform(Ciphertext& ctxt,
 			if (blockResults[0]->c1.isModUp())
 				blockResults[0]->modDown(false);
 
-			ctxt.copy(*blockResults[0]);
+			ctxt.takeFrom(*blockResults[0]);  // blockResults dies at scope end
 			ctxt.rescale();
 		}
 	}
@@ -965,7 +1027,7 @@ void FIDESlib::CKKS::LinearTransformSpecial(FIDESlib::CKKS::Ciphertext& ctxt1, F
         }
     }
 
-    ctxt1.copy(result);
+    ctxt1.takeFrom(result);  // result is a dying local
     CudaCheckErrorModNoSync;
 }
 

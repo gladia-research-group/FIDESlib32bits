@@ -2,6 +2,7 @@
 // Created by carlosad on 2/05/24.
 //
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
@@ -358,39 +359,37 @@ std::vector<std::vector<int>> ContextData::generateGPUdigits(const int dnum, con
     return res;
 }
 
-/* S7 thread-safety, ported to the paper pin (upstream e3a8f63): the workspace
- * lazy-init raced make_unique from two host threads -> heap corruption (the
- * threaded-prefill segfault class). Construction is mutex-guarded with a
- * double-checked null; the hot path pays only the null check. Upstream's
- * pool/TLS slot machinery (built for its two-ct experiments) is NOT ported —
- * structures stay exactly the pin's. */
+/* Concurrent host threads through one context: workspace lazy-init is mutex-guarded (an unguarded
+ * make_unique from two threads corrupts the heap); the hot path only pays a null check. */
 static std::mutex ks_aux_init_mtx;
 
 RNSPoly& ContextData::getKeySwitchAux() {
-    if (key_switch_aux == nullptr) {
+    auto& p = key_switch_aux;
+    if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
-        if (key_switch_aux == nullptr)
-            key_switch_aux = std::make_unique<RNSPoly>(*this, L, false);
+        if (p == nullptr)
+            p = std::make_unique<RNSPoly>(*this, L, false);
     }
 
-    key_switch_aux->generateDecompAndDigit(false);
-    key_switch_aux->generateSpecialLimbs(false, false);
-    return *key_switch_aux;
+    p->generateDecompAndDigit(false);
+    p->generateSpecialLimbs(false, false);
+    return *p;
 }
 
 RNSPoly& ContextData::getKeySwitchAux2() {
-    if (key_switch_aux2 == nullptr) {
+    auto& p = key_switch_aux2;
+    if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
-        if (key_switch_aux2 == nullptr)
-            key_switch_aux2 = std::make_unique<RNSPoly>(*this, L, false);
+        if (p == nullptr)
+            p = std::make_unique<RNSPoly>(*this, L, false);
     }
-    key_switch_aux2->generateDecompAndDigit(false);
-    key_switch_aux2->generateSpecialLimbs(false, false);
-    return *key_switch_aux2;
+    p->generateDecompAndDigit(false);
+    p->generateSpecialLimbs(false, false);
+    return *p;
 }
 
 RNSPoly& ContextData::getModdownAux(const int num) {
-    auto& p = moddown_aux[num % moddown_aux.size()];
+    auto& p = moddown_aux[num & 1];
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
         if (p == nullptr)
@@ -401,26 +400,55 @@ RNSPoly& ContextData::getModdownAux(const int num) {
 }
 std::vector<uint64_t> ContextData::ElemForEvalMult(int level, const double operand, int level_in) {
 
+    // Memoized: the Chebyshev evaluator calls this once per weight per bootstrap with a
+    // recurring (level, weight) set, and each call is a full bigint CRT expansion. After
+    // the first bootstrap every lookup hits. Mutex: cheap vs the expansion, and RNSPoly
+    // paths run under omp on multi-GPU.
+    uint64_t operand_bits;
+    static_assert(sizeof(operand_bits) == sizeof(operand));
+    std::memcpy(&operand_bits, &operand, sizeof(operand_bits));
+    const ElemMemoKey memo_key{level, (level_in == -1 ? level : level_in), operand_bits};
+    {
+        std::lock_guard<std::mutex> g(elem_memo_mutex);
+        auto it = elem_memo.find(memo_key);
+        if (it != elem_memo.end())
+            return it->second;
+    }
+
     uint32_t numTowers = level + 1;
     std::vector<lbcrypto::DCRTPoly::Integer> moduli(numTowers);
     for (usint i = 0; i < numTowers; i++) {
         moduli[i] = prime[i].p;
     }
 
+    const int cd = param.compositeDegree;
     double scFactor;
     if (level_in == -1 || level_in == level) {
-        scFactor = param.ScalingFactorReal[level];
+        scFactor = sfAtLimb(level);
     } else {
         /** Lets handle scale changes more efficiently!*/
-        assert(level > 0);
-        double scFactorIn = param.ScalingFactorReal[level_in];
-        double scFactorOut = param.ScalingFactorReal[level - 1];
-        double rescalingFactor = param.ModReduceFactor[level];
+        assert(level >= cd);
+        // Composite: the next level down is cd limbs lower, and the rescale divides by the
+        // product of the cd dropped primes (single prime / -1 on classic chains).
+        double scFactorIn = sfAtLimb(level_in);
+        double scFactorOut = sfAtLimb(level - cd);
+        double rescalingFactor = modReduceProduct(level);
         scFactor = scFactorOut * rescalingFactor / scFactorIn;
 
-        assert(abs(param.ScalingFactorReal[level - 1] * rescalingFactor -
-                   param.ScalingFactorReal[level] * param.ScalingFactorReal[level]) < 1e-9);
-        assert(abs(scFactorIn * scFactor / rescalingFactor - scFactorOut) < 1e-9);
+        // The FLEXIBLEAUTO invariant sf[l-1]*q_drop == sf[l]^2 is the cheapest whole-chain
+        // canary for composite level bookkeeping — keep it armed in Release builds (assert
+        // is dead under NDEBUG) with a RELATIVE tolerance (absolute 1e-9 is meaningless at
+        // sf ~ 2^54).
+        const double lhs = scFactorOut * rescalingFactor;
+        const double rhs = sfAtLimb(level) * sfAtLimb(level);
+        if (std::abs(lhs - rhs) > 1e-9 * std::abs(rhs) ||
+            std::abs(scFactorIn * scFactor / rescalingFactor - scFactorOut) > 1e-9 * std::abs(scFactorOut)) {
+            std::fprintf(stderr,
+                         "FIDESlib: ElemForEvalMult scale invariant broken at level=%d level_in=%d d=%d "
+                         "(sf[l-d]*drop=%e vs sf[l]^2=%e)\n",
+                         level, level_in, cd, lhs, rhs);
+            std::abort();
+        }
     }
 
     typedef int128_t DoubleInteger;
@@ -484,9 +512,14 @@ std::vector<uint64_t> ContextData::ElemForEvalMult(int level, const double opera
         result[i] = result[i] % prime[i].p;
     }
 
+    {
+        std::lock_guard<std::mutex> g(elem_memo_mutex);
+        elem_memo.emplace(memo_key, result);
+    }
     return result;
 }
 
+#if NATIVEINT == 128
 std::ostream& operator<<(std::ostream& o, const uint128_t& x) {
     if (x == std::numeric_limits<uint128_t>::min())
         return o << "0";
@@ -494,6 +527,7 @@ std::ostream& operator<<(std::ostream& o, const uint128_t& x) {
         return o << (char)(x + '0');
     return o << x / 10 << (char)(x % 10 + '0');
 }
+#endif
 
 std::vector<uint64_t> ContextData::ElemForEvalAddOrSub(const int level, const double operand, const int noise_deg) {
     usint sizeQl = level + 1;
@@ -508,7 +542,7 @@ std::vector<uint64_t> ContextData::ElemForEvalAddOrSub(const int level, const do
         scFactor =
             param.ScalingFactorRealBig.at(level);  // cryptoParams->GetScalingFactorRealBig(ciphertext->GetLevel());
     } else {
-        scFactor = param.ScalingFactorReal.at(level);  //cryptoParams->GetScalingFactorReal(ciphertext->GetLevel());
+        scFactor = sfAtLimb(level);  //cryptoParams->GetScalingFactorReal(ciphertext->GetLevel());
     }
 
     int32_t logApprox = 0;
@@ -705,19 +739,66 @@ void ContextData::AddBootPrecomputation(int slots, BootstrapPrecomputation&& pre
                              precomp.CtS.size() * precomp.CtS.at(0).A.size() *
                                  (1 + precomp.CtS.at(0).A.at(0).c0.getLevel() +
                                   precomp.CtS.at(0).A.at(0).c0.isModUp() * specialMeta[0].size()))) *
-                         N * 8 / (1 << 20)
+                         N * (NATIVEINT / 8) / (1 << 20)
                   << "MB\n";
+        // Per-level homomorphic-DFT shape: bStep = hoisted rotations per level's hoistedRotateDotKSK
+        // launch (each streams bStep full rotation keys), gStep = giant rotations. Printed once at setup.
+        for (auto* v : {&precomp.CtS, &precomp.StC}) {
+            for (size_t i = 0; i < v->size(); ++i)
+                std::cout << "[boot_lt] " << (v == &precomp.CtS ? "CtS" : "StC") << " level " << i
+                          << ": slots=" << v->at(i).slots << " bStep=" << v->at(i).bStep
+                          << " gStep=" << v->at(i).gStep << "\n";
+        }
     }
 
     precom.boot.emplace(slots, std::move(precomp));
 }
 
 FIDESlib::CKKS::RESCALE_TECHNIQUE ContextData::translateRescalingTechnique(lbcrypto::ScalingTechnique technique) {
+    // COMPOSITESCALING* reuses OpenFHE's FLEXIBLEAUTO scale-tracking machinery (one real
+    // scaling factor per level, auto-rescale); before this mapping it fell through to
+    // NO_RESCALE, silently disabling every auto-rescale and scale-adjust branch.
     return technique == lbcrypto::ScalingTechnique::FIXEDAUTO         ? FIDESlib::CKKS::FIXEDAUTO
            : technique == lbcrypto::ScalingTechnique::FIXEDMANUAL     ? FIDESlib::CKKS::FIXEDMANUAL
            : technique == lbcrypto::ScalingTechnique::FLEXIBLEAUTOEXT ? FIDESlib::CKKS::FLEXIBLEAUTOEXT
            : technique == lbcrypto::ScalingTechnique::FLEXIBLEAUTO    ? FIDESlib::CKKS::FLEXIBLEAUTO
-                                                                      : FIDESlib::CKKS::NO_RESCALE;
+           : technique == lbcrypto::ScalingTechnique::COMPOSITESCALINGAUTO   ? FIDESlib::CKKS::FLEXIBLEAUTO
+           : technique == lbcrypto::ScalingTechnique::COMPOSITESCALINGMANUAL ? FIDESlib::CKKS::FLEXIBLEAUTO
+                                                                             : FIDESlib::CKKS::NO_RESCALE;
+}
+
+void ContextData::setCorrectionFactorOverride(const int cf) {
+    correctionFactorOverride = cf;
+}
+
+int ContextData::getCorrectionFactorOverride() const {
+    return correctionFactorOverride;
+}
+
+void ContextData::setBtsPreScale(const double f) {
+    btsPreScale = f;
+}
+
+double ContextData::getBtsPreScale() const {
+    return btsPreScale;
+}
+
+double ContextData::sfAtLimb(const int limbTop) const {
+    if ((L - limbTop) % param.compositeDegree != 0) {
+        std::fprintf(stderr,
+                     "FIDESlib: sfAtLimb(%d) is OFF the composite level grid (L=%d, d=%d) — "
+                     "this index holds OpenFHE's sentinel 1.0, not a scaling factor\n",
+                     limbTop, L, param.compositeDegree);
+        std::abort();
+    }
+    return param.ScalingFactorReal[limbTop];
+}
+
+double ContextData::modReduceProduct(const int limbTop) const {
+    double factor = 1.0;
+    for (int j = 0; j < param.compositeDegree; ++j)
+        factor *= param.ModReduceFactor[limbTop - j];
+    return factor;
 }
 
 void ContextData::PrepareNCCLCommunication() {
@@ -944,9 +1025,8 @@ bool ContextData::hasAuxilarPoly() const {
     return precom.auxPoly.empty();
 }
 
-// S7 thread-safety: every Ciphertext construction pops this shared pool; two host
-// threads racing the unlocked pop/push double-moved RNSPolys (heap corruption behind
-// the two-ct segfault). Cold path, plain mutex.
+// Thread-safety: every Ciphertext construction pops this shared pool; two host threads racing
+// an unlocked pop/push double-move RNSPolys. Cold path, plain mutex.
 static std::mutex aux_poly_mtx;
 
 RNSPoly ContextData::getAuxilarPoly() {

@@ -18,6 +18,16 @@ __global__ void sub_(T* a, const T* b, const int primeId);
 /** a = a .+ b % p*/
 __global__ void add_(void** a, void** b, const int primeid_init);
 
+/** BYTES-indexed in-place add; grid {bytes_per_limb/(BYTES*128), nlimbs}, block 128. AddSub.cu. */
+void launchAddBytes(dim3 grid, dim3 block, cudaStream_t stream, void** a, void** b, int primeid_init,
+                    int bytes_per_thread);
+void launchSubBytes(dim3 grid, dim3 block, cudaStream_t stream, void** a, void** b, int primeid_init,
+                    int bytes_per_thread);
+void launchScalarAddSubBytes(dim3 grid, dim3 block, cudaStream_t stream, void** a, const uint64_t* b,
+                             int primeid_init, int bytes_per_thread, bool sub);
+/** Bytes-per-thread for the vectorized pointwise family; FIDESLIB_ADD_BYTES, default 16. */
+int fideslibAddBytes();
+
 /** a = a .- b % p*/
 __global__ void sub_(void** a, void** b, const int primeid_init);
 

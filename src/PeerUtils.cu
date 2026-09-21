@@ -264,7 +264,7 @@ void pollingKernel(TimelineSemaphore* gpu1_complete_flag, uint64_t value, cudaSt
         cudaGraphAddKernelNode(&peer_kernel_node, capturing_graph, deps, dep_count,
                                /*cudaGraphNodeTypeKernel,*/ &kernel_params);
 
-        // ✅ CRITICAL: Set memory sync domain to REMOTE for peer access
+        // CRITICAL: Set memory sync domain to REMOTE for peer access
         cudaLaunchAttributeValue attr_value;
         attr_value.memSyncDomain = cudaLaunchMemSyncDomainRemote;
 
@@ -330,7 +330,7 @@ void notifyKernel(TimelineSemaphore* gpu1_complete_flag, uint64_t value, cudaStr
         cudaGraphAddKernelNode(&peer_kernel_node, capturing_graph, deps, dep_count,
                                /*cudaGraphNodeTypeKernel,*/ &kernel_params);
 
-        // ✅ CRITICAL: Set memory sync domain to REMOTE for peer access
+        // CRITICAL: Set memory sync domain to REMOTE for peer access
         cudaLaunchAttributeValue attr_value;
         attr_value.memSyncDomain = cudaLaunchMemSyncDomainRemote;
 
@@ -828,7 +828,7 @@ void transferKernel(float* src, float* dst, size_t elems, cudaStream_t s, size_t
         cudaGraphAddKernelNode(&peer_kernel_node, capturing_graph, deps, dep_count,
                                /*cudaGraphNodeTypeKernel,*/ &kernel_params);
 
-        // ✅ CRITICAL: Set memory sync domain to REMOTE for peer access
+        // CRITICAL: Set memory sync domain to REMOTE for peer access
         cudaLaunchAttributeValue attr_value;
         attr_value.memSyncDomain = cudaLaunchMemSyncDomainRemote;
 
