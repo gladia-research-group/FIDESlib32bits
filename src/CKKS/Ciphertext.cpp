@@ -1920,7 +1920,11 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 	static std::mutex monomial_mtx;
 	std::lock_guard<std::mutex> monomial_guard(monomial_mtx);
 
-	if (!cc.precom.monomialCache.contains(power) || cc.precom.monomialCache.find(power)->second.getLevel() != this->getLevel()) {
+	// One cached monomial per (power, level); an entry is never replaced.
+	const int key = power * 1024 + this->getLevel();
+	if (!cc.precom.monomialCache.contains(key)) {
+		// The build writes into a pooled auxiliary polynomial: wait for work still using it.
+		cudaDeviceSynchronize();
 		// TODO compute fully as a GPU function.
 		RNSPoly monomial(cc.getAuxilarPoly());
 		monomial.grow(c0.getLevel());
@@ -1969,13 +1973,13 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 
 		// cudaDeviceSynchronize();
 		monomial.NTT(cc.batch, true);
-		// cudaDeviceSynchronize();
+		// multElement runs on this ciphertext's streams, which do not wait on the NTT's.
+		cudaDeviceSynchronize();
 
-		cc.precom.monomialCache.erase(power);
-		cc.precom.monomialCache.emplace(power, std::move(monomial));
+		cc.precom.monomialCache.emplace(key, std::move(monomial));
 	}
 
-	RNSPoly& monomial = cc.precom.monomialCache.find(power)->second;
+	RNSPoly& monomial = cc.precom.monomialCache.find(key)->second;
 
 	c0.multElement(monomial);
 	c1.multElement(monomial);
