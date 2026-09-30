@@ -4,11 +4,9 @@
 
 # FIDESlib32bits
 
-A fork of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib) 2.0 — a server-side CKKS GPU library
-fully interoperable with OpenFHE — that adds a **32-bit composite-scaling backend** and
+A fork of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib) that adds a **32-bit composite-scaling backend** and
 **seed-expanded key-switching keys**. It is the runtime of
-[Perseus](https://github.com/gladia-research-group/perseus) (*Perseus: A Bootstrap Placer for
-Faster Encrypted Transformer Inference*); `CHANGES.md` lists what differs from upstream.
+[Perseus](https://github.com/gladia-research-group/perseus) (*Perseus: Perseus: Faster FHE Transformer Inference via Complex-Packing and Sparse Bootstraps*); `CHANGES.md` lists what differs from upstream.
 
 * `NATIVEINT=32` chains: each CKKS level is a pair of 27-bit primes (composite degree 2), so
   modular arithmetic rides native 32-bit GPU paths; the 64-bit backend stays available.
@@ -28,24 +26,9 @@ The 32-bit OpenFHE this fork builds against is a fixed upstream commit plus the 
 kept in the Perseus repository (`third_party/openfhe-n32/patches`); Perseus's
 `scripts/install_deps.sh` builds both. The `deps/` patches here are the 64-bit path.
 
-## Improvements in version 2.0
-
-  - OpenFHE version 1.4.2 compatibility.
-  - Multi-GPU support with NCCL.
-  - Sparse Secret Encapsulation support.
-  - Many performance optimizations.
-  - Bug fixes.
-
-## Features
-  -  Full CKKS implementation: Add, AddPt, AddScalar, Mult, MultPt, MultScalar, Square, Rotate, RotateHoisted, Bootstrap.
-  -  OpenFHE interoperability for FIXEDMANUAL, FIXEDAUTO, FLEXIBLEAUTO and FLEXIBLEAUTOEXT.
-  -  Hardware acceleration with NVIDIA CUDA.
-  -  High-performance NTT/INTT implementation.
-  -  Hybrid Key-Switching.
-
 ## Citation
 
-If you use FIDESlib on your research, please cite our ISPASS paper.
+If you use FIDESlib on your research, please cite their ISPASS paper.
 
 ```bibtex
 @inproceedings{FIDESlib,
