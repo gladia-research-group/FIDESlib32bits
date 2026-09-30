@@ -137,26 +137,12 @@ Check docker directory to obtain instructions on running FIDESlib inside a Docke
 
 ## Credits
 
-Thanks to all main contributors:
+Thanks to the original contributors:
 * Carlos Agulló Domingo. 
 * Óscar Vera López.
 * Seyda Guzelhan.
 * Lohit Daksha.
 * Aymane El Jerari.
 
-And thanks to our advisor:
+And thanks to their advisor:
 * José L. Abellán.
-
-## Grants
-
-This project was possible thanks to the following grants:
-* Grant CNS2023-144241 funded by "MICIU/AEI/10.13039/501100011033" and the "European Union NextGenerationEU/PRTR".
-* Grants NSF CNS 2312275 and 2312276, and supported in part from the NSF IUCRC Center for Hardware and Embedded Systems Security and Trust (CHEST).
-
-## Inquiries and comments
-
-If you have any question, comment, or suggestion, please contact:
-* Carlos Agulló Domingo (carlos.a.d@um.es).
-* Óscar Vera López (oscar.veral@um.es).
-
-Or feel free to open an issue or a general discussion on this repository.
