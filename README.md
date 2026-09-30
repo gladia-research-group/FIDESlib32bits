@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="https://github.com/CAPS-UMU/FIDESlib/blob/main/doxygen/FidesLogo.drawio.svg?raw=true" width="200">
-</p>
-
 # FIDESlib32bits
 
 A fork of [FIDESlib](https://github.com/CAPS-UMU/FIDESlib) that adds a **32-bit composite-scaling backend** and
