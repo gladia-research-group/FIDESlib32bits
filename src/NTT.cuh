@@ -31,6 +31,10 @@ __global__ void Bit_Reverse(T* dat, uint32_t N);
 
 /* Get pointer to kernel, needed for explicit Cuda Graph construction. */
 void* get_NTT_reference(bool second);
+/// Transient-scratch discard (see NTT.cu): set the device flag (per current device) / read FIDESLIB_DISCARD_SCRATCH.
+void setDiscardScratch(int v);
+int discardScratchEnv();
+int discardScratchFlag();
 
 // ------------------------------------- INTT ----------------------------------------
 /** Kernel fusions */
@@ -60,7 +64,7 @@ __global__ void INTT_(const Global::Globals* Globals, void** __restrict__ dat, c
 // dat[0] = the qb limb, dat[1] = the qa top; primeid_rescale = qa's primeid, and qb's primeid
 // is derived as primeid_rescale - 1 (single-GPU composite chains have level-ordered q ids —
 // asserted by the host caller, which falls back to two passes otherwise).
-enum NTT_MODE { NTT_NONE, NTT_RESCALE, NTT_MULTPT, NTT_MODDOWN, NTT_KSK_DOT, NTT_KSK_DOT_ACC, NTT_RESCALE2 };
+enum NTT_MODE { NTT_NONE, NTT_RESCALE, NTT_MULTPT, NTT_MODDOWN, NTT_KSK_DOT, NTT_KSK_DOT_ACC, NTT_RESCALE2, NTT_MODDOWNR };
 
 template <typename T, bool second = true, ALGO algo = ALGO_SHOUP, NTT_MODE mode = NTT_NONE>
 __global__ void NTT_(const Global::Globals* Globals, T* __restrict__ dat, const int __grid_constant__ primeid,

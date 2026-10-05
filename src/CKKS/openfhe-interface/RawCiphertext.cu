@@ -2,6 +2,8 @@
 // Created by carlosad on 24/04/24.
 //
 #include <bit>
+#include <cmath>
+#include <complex>
 #include <cassert>
 #include <cstdlib>
 #include <fstream>
@@ -9,6 +11,8 @@
 #include <type_traits>
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/AksKeys.cuh"
+#include "CKKS/SmallInt.cuh"
 #include "CKKS/KskSeedExpand.cuh"
 #include "CKKS/openfhe-interface/ParameterSwitch.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
@@ -1070,6 +1074,32 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
                         evalKeys[2 * GPUcc.N - 4]);
                 FIDESlib::CKKS::RawKeySwitchKey rawKskEval2 = FIDESlib::CKKS::GetKeySwitchKey(res);
                 result.sparse_btoa->Initialize(rawKskEval2);
+                // GHS form for the small raised ciphertext (FIDESLIB_BTS_SHIFT): sum the digit keys limb-wise.
+                // sum_j D^_j D*_j == 1 (mod Q) and the P factor kills the mod-P ambiguity, so (sum b_j, sum a_j)
+                // encrypts P*s~ under s with noise sum e_j.
+                if (const char* e = std::getenv("FIDESLIB_BTS_SHIFT"); e && std::atoi(e) > 0) {
+                    const auto& A = rawKskEval2.r_key[0];  // [digit][limb][coef]
+                    const auto& B = rawKskEval2.r_key[1];
+                    const auto& M = rawKskEval2.r_key_moduli[0];
+                    std::vector<uint64_t> moduli;
+                    for (int i = 0; i <= GPUcc.L; ++i) moduli.push_back(GPUcc.prime[i].p);
+                    for (auto& sp : GPUcc.specialPrime) moduli.push_back(sp.p);
+                    const size_t nl = moduli.size(), N = GPUcc.N;
+                    std::vector<std::vector<uint64_t>> sa(nl, std::vector<uint64_t>(N, 0)), sb(nl, std::vector<uint64_t>(N, 0));
+                    for (size_t j = 0; j < A.size(); ++j)
+                        for (size_t k = 0; k < A[j].size(); ++k) {
+                            const uint64_t q = M[j][k];
+                            size_t l = 0;
+                            while (l < nl && moduli[l] != q) ++l;
+                            if (l == nl) throw std::runtime_error("ghs_btoa: key limb modulus not in Q+P");
+                            for (size_t n = 0; n < N; ++n) {
+                                sa[l][n] = (sa[l][n] + A[j][k][n]) % q;
+                                sb[l][n] = (sb[l][n] + B[j][k][n]) % q;
+                            }
+                        }
+                    result.ghs_btoa = FIDESlib::CKKS::MakeGhsKeyStage(GPUcc_, sa, sb, moduli);
+                    std::cerr << "[bts_shift] GHS btoa key built from " << A.size() << " digit keys over " << nl << " limbs\n";
+                }
             }
             // result.sparse_context stays unset: the d>1 raise never enters the helper path,
             // and an accidental .lock() should fail loudly rather than hand back a live context.
@@ -1144,6 +1174,41 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                     if constexpr (remove_extension)
                         result.LT.invA.back().c0.freeSpecialLimbs();
                 }
+                // FIDESLIB_BTS_SHIFT for the single-LT precomputation (slots whose level budget is {1,1}, e.g. the
+                // slots=1 route): same re-level as the multi-stage CtS/StC below — LT.A is the only CtS stage (carries
+                // 2^-t), LT.invA the only StC stage — so this route's landing moves with the dense one.
+                if (const int bts_shift = [] {
+                        const char* e = std::getenv("FIDESLIB_BTS_SHIFT");
+                        return e ? std::atoi(e) : 0;
+                    }();
+                    bts_shift > 0) {
+                    const int bts_t = [] {
+                        const char* e = std::getenv("FIDESLIB_BTS_SHIFT_T");
+                        return e ? std::atoi(e) : 12;
+                    }();
+                    const double tfac = std::ldexp(1.0, -bts_t);
+                    double qDouble = 1.0;
+                    for (int j = 0; j < GPUcc.compositeDegree(); ++j)
+                        qDouble *= (double)GPUcc.prime[j].p;
+                    const double pre = GPUcc.sfAtLimb(GPUcc.L) / qDouble;
+                    const double c = pre * (1.0 / (GPUcc.GetBootK() * GPUcc.N)) * GPUcc.getBtsPreScale();
+                    std::vector<Plaintext> nA, nInv;
+                    for (auto& pt : result.LT.A) {
+                        nA.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, bts_shift, tfac));
+                        nA.back().NoiseFactor *= tfac;
+                    }
+                    for (auto& pt : result.LT.invA)
+                        nInv.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, bts_shift, 1.0));
+                    result.LT.A = std::move(nA);
+                    result.LT.invA = std::move(nInv);
+                    result.cts0_const = c;
+                    result.cts0_t = bts_t;
+                    cudaDeviceSynchronize();
+                    std::cerr << "[bts_shift] slots=" << slots << " (single LT): " << result.LT.A.size() << " + "
+                              << result.LT.invA.size() << " plaintexts re-levelled by " << bts_shift
+                              << " composite level(s); LT at level " << result.LT.A.at(0).c0.getLevel() << ", t = " << bts_t
+                              << "\n";
+                }
             }
         }
 
@@ -1173,17 +1238,102 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                 }
             }
 
+            // FIDESLIB_BTS_SHIFT = s (composite levels, default 0). FIDESlib applies the FLEXIBLEAUTO adjustment
+            // BEFORE raising, so the raised ciphertext is canonical at the top level, while OpenFHE's precompute
+            // (written for its own post-raise adjust) encodes the first CtS stage d towers lower: stage 0 drops
+            // the top d primes for nothing. Re-level every CtS/StC plaintext s composite levels up on the GPU
+            // (exact small-integer lift + the real rescale sf(old)/sf(new), CKKS/SmallInt.cuh); the bootstrap
+            // output gains s composite levels with unchanged kernels and keys.
+            if (const int bts_shift = [] {
+                    const char* e = std::getenv("FIDESLIB_BTS_SHIFT");
+                    return e ? std::atoi(e) : 0;
+                }();
+                bts_shift > 0) {  // dense AND sparse-slot precomputations (the exact scaling commutes with Accumulate)
+                // Dense bootstraps only (the sparse-slot ones run Accumulate between the raise and CtS). The
+                // post-raise multScalar(constantEvalMult) + rescale is replaced by an EXACT small-integer scaling
+                // of the raised (still small-coefficient) ciphertext inside ModRaise (CKKS/SmallInt.cuh), which
+                // keeps the level; `cts0_const` records the constant Bootstrap() must see to take that path.
+                // (Folding c into the stage-0 plaintexts instead costs ~2.5 bits: their 2^32-sized integers
+                // multiply the unscaled q0*I term before c shrinks the signal.)
+                double qDouble = 1.0;
+                for (int j = 0; j < GPUcc.compositeDegree(); ++j)
+                    qDouble *= (double)GPUcc.prime[j].p;
+                const double pre = GPUcc.sfAtLimb(GPUcc.L) / qDouble;  // composite chain (Bootstrap.cu)
+                const double c = pre * (1.0 / (GPUcc.GetBootK() * GPUcc.N)) * GPUcc.getBtsPreScale();
+                int n = 0;
+                if (const char* e = std::getenv("FIDESLIB_RELEVEL_SELFTEST"); e && std::atoi(e)) {
+                    relevelSelfTest(GPUcc_, GPUcc, result.CtS.at(0).A.at(0), "CtS0[0]");
+                    relevelSelfTest(GPUcc_, GPUcc, result.CtS.at(1).A.at(3), "CtS1[3]");
+                    relevelSelfTest(GPUcc_, GPUcc, result.StC.at(0).A.at(0), "StC0[0]");
+                }
+                const int bts_t = [] {
+                    const char* e = std::getenv("FIDESLIB_BTS_SHIFT_T");
+                    return e ? std::atoi(e) : 12;
+                }();
+                const double tfac = std::ldexp(1.0, -bts_t);
+                // lever 1b layout: stage 0 is done by the aggregated switch at level L with full-precision
+                // plaintexts; it consumes no level, so stages >= 1 and StC move up by TWO composite levels and
+                // stage 1 carries the 2^-t
+                const bool aks_layout = [&] {  // only the dense precomputation has an AKS stage 0
+                    const char* e = std::getenv("FIDESLIB_AKS");
+                    return e && std::atoi(e) > 0 && slots == (int)GPUcc.N / 2;
+                }();
+                const bool shift_stc = [] {  // diagnostic: FIDESLIB_BTS_SHIFT_STC=0 leaves StC alone
+                    const char* e = std::getenv("FIDESLIB_BTS_SHIFT_STC");
+                    return !(e && std::atoi(e) == 0);
+                }();
+                for (auto* v : {&result.CtS, &result.StC})
+                    for (size_t si = 0; si < v->size(); ++si) {
+                        if (v == &result.StC && !shift_stc)
+                            continue;
+                        auto& st = (*v)[si];
+                        const bool stage0 = (v == &result.CtS && si == 0);
+                        std::vector<Plaintext> nv;
+                        nv.reserve(st.A.size());
+                        for (auto& pt : st.A) {
+                            const bool carries_t = aks_layout ? (v == &result.CtS && si == 1) : stage0;
+                            const int sh = (aks_layout && !stage0) ? bts_shift + 1 : bts_shift;
+                            nv.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, sh, carries_t ? tfac : 1.0));
+                            if (carries_t)
+                                nv.back().NoiseFactor *= tfac;  // integers x 2^-t at scale sf x 2^-t: same value
+                            if (const char* td = std::getenv("BTS_TRACE_DIR"); td && (n == 0 || n == 5 || n == 70 || (v == &result.StC && (&pt == &st.A.front())))) {
+                                const std::string base = std::string(td) + "/pt" + std::to_string(n) + (v == &result.StC ? "-stc" : "-cts") + std::to_string(si);
+                                exactPlainDump(pt, (base + "-orig.ct").c_str());
+                                exactPlainDump(nv.back(), (base + "-new.ct").c_str());
+                            }
+                            ++n;
+                        }
+                        if (std::getenv("BTS_TRACE_DIR") && shift_stc) {  // keep the originals for the reference run
+                            auto& ov = (v == &result.CtS) ? result.CtS_orig : result.StC_orig;
+                            BootstrapPrecomputation::LTstep o;
+                            o.slots = st.slots; o.bStep = st.bStep; o.gStep = st.gStep; o.rotIn = st.rotIn; o.rotOut = st.rotOut;
+                            o.A = std::move(st.A);
+                            ov.push_back(std::move(o));
+                        }
+                        st.A = std::move(nv);
+                    }
+                result.cts0_const = c;
+                result.cts0_t = bts_t;
+                cudaDeviceSynchronize();
+                std::cerr << "[bts_shift] slots=" << slots << ": " << n << " CtS/StC plaintexts re-levelled by "
+                          << bts_shift << " composite level(s); CtS stage 0 at level "
+                          << result.CtS.at(0).A.at(0).c0.getLevel() << "; EvalMod constant " << c
+                          << " applied exactly in ModRaise, t = " << bts_t << "\n";
+            }
+
+            auto ltFriendly = [&](std::vector<BootstrapPrecomputation::LTstep>& CtS,
+                                  std::vector<BootstrapPrecomputation::LTstep>& StC) {
             int acc_offset = 0;
             if constexpr (MAKE_CTS_LT_FRIENDLY) {
-                for (int32_t s = 0; s < result.CtS.size(); s++) {
-                    int offset = result.CtS.at(s).rotOut[0];
-                    acc_offset += result.CtS.at(s).rotOut[0];
-                    result.CtS.at(s).rotOut[0] = 0;
+                for (int32_t s = 0; s < CtS.size(); s++) {
+                    int offset = CtS.at(s).rotOut[0];
+                    acc_offset += CtS.at(s).rotOut[0];
+                    CtS.at(s).rotOut[0] = 0;
 
-                    for (int i = 0; i < result.CtS.at(s).gStep; ++i) {
-                        for (int j = 0; j < result.CtS.at(s).bStep; ++j) {
-                            if (i * result.CtS.at(s).bStep + j < result.CtS.at(s).slots) {
-                                result.CtS.at(s).A[i * result.CtS.at(s).bStep + j].automorph(
+                    for (int i = 0; i < CtS.at(s).gStep; ++i) {
+                        for (int j = 0; j < CtS.at(s).bStep; ++j) {
+                            if (i * CtS.at(s).bStep + j < CtS.at(s).slots) {
+                                CtS.at(s).A[i * CtS.at(s).bStep + j].automorph(
                                     ReduceRotation(-acc_offset, M / 4));
                             }
                         }
@@ -1192,31 +1342,35 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
             }
 
             if constexpr (MAKE_STC_LT_FRIENDLY) {
-                for (int32_t s = 0; s < result.StC.size(); s++) {
-                    int offset = result.StC.at(s).rotOut[0];
-                    acc_offset += result.StC.at(s).rotOut[0];
+                for (int32_t s = 0; s < StC.size(); s++) {
+                    int offset = StC.at(s).rotOut[0];
+                    acc_offset += StC.at(s).rotOut[0];
 
-                    result.StC.at(s).rotOut[0] = 0;
+                    StC.at(s).rotOut[0] = 0;
 
-                    for (int i = 0; i < result.StC.at(s).gStep; ++i) {
-                        for (int j = 0; j < result.StC.at(s).bStep; ++j) {
-                            if (i * result.StC.at(s).bStep + j < result.StC.at(s).slots) {
-                                result.StC.at(s).A[i * result.StC.at(s).bStep + j].automorph(
+                    for (int i = 0; i < StC.at(s).gStep; ++i) {
+                        for (int j = 0; j < StC.at(s).bStep; ++j) {
+                            if (i * StC.at(s).bStep + j < StC.at(s).slots) {
+                                StC.at(s).A[i * StC.at(s).bStep + j].automorph(
                                     ReduceRotation(-acc_offset, M / 4));
                             }
                         }
                     }
 
-                    if (s == result.StC.size() - 1) {
-                        result.StC.at(s).rotOut[0] = acc_offset;
-                        result.StC.at(s).rotOut[0] %= std::min(2 * slots, (int)cc->GetRingDimension() / 2);
-                        for (int i = 1; i < result.StC.at(s).gStep; ++i) {
-                            result.StC.at(s).rotOut[i] += acc_offset;
-                            result.StC.at(s).rotOut[i] %= std::min(2 * slots, (int)cc->GetRingDimension() / 2);
+                    if (s == StC.size() - 1) {
+                        StC.at(s).rotOut[0] = acc_offset;
+                        StC.at(s).rotOut[0] %= std::min(2 * slots, (int)cc->GetRingDimension() / 2);
+                        for (int i = 1; i < StC.at(s).gStep; ++i) {
+                            StC.at(s).rotOut[i] += acc_offset;
+                            StC.at(s).rotOut[i] %= std::min(2 * slots, (int)cc->GetRingDimension() / 2);
                         }
                     }
                 }
             }
+            };
+            ltFriendly(result.CtS, result.StC);
+            if (!result.CtS_orig.empty())
+                ltFriendly(result.CtS_orig, result.StC_orig);
         }
     }
 }

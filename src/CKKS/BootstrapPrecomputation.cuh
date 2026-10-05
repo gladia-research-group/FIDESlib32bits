@@ -14,6 +14,7 @@
 namespace FIDESlib::CKKS {
 
 class KeySwitchingKey;
+struct AksStage;
 
 class BootstrapPrecomputation {
    public:
@@ -50,6 +51,16 @@ class BootstrapPrecomputation {
     // the M-4 fetch would return the M-2 key.
     std::unique_ptr<KeySwitchingKey> sparse_atob;  // dense -> sparse (M-4), applied at the composite bottom
     std::unique_ptr<KeySwitchingKey> sparse_btoa;  // sparse -> dense (M-2), applied at the raised level
+    std::shared_ptr<AksStage> aks0;  // aggregated key switching for CtS stage 0 (CKKS/AksKeys.cuh), optional
+    std::shared_ptr<AksStage> ghs_btoa;  // GHS form of sparse_btoa (digit keys summed) for the small raised ciphertext
+    // FIDESLIB_BTS_SHIFT: the post-raise EvalMod constant (pre / (k N) * btsPreScale) folded into the stage-0
+    // plaintexts; 0 = not folded. Bootstrap skips its multScalar + rescale when its own constant matches.
+    double cts0_const = 0;
+    // FIDESLIB_BTS_SHIFT_T: the exact scaling is by cts0_const * 2^cts0_t (scale bookkeeping carries the 2^t; the
+    // stage-0 plaintexts carry 2^-t) so the encapsulation switch's absolute noise (~2^9/coef) is 2^t below the message
+    int cts0_t = 0;
+    // diagnostics (BTS_TRACE_DIR): the un-shifted plaintext stages, for a within-run reference bootstrap
+    std::vector<LTstep> CtS_orig, StC_orig;
 };
 
 }  // namespace FIDESlib::CKKS

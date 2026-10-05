@@ -360,7 +360,7 @@ void LimbPartition::binomialMultAccumBatch(LimbPartition& acc0, LimbPartition& a
 
 void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
                                         const std::vector<LimbPartition*>& pt, int bStep, int gStep, int stride,
-                                        double usage, bool ext) {
+                                        double usage, bool ext, int part, int limb_begin, int limb_count) {
 
     constexpr bool VER2 = true;
     constexpr bool VER3 = true;
@@ -372,6 +372,22 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
     int special_start = 0;
     for (int i = 0; i < out[0]->id; ++i) {
         special_start += cc.splitSpecialMeta.at(i).size();
+    }
+    // Limb-range form (LT chunking). The kernels index every limb table with blockIdx.y and
+    // derive the prime from primeid_flattened[primeidInit + blockIdx.y], so a sub-range is the
+    // table entries offset by limb_begin plus primeidInit + limb_begin and a smaller grid.y.
+    const bool do_regular = part != 1;
+    const bool do_special = part != 0 && ext;
+    int reg_begin = 0, sp_begin = 0;
+    if (part == 0) {
+        reg_begin = limb_begin;
+        limbsize = limb_count < 0 ? limbsize - limb_begin : std::min(limb_count, limbsize - limb_begin);
+        assert(limb_begin >= 0 && limbsize > 0);
+    } else if (part == 1) {
+        assert(ext);
+        sp_begin = limb_begin;
+        slimbsize = limb_count < 0 ? slimbsize - limb_begin : std::min(limb_count, slimbsize - limb_begin);
+        assert(limb_begin >= 0 && slimbsize > 0);
     }
 
     dim3 block;
@@ -430,36 +446,37 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
         for (int j = 0; j < stride; ++j) {
             for (int k = 0; k < gStep; ++k) {
                 data_ptrs[offset_out_c0 + i * stride * gStep + j * gStep + k] =
-                    out[2 * (i * stride * gStep + j * gStep + k)]->limbptr.data;
+                    out[2 * (i * stride * gStep + j * gStep + k)]->limbptr.data + reg_begin;
             }
         }
 
         for (int j = 0; j < stride; ++j) {
             for (int k = 0; k < gStep; ++k) {
                 data_ptrs[offset_out_c1 + i * stride * gStep + j * gStep + k] =
-                    out[2 * (i * stride * gStep + j * gStep + k) + 1]->limbptr.data;
+                    out[2 * (i * stride * gStep + j * gStep + k) + 1]->limbptr.data + reg_begin;
             }
         }
 
         for (int j = 0; j < stride; ++j) {
             for (int k = 0; k < bStep; ++k) {
                 data_ptrs[offset_in_c0 + i * stride * bStep + j * bStep + k] =
-                    in[2 * (i * stride * bStep + j * bStep + k)]->limbptr.data;
+                    in[2 * (i * stride * bStep + j * bStep + k)]->limbptr.data + reg_begin;
             }
         }
 
         for (int j = 0; j < stride; ++j) {
             for (int k = 0; k < bStep; ++k) {
                 data_ptrs[offset_in_c1 + i * stride * bStep + j * bStep + k] =
-                    in[2 * (i * stride * bStep + j * bStep + k) + 1]->limbptr.data;
+                    in[2 * (i * stride * bStep + j * bStep + k) + 1]->limbptr.data + reg_begin;
             }
         }
 
         for (int j = 0; j < gStep; ++j) {
             for (int k = 0; k < bStep; ++k) {
                 data_ptrs[offset_pt + i * gStep * bStep + j * bStep + k] =
-                    pt[i * gStep * bStep + j * bStep + k] ? pt[i * gStep * bStep + j * bStep + k]->limbptr.data
-                                                          : nullptr;
+                    pt[i * gStep * bStep + j * bStep + k]
+                        ? pt[i * gStep * bStep + j * bStep + k]->limbptr.data + reg_begin
+                        : nullptr;
             }
         }
 
@@ -467,28 +484,30 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
             for (int j = 0; j < stride; ++j) {
                 for (int k = 0; k < gStep; ++k) {
                     data_ptrs[soffset_out_c0 + i * stride * gStep + j * gStep + k] =
-                        out[2 * (i * stride * gStep + j * gStep + k)]->SPECIALlimbptr.data + special_start;
+                        out[2 * (i * stride * gStep + j * gStep + k)]->SPECIALlimbptr.data + special_start + sp_begin;
                 }
             }
 
             for (int j = 0; j < stride; ++j) {
                 for (int k = 0; k < gStep; ++k) {
                     data_ptrs[soffset_out_c1 + i * stride * gStep + j * gStep + k] =
-                        out[2 * (i * stride * gStep + j * gStep + k) + 1]->SPECIALlimbptr.data + special_start;
+                        out[2 * (i * stride * gStep + j * gStep + k) + 1]->SPECIALlimbptr.data + special_start +
+                        sp_begin;
                 }
             }
 
             for (int j = 0; j < stride; ++j) {
                 for (int k = 0; k < bStep; ++k) {
                     data_ptrs[soffset_in_c0 + i * stride * bStep + j * bStep + k] =
-                        in[2 * (i * stride * bStep + j * bStep + k)]->SPECIALlimbptr.data + special_start;
+                        in[2 * (i * stride * bStep + j * bStep + k)]->SPECIALlimbptr.data + special_start + sp_begin;
                 }
             }
 
             for (int j = 0; j < stride; ++j) {
                 for (int k = 0; k < bStep; ++k) {
                     data_ptrs[soffset_in_c1 + i * stride * bStep + j * bStep + k] =
-                        in[2 * (i * stride * bStep + j * bStep + k) + 1]->SPECIALlimbptr.data + special_start;
+                        in[2 * (i * stride * bStep + j * bStep + k) + 1]->SPECIALlimbptr.data + special_start +
+                        sp_begin;
                 }
             }
 
@@ -496,7 +515,7 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
                 for (int k = 0; k < bStep; ++k) {
                     data_ptrs[soffset_pt + i * gStep * bStep + j * bStep + k] =
                         pt[i * gStep * bStep + j * bStep + k]
-                            ? pt[i * gStep * bStep + j * bStep + k]->SPECIALlimbptr.data
+                            ? pt[i * gStep * bStep + j * bStep + k]->SPECIALlimbptr.data + sp_begin
                             : nullptr;
                 }
             }
@@ -511,43 +530,43 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
     s.wait(pt[0]->s);
 
     if constexpr (!VER2) {
-        if (limbsize > 0) {
+        if (do_regular && limbsize > 0) {
             dotProductLtBatchedPt___<<<grid, block, shmem_bytes, s.ptr()>>>(
                 data_ptrs_d + offset_out_c0, data_ptrs_d + offset_out_c1, data_ptrs_d + offset_in_c0,
-                data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, stride, gStep, PARTITION(out[0]->id, 0), num_LT);
+                data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, stride, gStep, PARTITION(out[0]->id, 0) + reg_begin, num_LT);
         }
-        if (ext && slimbsize > 0) {
+        if (do_special && slimbsize > 0) {
             dotProductLtBatchedPt___<<<sgrid, block, shmem_bytes, s.ptr()>>>(
                 data_ptrs_d + soffset_out_c0, data_ptrs_d + soffset_out_c1, data_ptrs_d + soffset_in_c0,
                 data_ptrs_d + soffset_in_c1, data_ptrs_d + soffset_pt, stride, gStep,
-                SPECIAL(out[0]->id, special_start), num_LT);
+                SPECIAL(out[0]->id, special_start) + sp_begin, num_LT);
         }
     } else {
         if constexpr (!VER3) {
-            if (limbsize > 0) {
+            if (do_regular && limbsize > 0) {
                 dotProductLtBatchedPt2___<<<grid, block, shmem_bytes, s.ptr()>>>(
                     data_ptrs_d + offset_out_c0, data_ptrs_d + offset_out_c1, data_ptrs_d + offset_in_c0,
-                    data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, bStep, gStep, PARTITION(out[0]->id, 0),
+                    data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, bStep, gStep, PARTITION(out[0]->id, 0) + reg_begin,
                     num_LT);
             }
-            if (ext && slimbsize > 0) {
+            if (do_special && slimbsize > 0) {
                 dotProductLtBatchedPt2___<<<sgrid, block, shmem_bytes, s.ptr()>>>(
                     data_ptrs_d + soffset_out_c0, data_ptrs_d + soffset_out_c1, data_ptrs_d + soffset_in_c0,
                     data_ptrs_d + soffset_in_c1, data_ptrs_d + soffset_pt, bStep, gStep,
-                    SPECIAL(out[0]->id, special_start), num_LT);
+                    SPECIAL(out[0]->id, special_start) + sp_begin, num_LT);
             }
         } else {
-            if (limbsize > 0) {
+            if (do_regular && limbsize > 0) {
                 dotProductLtBatchedPt3___<<<grid, block, shmem_bytes, s.ptr()>>>(
                     data_ptrs_d + offset_out_c0, data_ptrs_d + offset_out_c1, data_ptrs_d + offset_in_c0,
-                    data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, bStep, gStep, PARTITION(out[0]->id, 0),
+                    data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, bStep, gStep, PARTITION(out[0]->id, 0) + reg_begin,
                     num_LT);
             }
-            if (ext && slimbsize > 0) {
+            if (do_special && slimbsize > 0) {
                 dotProductLtBatchedPt3___<<<sgrid, block, shmem_bytes, s.ptr()>>>(
                     data_ptrs_d + soffset_out_c0, data_ptrs_d + soffset_out_c1, data_ptrs_d + soffset_in_c0,
                     data_ptrs_d + soffset_in_c1, data_ptrs_d + soffset_pt, bStep, gStep,
-                    SPECIAL(out[0]->id, special_start), num_LT);
+                    SPECIAL(out[0]->id, special_start) + sp_begin, num_LT);
             }
         }
     }

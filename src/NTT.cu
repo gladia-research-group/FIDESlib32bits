@@ -53,11 +53,81 @@ __device__ __forceinline__ int evalPerm4(const int idx4) {
 #include <tuple>
 
 #include "NTTfusions.cuh"
+#include "NTTtc_core.cuh"
 #include "NTThelper.cuh"
 
 namespace cg = cooperative_groups;
 
 namespace FIDESlib {
+
+// ---- Transient-scratch discard (traffic campaign, 2026-10-03) -------------------------------
+// Every two-pass NTT/INTT writes its intermediate to a scratch limb (aux) that is read exactly
+// once by the second pass. Those lines are dirty in L2 and get written back to DRAM on eviction
+// for nothing (~16 GB/bts of DRAM writes measured device-wide). When the flag is set:
+//  * the second pass discards (discard.global.L2, no write-back) each 128-B scratch line after
+//    the block has loaded it. This needs the block to be the only reader of the line, so
+//  * the forward NTT stores its scratch in a permuted layout in which pass 2's transposed read
+//    becomes one contiguous 8 KB chunk per block (the INTT already reads its scratch contiguously).
+// Both passes consult the same flag, so toggling it between whole operations is safe (used by the
+// in-process bit-exact A/B). u32 limbs only; the u64 path keeps the original layout and never discards.
+__device__ int g_fides_discard_scratch = 0;
+static int g_host_discard_scratch = 0;  // host mirror for the discard kernels (Discard.cu)
+void setDiscardScratch(int v) {
+    g_host_discard_scratch = v;
+    cudaMemcpyToSymbol(g_fides_discard_scratch, &v, sizeof(int));
+}
+int discardScratchFlag() {
+    return g_host_discard_scratch;
+}
+
+// Tensor-core NTT core (NTTtc.cuh): per-device tables and the routing flag, set from the host.
+__device__ int g_fides_tc_ntt = 0;
+__device__ const uint8_t* g_tc_R[MAXP];
+__device__ const uint8_t* g_tc_Rinv[MAXP];
+__device__ uint64_t g_tc_mu[MAXP];
+__device__ const uint8_t* g_tc_B[MAXP];
+__device__ const uint8_t* g_tc_Binv[MAXP];
+void setTcTables(const TcTables& t, int device) {
+    cudaSetDevice(device);
+    cudaMemcpyToSymbol(g_tc_B, t.B, sizeof(t.B));
+    cudaMemcpyToSymbol(g_tc_Binv, t.Binv, sizeof(t.Binv));
+    cudaMemcpyToSymbol(g_tc_R, t.R, sizeof(t.R));
+    cudaMemcpyToSymbol(g_tc_Rinv, t.Rinv, sizeof(t.Rinv));
+    cudaMemcpyToSymbol(g_tc_mu, t.mu, sizeof(t.mu));
+    const int f = tcNttFlag();
+    cudaMemcpyToSymbol(g_fides_tc_ntt, &f, sizeof(int));
+}
+void setTcNtt(int v) {
+    cudaMemcpyToSymbol(g_fides_tc_ntt, &v, sizeof(int));
+}
+int discardScratchEnv() {
+    const char* e = std::getenv("FIDESLIB_DISCARD_SCRATCH");
+    return e ? std::atoi(e) : 0;
+}
+__device__ __forceinline__ void discard_l2_line(const void* p) {
+    asm volatile("discard.global.L2 [%0], 128;" ::"l"(p) : "memory");
+}
+// forward-NTT scratch layout. Pass 1 stores logical int2 index q = (bd*M)*bx + bd*i + tid; pass 2
+// block bx' reads, for each of its 2*bd rows r, the (M/2) int2 at q = rowlen*r + (M/2)*bx' + c with
+// rowlen = (M/2)*gridDim.x. phys(q) = (bd*M)*bx' + (M/2)*r + c makes block bx' own the contiguous
+// int2 range [(bd*M)*bx', +bd*M) = 8 KB at u32, which it can then discard.
+__device__ __forceinline__ int ntt_scratch_store_int2(const int bx, const int i, const int tid, const int M) {
+    const int q = (int)(blockDim.x * M) * bx + (int)blockDim.x * i + tid;
+    const int lg_rowlen = 31 - __clz((M / 2) * gridDim.x);  // rowlen is a power of two
+    const int r = q >> lg_rowlen;
+    const int rem = q & (((M / 2) * gridDim.x) - 1);
+    return (int)(blockDim.x * M) * (rem / (M / 2)) + (M / 2) * r + (rem % (M / 2));
+}
+__device__ __forceinline__ int ntt_scratch_load_int4(const int bx, const int r, const int j, const int M) {
+    return ((int)(blockDim.x * M) * bx + (M / 2) * r + (j & 2)) >> 1;
+}
+template <typename T>
+__device__ __forceinline__ void discard_scratch_chunk(const T* dat, const int tid, const int M) {
+    // the block's chunk is blockDim.x * M int2 = 8 KB at u32; 128 threads x 64 lines
+    const size_t chunk = (size_t)blockDim.x * M * 8;
+    if ((size_t)tid * 128 < chunk)
+        discard_l2_line((const char*)dat + (size_t)blockIdx.x * chunk + (size_t)tid * 128);
+}
 
 constexpr bool NEGACYCLIC = true;
 constexpr bool FUSEITERATIONS = true;
@@ -153,6 +223,9 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
 */
     }
     __syncthreads();
+    if constexpr (second && sizeof(T) == 4)
+        if (g_fides_discard_scratch)
+            discard_scratch_chunk<T>(dat, tid, M);  // scratch consumed: no DRAM write-back
 
     if constexpr (second) {
         // EOT: the middle-scale exponent is affine in i, so hoist the base and iterate.
@@ -238,6 +311,17 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
         }
     }
 
+    bool use_tc = false;  // tensor-core core (NTTtc.cuh): block-uniform choice
+    if constexpr (sizeof(T) == 4) {
+        if (g_fides_tc_ntt == 2 && g_tc_Binv[primeid] != nullptr) {
+            use_tc = true;
+            tc::tc_core2<T>(buffer, g_tc_Binv[primeid], primeid, g_tc_mu[primeid], tid);
+        } else if (g_fides_tc_ntt && g_tc_Rinv[primeid] != nullptr) {
+            use_tc = true;
+            tc::tc_core<T>(buffer, g_tc_Rinv[primeid], primeid, g_tc_mu[primeid], tid);
+        }
+    }
+    if (!use_tc) {
     int m = 1;
     int maskPsi = (blockDim.x - 1);
     uint32_t log_psi = 0;
@@ -327,6 +411,7 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
         AS(i, tid + m) = modsub(aux[0], aux[1], primeid);
     }
 
+    }  // !use_tc
     // Obs: Almacenamos el array transpuesto ambas veces
     // Idea: calcular full_psi en función de ambos arrays psi
     // Idea: incluir N_inv en full_psi
@@ -568,7 +653,9 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                     const int pos_transp = (M / 2) * (gridDim.x * (col_init + i) + blockIdx.x) + (j & 2);
 #endif
                     //                   const int pos_res = (col_init + i);
-                    aux = FIDESLIB_NTT_STREAM_LD((const int4*)dat + (pos_transp >> 1));
+                    aux = FIDESLIB_NTT_STREAM_LD((const int4*)dat + ((second && g_fides_discard_scratch)
+                                                                         ? ntt_scratch_load_int4(blockIdx.x, col_init + i, j, M)
+                                                                         : (pos_transp >> 1)));
                     if constexpr (mode == NTT_RESCALE2 && !second) {
                         // fused double drop: dat = qb limb (x2c), pt = qa top (va), both coeff
                         // domain, loaded with the identical transposed pattern (coalesced).
@@ -601,6 +688,9 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
             }
 
             __syncthreads();
+            if constexpr (second && sizeof(T) == 4)
+                if (g_fides_discard_scratch)
+                    discard_scratch_chunk<T>(dat, tid, M);  // scratch consumed: no DRAM write-back
         }
 
         if constexpr (1) {
@@ -619,9 +709,20 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 forward_negacyclic_scale<T, algo, M>(buffer, primeid, psi, psi_barret, Globals);
             }
 
+            const uint64_t logBD = 32 - __clz(blockDim.x) + (sizeof(T) == 8 ? 3 : 2);
+            bool use_tc = false;  // tensor-core core (NTTtc.cuh): block-uniform choice
+            if constexpr (sizeof(T) == 4) {
+                if (g_fides_tc_ntt == 2 && g_tc_B[primeid] != nullptr) {
+                    use_tc = true;
+                    tc::tc_core2<T>(buffer, g_tc_B[primeid], primeid, g_tc_mu[primeid], tid);
+                } else if (g_fides_tc_ntt && g_tc_R[primeid] != nullptr) {
+                    use_tc = true;
+                    tc::tc_core<T>(buffer, g_tc_R[primeid], primeid, g_tc_mu[primeid], tid);
+                }
+            }
+            if (!use_tc) {
             int m = blockDim.x;
             int maskPsi = m;
-            const uint64_t logBD = 32 - __clz(blockDim.x) + (sizeof(T) == 8 ? 3 : 2);
 
             // Iteración 0 optimizada.`
             for (int i = 0; i < M; i += 1) {
@@ -845,6 +946,7 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 }
             }
 
+            }  // !use_tc
             // Idea: calcular full_psi en función de ambos arrays psi
             if (!second) {
                 // EOT: the middle-scale exponent is affine in i, so hoist the base and iterate.
@@ -931,7 +1033,8 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                     if constexpr (sizeof(T) == 8) {
                         ((int4*)res)[evalPerm4(OFFSET_2T(i))] = aux;  // orbit probe
                     } else {
-                        ((int2*)res)[evalPerm2(OFFSET_2T(i))] = ((int2*)&aux)[0];  // orbit probe
+                        ((int2*)res)[g_fides_discard_scratch ? ntt_scratch_store_int2(blockIdx.x, i, tid, M)
+                                                             : evalPerm2(OFFSET_2T(i))] = ((int2*)&aux)[0];  // orbit probe
                     }
                 }
 
@@ -948,6 +1051,9 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                 }
                 if constexpr (mode == NTT_MODDOWN) {
                     moddown_fusion<T, algo, M>(buffer, logBD, j, primeid, res);
+                }
+                if constexpr (mode == NTT_MODDOWNR) {
+                    moddownr_fusion<T, algo, M>(buffer, logBD, j, primeid, primeid_rescale, res, Globals);
                 }
 
                 if constexpr (mode == NTT_KSK_DOT) {
@@ -1003,6 +1109,9 @@ template <bool second, ALGO algo, NTT_MODE mode>
 __global__ void NTT_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
                      void** __restrict__ res, void** __restrict__ pt, const int __grid_constant__ primeid_rescale,
                      void** __restrict__ res2, void** __restrict__ kskb) {
+    // a multi-digit table (lever B1-2) is num_d * MAXP rows with nullptr holes: nothing to do for a hole
+    if (!((mode == NTT_RESCALE || mode == NTT_MULTPT || mode == NTT_RESCALE2) && !second) && dat[blockIdx.y] == nullptr)
+        return;
     const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
 
     assert(primeid >= 0 && primeid < MAXP);

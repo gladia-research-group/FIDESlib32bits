@@ -53,7 +53,7 @@ class RNSPoly {
     void modup();
 
     template <ALGO algo = ALGO_SHOUP>
-    void moddown(bool ntt = true, bool free = true, int aux_num = 0);
+    void moddown(bool ntt = true, bool free = true, int aux_num = 0, bool rescale2 = false);
     int automorph_index_precomp(int idx) const;
 
     void rescale();
@@ -96,7 +96,7 @@ class RNSPoly {
 
     void hoistedRotationFused(std::vector<int> indexes, std::vector<RNSPoly*>& c0, std::vector<RNSPoly*>& c1,
                               const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
-                              const RNSPoly& src_c0, const RNSPoly& src_c1);
+                              const RNSPoly& src_c0, const RNSPoly& src_c1, int y_begin = 0, int y_count = -1);
 
     /** Change the polynomial level only superficially, be very careful as this should only be used for lower
      * level optimizations.
@@ -180,6 +180,11 @@ class RNSPoly {
     void multNoModdownEnd(RNSPoly& c0, const RNSPoly& bc0, const RNSPoly& bc1, const RNSPoly& in, const RNSPoly& aux);
 
     void binomialMult(RNSPoly& c1, RNSPoly& in, const RNSPoly& d0, const RNSPoly& d1, bool moddown, bool square);
+    /// Lever E1: out-of-place (this, c1, in) = (a0, a1) x (d0, d1); this/c1 are (re)sized to a0's level.
+    void binomialMultFrom(RNSPoly& c1, RNSPoly& in, const RNSPoly& a0, const RNSPoly& a1, const RNSPoly& d0,
+                          const RNSPoly& d1, bool square);
+    /// Lever E2: this = src * P with zeroed special limbs (ModUp form), one pass.
+    void copyScaledByP(const RNSPoly& src);
 
     static void multScalarBatchManyToOne(std::vector<RNSPoly*>& polya,
                                          const std::vector<std::vector<unsigned long int>>& vector,
@@ -195,7 +200,7 @@ class RNSPoly {
 
     static void LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                     const std::vector<RNSPoly*>& pt, int bStep, int gStep, int stride, double usage,
-                                    bool ext);
+                                    bool ext, int part = -1, int limb_begin = 0, int limb_count = -1);
     static void fusedHoistedRotateBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                         const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
                                         const std::vector<int>& indexes, int stride, double usage, bool c0_modup);

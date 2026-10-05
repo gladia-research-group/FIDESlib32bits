@@ -25,6 +25,19 @@
 //#include "cooperative_groups/memcpy_async.h"
 namespace cg = cooperative_groups;
 
+// DIAGNOSTIC flag (FIDESLIB_ABLATE_KB, set at Context init): skip the packed key-b loads in fusedDotKSKRegen4_.
+__device__ int g_fides_ablate_kb = 0;
+namespace FIDESlib::CKKS {
+void setAblateKb(int v) {
+    cudaMemcpyToSymbol(g_fides_ablate_kb, &v, sizeof(int));
+}
+int ablateKbEnv() {
+    const char* e = std::getenv("FIDESLIB_ABLATE_KB");
+    return e ? std::atoi(e) : 0;
+}
+}  // namespace FIDESlib::CKKS
+
+#include <cstdlib>
 namespace FIDESlib {
 namespace CKKS {
 __global__ void mult1AddMult23Add4_(const __grid_constant__ int primeid_init, void** l, void** l1, void** l2, void** l3,
@@ -922,9 +935,15 @@ __global__ void fusedDotKSKRegen4_(void** out1, void** sout1, void** out2, void*
         uint32_t kb[5];
         if constexpr (KSK_BITS == 28) {
             const uint32_t bit0 = (uint32_t)base * KSK_BITS;
+            if (g_fides_ablate_kb) {  // DIAGNOSTIC (wrong results): bound of the key-b stream's cost
 #pragma unroll
-            for (int t = 0; t < 5; ++t)
-                kb[t] = FIDESLIB_STREAM_LD((const uint32_t*)kskbp + (bit0 >> 5) + t);
+                for (int t = 0; t < 5; ++t)
+                    kb[t] = 0x01234567u + (uint32_t)i;
+            } else {
+#pragma unroll
+                for (int t = 0; t < 5; ++t)
+                    kb[t] = FIDESLIB_STREAM_LD((const uint32_t*)kskbp + (bit0 >> 5) + t);
+            }
         }
 
         uint32_t ca, cb, cc, cd;
@@ -2954,6 +2973,95 @@ __global__ void binomialMult_(const __grid_constant__ int primeid_init, void** c
 
         T aux2 = modmult<ALGO_BARRETT>(c1in, d1in, primeid);
         ((T*)(c2[blockIdx.y]))[idx] = aux2;
+    }
+}
+
+// Lever E1: out-of-place forms — read the (a0, a1) operand instead of the output ciphertext.
+__global__ void binomialMultFrom_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2, void** a0, void** a1,
+                              void** d0, void** d1) {
+    const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
+    const int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    constexpr ALGO algo = ALGO_BARRETT;
+
+    if (ISU64(primeid)) {
+        using T = uint64_t;
+        T d0in = ((T*)(d0[blockIdx.y]))[idx];
+        T d1in = ((T*)(d1[blockIdx.y]))[idx];
+        T c0in = ((T*)(a0[blockIdx.y]))[idx];
+        T c1in = ((T*)(a1[blockIdx.y]))[idx];
+
+        T aux0 = modmult<ALGO_BARRETT>(c0in, d0in, primeid);
+        ((T*)(c0[blockIdx.y]))[idx] = aux0;
+
+        T aux1 =
+            modadd(modmult<ALGO_BARRETT>(c0in, d1in, primeid), modmult<ALGO_BARRETT>(c1in, d0in, primeid), primeid);
+        ((T*)(c1[blockIdx.y]))[idx] = aux1;
+
+        T aux2 = modmult<ALGO_BARRETT>(c1in, d1in, primeid);
+        ((T*)(c2[blockIdx.y]))[idx] = aux2;
+
+    } else {
+        using T = uint32_t;
+        T d0in = ((T*)(d0[blockIdx.y]))[idx];
+        T d1in = ((T*)(d1[blockIdx.y]))[idx];
+        T c0in = ((T*)(a0[blockIdx.y]))[idx];
+        T c1in = ((T*)(a1[blockIdx.y]))[idx];
+
+        T aux0 = modmult<ALGO_BARRETT>(c0in, d0in, primeid);
+        ((T*)(c0[blockIdx.y]))[idx] = aux0;
+
+        T aux1 =
+            modadd(modmult<ALGO_BARRETT>(c0in, d1in, primeid), modmult<ALGO_BARRETT>(c1in, d0in, primeid), primeid);
+        ((T*)(c1[blockIdx.y]))[idx] = aux1;
+
+        T aux2 = modmult<ALGO_BARRETT>(c1in, d1in, primeid);
+        ((T*)(c2[blockIdx.y]))[idx] = aux2;
+    }
+}
+
+__global__ void binomialSquareFrom_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2, void** a0, void** a1) {
+    const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
+    const int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    constexpr ALGO algo = ALGO_BARRETT;
+
+    if (ISU64(primeid)) {
+        using T = uint64_t;
+        T c0in = ((T*)(a0[blockIdx.y]))[idx];
+        T c1in = ((T*)(a1[blockIdx.y]))[idx];
+
+        T aux0 = modmult<ALGO_BARRETT>(c0in, c0in, primeid);
+        ((T*)(c0[blockIdx.y]))[idx] = aux0;
+
+        T aux1 = modmult<ALGO_BARRETT>(c0in, c1in, primeid);
+        ((T*)(c1[blockIdx.y]))[idx] = modadd(aux1, aux1, primeid);
+
+        T aux2 = modmult<ALGO_BARRETT>(c1in, c1in, primeid);
+        ((T*)(c2[blockIdx.y]))[idx] = aux2;
+
+    } else {
+        using T = uint32_t;
+        T c0in = ((T*)(a0[blockIdx.y]))[idx];
+        T c1in = ((T*)(a1[blockIdx.y]))[idx];
+
+        T aux0 = modmult<ALGO_BARRETT>(c0in, c0in, primeid);
+        ((T*)(c0[blockIdx.y]))[idx] = aux0;
+
+        T aux1 = modmult<ALGO_BARRETT>(c0in, c1in, primeid);
+        ((T*)(c1[blockIdx.y]))[idx] = modadd(aux1, aux1, primeid);
+
+        T aux2 = modmult<ALGO_BARRETT>(c1in, c1in, primeid);
+        ((T*)(c2[blockIdx.y]))[idx] = aux2;
+    }
+}
+
+// Lever E2: dst = src * P in one pass (the identity rotation of a hoisted LT stage used copy + scaleByP).
+__global__ void copyScaleByP_(void** dst, void** src, const int primeid_init) {
+    const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ISU64(primeid)) {
+        ((uint64_t*)dst[blockIdx.y])[idx] = modmult<ALGO_SHOUP>(((const uint64_t*)src[blockIdx.y])[idx], C_.P[primeid], primeid, C_.P_shoup[primeid]);
+    } else {
+        ((uint32_t*)dst[blockIdx.y])[idx] = modmult<ALGO_SHOUP>(((const uint32_t*)src[blockIdx.y])[idx], (uint32_t)C_.P[primeid], primeid, (uint32_t)C_.P_shoup[primeid]);
     }
 }
 

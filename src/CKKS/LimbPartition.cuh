@@ -140,6 +140,11 @@ class LimbPartition {
                             const std::vector<const LimbPartition*>& d1s, bool ext);
     void binomialMult(LimbPartition& c1, LimbPartition& c2, const LimbPartition& d0, const LimbPartition& d1,
                       bool extend_ins, bool square);
+    /// Lever E1: out-of-place (this, c1, c2) = (a0, a1) x (d0, d1) (square: d = a), no P extension.
+    void binomialMultFrom(LimbPartition& c1, LimbPartition& c2, const LimbPartition& a0, const LimbPartition& a1,
+                          const LimbPartition& d0, const LimbPartition& d1, bool square);
+    /// Lever E2: this = src * P (one pass; the identity rotation of a hoisted LT stage).
+    void copyScaledByP(const LimbPartition& src);
     void generateLimbToLevel(int new_level);
 
     enum GENERATION_MODE { AUTOMATIC, SINGLE_BUFFER, DUAL_BUFFER };
@@ -164,7 +169,8 @@ class LimbPartition {
     void modup(LimbPartition& aux_partition);
 
     template <ALGO algo = ALGO_SHOUP>
-    void moddown(LimbPartition& auxLimbs, bool ntt, bool free_special_limbs);
+    /// rescale2: fused ModDown + composite rescale (lever A): also drops the two top Q limbs (caller lowers level by 2).
+    void moddown(LimbPartition& auxLimbs, bool ntt, bool free_special_limbs, bool rescale2 = false);
 
     void rescale();
     /** Fused composite DOUBLE prime drop (bit-identical to two rescale() calls,
@@ -225,6 +231,9 @@ class LimbPartition {
 
     void copyLimb(const LimbPartition& partition);
     void copySpecialLimb(const LimbPartition& p);
+    /// NTT / INTT of the special limbs in place (SmallInt lift); synchronised through `s`.
+    void nttSpecialLimbs();
+    void inttSpecialLimbs();
 
     void generateAllDecompAndDigit(bool iskey, int q_band = -1);
     // Banded key (rotation-key limb pruning): Q-limbs allocated only up to
@@ -311,10 +320,12 @@ class LimbPartition {
     void generateGatherLimb(bool iskey);
     void dotKSKfusedMGPU(LimbPartition& out2, const LimbPartition& digitSrc, const LimbPartition& ksk_a,
                          const LimbPartition& ksk_b, const LimbPartition& src);
+    // y_begin / y_count restrict the launch to a range of the kernel's limb axis (specials
+    // first, then the partition's limbs); y_count < 0 = everything (the default path).
     void fusedHoistRotate(int n, std::vector<int> indexes, std::vector<LimbPartition*>& c0,
                           std::vector<LimbPartition*>& c1, const std::vector<LimbPartition*>& ksk_a,
                           const std::vector<LimbPartition*>& ksk_b, const LimbPartition& src_c0,
-                          const LimbPartition& src_c1, bool c0_modup);
+                          const LimbPartition& src_c1, bool c0_modup, int y_begin = 0, int y_count = -1);
 
     void modup_ksk_moddown_mgpu(LimbPartition& c0, const LimbPartition& ksk_a, const LimbPartition& ksk_b,
                                 LimbPartition& auxLimbs1, LimbPartition& auxLimbs2, const bool moddown,
@@ -347,9 +358,11 @@ class LimbPartition {
     static void addBatchManyToOne(std::vector<LimbPartition*>& parta, const std::vector<LimbPartition*>& partb,
                                   int stride, double usage, bool sub, bool exta, bool extb);
 
+    // part: -1 = regular + special limbs (default), 0 = regular limbs [limb_begin, +limb_count),
+    // 1 = special limbs [limb_begin, +limb_count); limb_count < 0 = all of that part.
     static void LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
                                     const std::vector<LimbPartition*>& pt, int bStep, int gStep, int stride,
-                                    double usage, bool ext);
+                                    double usage, bool ext, int part = -1, int limb_begin = 0, int limb_count = -1);
 
     // acc0 += Σ a0[j]·b0[j]; acc1 += Σ a0[j]·b1[j]+a1[j]·b0[j]; acc2 = Σ a1[j]·b1[j].
     // One binomialMultAccum_ launch per partition (FHE_LANE_BATCH phase 2).

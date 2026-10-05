@@ -11,7 +11,11 @@
 #include <vector>
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/ApproxModEval.cuh"
+#include <cmath>
+#include <iostream>
 #include "CKKS/Bootstrap.cuh"
+#include "CKKS/AksKeys.cuh"
+#include "CKKS/SmallInt.cuh"
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/CoeffsToSlots.cuh"
@@ -292,18 +296,34 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
 
     //////////////////////////////////////////////////////////////////////
     bool sparse_encaps = cc.GetBootPrecomputation(slots).sparse_encaps;
+    bool shiftedFlow = false;  // FIDESLIB_BTS_SHIFT path taken (exact scaling, +d level)
 
     {
-        ModRaise(ctxt, slots, correction, prescaled, sparse_encaps);
+        // Coefficients of the Chebyshev series interpolating 1/(2 Pi) Sin(2 Pi K x)
+        double k = cc.GetBootK();
+        double constantEvalMult = pre * (1.0 / (k * cc.N));
+        constantEvalMult *= cc.getBtsPreScale();
+        // FIDESLIB_BTS_SHIFT: apply it exactly inside the raise (level kept) when the precomputation was built for it
+        const double baked = cc.GetBootPrecomputation(slots).cts0_const;
+        // diagnostic: FIDESLIB_BTS_EXACT_ONLY=1 = exact scaling inside the raise, then an exact LevelReduce to the
+        // standard level, with the standard (unshifted) plaintexts — isolates the scaling step from the +d flow
+        const bool exactOnly = [] { const char* e = std::getenv("FIDESLIB_BTS_EXACT_ONLY"); return e && std::atoi(e) > 0; }();
+        const bool exactConst = exactOnly || (baked != 0 && std::fabs(baked / constantEvalMult - 1.0) < 1e-9);
+        if (baked != 0 && !exactConst)
+            std::cerr << "[bts_shift] WARNING: baked constant " << baked << " != runtime " << constantEvalMult
+                      << " (or sparse slots): falling back to multScalar, the level gain is lost\n";
+        const bool aksOn = exactConst && baked != 0 && cc.GetBootPrecomputation(slots).aks0 != nullptr;
+        ModRaise(ctxt, slots, correction, prescaled, sparse_encaps, exactConst ? constantEvalMult : 0.0, aksOn);
+        shiftedFlow = exactConst && baked != 0 && !aksOn;
+        if (exactOnly && baked == 0 && exactConst)
+            ctxt.dropToLevel(ctxt.getLevel() - cc.compositeDegree());  // standard plaintexts expect L - d
         //------------------------------------------------------------------------------
         // SETTING PARAMETERS FOR APPROXIMATE MODULAR REDUCTION
         //------------------------------------------------------------------------------
 
         // Coefficients of the Chebyshev series interpolating 1/(2 Pi) Sin(2 Pi K x)
-        double k = cc.GetBootK();
 
         // TO-DO: The 1/32 scale will be pre-applied with OpenFHE v1.4, so remove it from here
-        double constantEvalMult = pre * (1.0 / (k * cc.N));
 
         /*
         if (sparse_encaps) {
@@ -313,11 +333,8 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
 
         // Free per-call input pre-scale (Context.cuh btsPreScale): rides the arbitrary
         // double the input is multiplied by anyway. Any restore is the caller's business.
-        constantEvalMult *= cc.getBtsPreScale();
-
-        if constexpr (PRINT)
-            std::cout << "mult: " << constantEvalMult << std::endl;
-        ctxt.multScalar(constantEvalMult, false);
+        if (!exactConst)
+            ctxt.multScalar(constantEvalMult, false);
 
         if constexpr (PRINT) {
             std::cout << "Raise scaled ";
@@ -342,6 +359,39 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
     }
 
     btsStageProbe("pre-CtS", ctxt);
+    if (g_btsStageStash && shiftedFlow && !cc.GetBootPrecomputation(slots).CtS_orig.empty() &&
+        cc.GetBootPrecomputation(slots).cts0_t == 0) {
+        // within-run reference: the same raised ciphertext through the STANDARD flow (level dropped exactly by d,
+        // original plaintexts swapped in); stages probed as R-*
+        auto& pre = cc.GetBootPrecomputation(slots);
+        Ciphertext ref(cc_);
+        ref.copy(ctxt);
+        ref.dropToLevel(ref.getLevel() - cc.compositeDegree());
+        std::swap(pre.CtS, pre.CtS_orig);
+        std::swap(pre.StC, pre.StC_orig);
+        btsStageProbe("R-pre-CtS", ref);
+        EvalCoeffsToSlots(ref, slots, false);
+        btsStageProbe("R-post-CtS", ref);
+        {
+            Ciphertext raux(cc_);
+            raux.conjugate(ref);
+            Ciphertext encI(cc_);
+            encI.sub(ref, raux);
+            ref.add(raux);
+            encI.multMonomial(3 * 2 * cc.N / 4);
+            approxModReduction(ref, encI, cc.GetEvalKey(ref.keyID), scalar);
+        }
+        if (ref.NoiseLevel == 2)
+            ref.rescale();
+        btsStageProbe("R-post-EvalMod", ref);
+        EvalCoeffsToSlots(ref, slots, true);
+        btsStageProbe("R-post-StC", ref);
+        if (const uint64_t cf = (uint64_t)1 << std::llround(correction); cf != 1)
+            multIntScalar(ref, cf);
+        btsStageProbe("R-end", ref);
+        std::swap(pre.CtS, pre.CtS_orig);
+        std::swap(pre.StC, pre.StC_orig);
+    }
     if (isLT) {
         EvalLinearTransform(ctxt, slots, false);
     } else {
@@ -373,8 +423,20 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
         ctxt.rescale();
     }
 
+    btsStageProbe("post-EvalMod", ctxt);
     uint64_t corFactor = (uint64_t)1 << std::llround(correction);
 
+    // A ciphertext above the StC plaintexts' level (FIDESLIB_BTS_SHIFT with FIDESLIB_BTS_SHIFT_STC=0) is dropped to
+    // it first: an exact LevelReduce, instead of the plaintext-above-ciphertext adjust path.
+    if (!isLT && !cc.GetBootPrecomputation(slots).StC.empty()) {
+        const int stcL = cc.GetBootPrecomputation(slots).StC.at(0).A.at(0).c0.getLevel();
+        if (ctxt.getLevel() > stcL) {
+            if (ctxt.NoiseLevel == 2)
+                ctxt.rescale();
+            if (ctxt.getLevel() > stcL)
+                ctxt.dropToLevel(stcL);
+        }
+    }
     btsStageProbe("pre-StC", ctxt);
     if (isLT) {
         EvalLinearTransform(ctxt, slots, true);
@@ -480,7 +542,7 @@ double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {
 }
 
 void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t correction, const bool prescaled,
-                              const bool sparse_encaps) {
+                              const bool sparse_encaps, const double exactScale, const bool aksStage0) {
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     ContextData& cc = ctxt.cc;
     btsStageProbe("MR-entry", ctxt);
@@ -815,8 +877,57 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
     }
 
     btsStageProbe("MR-raised", ctxt);
-    if (sparse_encaps) {
+    // FIDESLIB_BTS_SHIFT: the EvalMod constant as an exact scaling of the small-coefficient ciphertext, before the
+    // encapsulation switch makes the coefficients uniform (CKKS/SmallInt.cuh). Replaces multScalar + rescale.
+    if (exactScale > 0 && !aksStage0) {  // lever 1b: the aggregated stage 0 scales, switches and transforms at once
+        const int tt = cc.GetBootPrecomputation(slots).cts0_t;
+        const double tf = std::ldexp(1.0, tt);
+        const double exactScaleT = exactScale * tf;  // the 2^t rides the scale bookkeeping (stage-0 plaintexts carry 2^-t)
+        if (g_btsStageStash && sparse_encaps && cc.compositeDegree() > 1) {
+            // trace (small-valued => faithful decode): the shipped path and the two scaled-then-switched variants
+            auto& pre = cc.GetBootPrecomputation(slots);
+            {
+                Ciphertext w(ctxt.cc_);
+                w.copy(ctxt);
+                w.keySwitch(*pre.sparse_btoa);
+                w.multScalar(exactScale, false);
+                w.rescale();
+                btsStageProbe("X-std", w);
+            }
+            Ciphertext sc(ctxt.cc_);
+            sc.copy(ctxt);
+            smallIntScalarMultiply(cc, sc, exactScaleT);
+            sc.NoiseFactor *= tf;
+            if (const char* td = std::getenv("BTS_TRACE_DIR")) {  // raw polynomials before/after the exact scaling
+                exactCtPolyDump(ctxt, (std::string(td) + "/P-raw").c_str());
+                exactCtPolyDump(sc, (std::string(td) + "/P-scaled").c_str());
+            }
+            btsStageProbe("X-scaled", sc);
+            {
+                Ciphertext h(ctxt.cc_);
+                h.copy(sc);
+                h.keySwitch(*pre.sparse_btoa);
+                btsStageProbe("X-hyb", h);
+            }
+            if (pre.ghs_btoa) {
+                Ciphertext g(ctxt.cc_);
+                g.copy(sc);
+                ghsSwitchSmall(g, *pre.ghs_btoa);
+                btsStageProbe("X-ghs", g);
+            }
+        }
+        smallIntScalarMultiply(cc, ctxt, exactScaleT);
+        ctxt.NoiseFactor *= tf;
+    }
+    if (sparse_encaps && !aksStage0) {
         if (cc.compositeDegree() > 1) {
+            if (exactScale > 0 && cc.GetBootPrecomputation(slots).ghs_btoa &&
+                [] { const char* e = std::getenv("FIDESLIB_BTS_SHIFT_GHS"); return e && std::atoi(e) > 0; }()) {
+                // default: the library hybrid switch (−0.67 ms vs GHS at t=12; FIDESLIB_BTS_SHIFT_GHS=1 opts in)
+                // The hybrid switch's noise would land undivided on the already-scaled (2^22 smaller) signal; the
+                // GHS switch on the small ciphertext only adds the ModDown rounding (CKKS/AksKeys.cuh).
+                ghsSwitchSmall(ctxt, *cc.GetBootPrecomputation(slots).ghs_btoa);
+            } else
             // COMPOSITESCALING: M-2 back to the dense key, MAIN-context standard hybrid key.
             ctxt.keySwitch(*cc.GetBootPrecomputation(slots).sparse_btoa);
         } else {

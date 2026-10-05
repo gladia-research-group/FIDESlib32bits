@@ -1,6 +1,8 @@
 //
 // Created by carlosad on 2/05/24.
 //
+#include "CKKS/ElemenwiseBatchKernels.cuh"
+#include "NTTtc.cuh"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -930,6 +932,12 @@ void ContextData::PrepareNCCLCommunication() {
             cudaSetDevice(GPUid[j]);
             digitStream2[i][j].init();
         }
+    }
+    for (size_t j = 0; j < GPUid.size(); ++j) {
+        cudaSetDevice(GPUid[j]);
+        FIDESlib::setDiscardScratch(FIDESlib::discardScratchEnv());
+        FIDESlib::CKKS::setAblateKb(FIDESlib::CKKS::ablateKbEnv());
+        FIDESlib::buildTcNttTables(precom.globals->globals[j], GPUid[j]);
     }
 }
 

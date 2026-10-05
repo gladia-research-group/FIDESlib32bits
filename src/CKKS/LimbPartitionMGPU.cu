@@ -10,6 +10,10 @@
 #include "CKKS/Conv.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
 #include "CKKS/LimbPartition.cuh"
+#include "CKKS/Discard.cuh"
+#include "NTTcluster.cuh"
+#include <cstring>
+namespace { inline bool nttClusterOn(const FIDESlib::CKKS::ContextData& cc) { return FIDESlib::nttClusterFlag() && cc.precom.constants[0].type == 0; } }
 #include "PeerUtils.cuh"
 #include "parallel_for.hpp"
 
@@ -535,7 +539,7 @@ void LimbPartition::dotKSKfusedMGPU(LimbPartition& out2, const LimbPartition& di
 void LimbPartition::fusedHoistRotate(int n, std::vector<int> indexes, std::vector<LimbPartition*>& c0,
                                      std::vector<LimbPartition*>& c1, const std::vector<LimbPartition*>& ksk_a,
                                      const std::vector<LimbPartition*>& ksk_b, const LimbPartition& src_c0,
-                                     const LimbPartition& src_c1, bool c0_modup) {
+                                     const LimbPartition& src_c1, bool c0_modup, int y_begin, int y_count) {
     cudaSetDevice(device);
     struct vector_gpu {
         void*** data{nullptr};
@@ -659,12 +663,17 @@ void LimbPartition::fusedHoistRotate(int n, std::vector<int> indexes, std::vecto
         const int kpb = ksk_a.empty() ? 0 : ksk_a[0]->key_pack_bits;
         // REGEN: 16 coefficients per thread => grid.x shrinks by 16 and the digit smem cache
         // is gone (see the kernel header for why it cannot come along).
+        // Limb-range launch (LT chunking): the kernel's limb axis is [specials | partition limbs];
+        // `init` offsets blockIdx.y, so a sub-range is just a smaller grid.y plus the offset.
+        const int y_total = num_special + num_limbs;
+        const int y_n = y_count < 0 ? y_total : std::min(y_count, y_total - y_begin);
+        assert(y_begin >= 0 && y_n > 0 && y_begin + y_n <= y_total);
         launchHoistedRotateDotKSK_2(
-            dim3{(uint32_t)cc.N / (regen ? BLOCK_X * 16 : BLOCK_X), (uint32_t)num_special + num_limbs}, BLOCK_X,
+            dim3{(uint32_t)cc.N / (regen ? BLOCK_X * 16 : BLOCK_X), (uint32_t)y_n}, BLOCK_X,
             regen ? 0 : sizeof(uint64_t) * BLOCK_X * i, s.ptr(), digits.data + offset_c1, src_c0.limbptr.data,
             digits.data + offset_output_c1, digits.data + offset_output_c1s, digits.data + offset_output_c0,
             digits.data + offset_output_c0s, n, (int*)(digits.data + offset_indexes), digits.data, i, id, num_special,
-            0, src_c0.SPECIALlimbptr.data, c0_modup, kpb,
+            y_begin, src_c0.SPECIALlimbptr.data, c0_modup, kpb,
             regen ? (const uint32_t*)(digits.data + offset_seeds) : nullptr, (uint32_t)cc.N >> 4,
             cc.precom.constants[0].type);
 
@@ -1291,6 +1300,10 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 if (size > 0) {
+                    if (nttClusterOn(cc)) {
+                        launchNTTcluster(getGlobals(), false, DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data, (int)size,
+                                         stream1.ptr());
+                    } else {
                     NTT_<false, algo, NTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst,
                                                   bytesFirst, stream1.ptr()>>>(
                         getGlobals(), DIGITlimbptr[d_].data, DIGIT(d_, 0), c0.DIGITlimbptr[d_].data);
@@ -1298,6 +1311,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                     NTT_<true, algo, NTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond,
                                                  bytesSecond, stream1.ptr()>>>(
                         getGlobals(), c0.DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data);
+                    }
 
                 }
             }
@@ -1826,8 +1840,13 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                     NTT_<false, algo, NTT_MODDOWN>
                         <<<dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst,
                            stream.ptr()>>>(getGlobals(), auxLimbs.limbptr.data, PARTITION(id, 0), out.auxptr.data);
+                    if (discardD2Flag())
+                        discardLimbTable(auxLimbs.limbptr.data, limb_size,
+                                         (size_t)cc.N * (cc.precom.constants[0].type == 0 ? 4 : 8), stream.ptr());
 
                     stream.wait(cc.digitStream2.at(0).at(id));
+                    if (i == 0 && discardD2Flag())
+                        discardDigitLimbs(*this, stream.ptr());  // the key-switch dot is done with the digits
 
                     NTT_<true, algo, NTT_MODDOWN>
                         <<<dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond, bytesSecond,
@@ -1853,6 +1872,8 @@ void LimbPartition::modup_ksk_moddown_mgpu(
         }
     } else {
         s.wait(cc.digitStream2.at(0).at(id));
+        if (discardD2Flag())
+            discardDigitLimbs(*this, s.ptr());
     }
     if (PRINT) {
         std::cout << "Going out keyswitch" << std::endl;
@@ -2032,6 +2053,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
     auto exec_old = map_exec.find(*level);
 
     cudaSetDevice(device);
+    const bool modup_merge = modupMergeFlag();  // lever B1 (declared up here: gotos below)
     constexpr bool PRINT = false;
     bool SELECT = id == 1;
     LimbPartition& c1 = *this;
@@ -2139,6 +2161,28 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             << std::endl;
     if constexpr (PRINT)
         std::cout << "GPU " << id << "compute " << num_d << " digits" << std::endl;
+    // Lever B1 (FIDESLIB_MODUP_MERGE): one INTT over every limb on s instead of a 9-limb launch per digit
+    // (288 blocks on 188 SMs ran at ~15 % warps active). The per-digit streams wait on s below anyway.
+    if (modup_merge && limb_size > 0) {
+        constexpr ALGO algo = ALGO_SHOUP;
+        const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;
+        dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
+        dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
+        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int gather_offset = 0;
+        for (int i = 0; i < id; ++i)
+            gather_offset += cc.meta.at(i).size();
+        if (nttClusterOn(cc)) {
+            launchNTTcluster(getGlobals(), true, limbptr.data, PARTITION(id, 0), GATHERptr.data + gather_offset, (int)limb_size, s.ptr());
+        } else {
+        INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst,
+                                        s.ptr()>>>(getGlobals(), limbptr.data, PARTITION(id, 0), auxptr.data);
+        INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond,
+                                       bytesSecond, s.ptr()>>>(getGlobals(), auxptr.data, PARTITION(id, 0),
+                                                               GATHERptr.data + gather_offset);
+        }
+    }
     for (int d = 0; d < num_d; d += digits_per_it) {
         int ds = std::min(num_d - d, digits_per_it);
         uint32_t start_d = 0;
@@ -2156,7 +2200,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
         stream.wait(s);
         if constexpr (PRINT)
             std::cout << "/** Intt */" << std::endl;
-        if (size_d > 0) {
+        if (size_d > 0 && !modup_merge) {
             constexpr ALGO algo = ALGO_SHOUP;
             const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
@@ -2167,6 +2211,10 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             for (int i = 0; i < id; ++i) {
                 gather_offset += cc.meta.at(i).size();
             }
+            if (nttClusterOn(cc)) {
+                launchNTTcluster(getGlobals(), true, limbptr.data + start_d, PARTITION(id, start_d),
+                                 GATHERptr.data + gather_offset + start_d, (int)size_d, stream.ptr());
+            } else {
             INTT_<false, algo, INTT_NONE>
                 <<<dim3{cc.N / (blockDimFirst.x * M * 2), size_d}, blockDimFirst, bytesFirst, stream.ptr()>>>(
                     getGlobals(), limbptr.data + start_d, PARTITION(id, start_d), auxptr.data + start_d);
@@ -2174,6 +2222,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                 <<<dim3{cc.N / (blockDimSecond.x * M * 2), size_d}, blockDimSecond, bytesSecond, stream.ptr()>>>(
                     getGlobals(), auxptr.data + start_d, PARTITION(id, start_d),
                     GATHERptr.data + gather_offset + start_d);
+            }
 
         }
         if constexpr (PRINT) {
@@ -2358,6 +2407,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             cudaDeviceSynchronize();
         }
     }
+    if (modup_merge < 2) {
     for (int d = 0; d < num_d; d += digits_per_it) {
         int ds = std::min(num_d - d, digits_per_it);
         uint32_t start_d = 0;
@@ -2412,16 +2462,101 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
                 int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
                 int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                if (size > 0) {
+                if (size > 0 && !modup_merge) {  // merged: the regular-limb launch below covers the specials
+                    if (nttClusterOn(cc)) {
+                        launchNTTcluster(getGlobals(), false, DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data, (int)size,
+                                         stream1.ptr());
+                    } else {
                     NTT_<false, algo, NTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst,
                                                   bytesFirst, stream1.ptr()>>>(
                         getGlobals(), DIGITlimbptr[d_].data, DIGIT(d_, 0), c0.DIGITlimbptr[d_].data);
                     NTT_<true, algo, NTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond,
                                                  bytesSecond, stream1.ptr()>>>(
                         getGlobals(), c0.DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data);
+                    }
 
                 }
             }
+        }
+    }
+    } else {
+        // Lever B1-2: ONE base conversion over every digit and ONE NTT pair over every digit's limbs
+        // (table of num_d*MAXP rows with nullptr holes), all on s: 5 well-filled launches instead of
+        // ~6 x (1 + 2 + 2) launches at 0.15-0.45 waves/SM. The per-digit stream pipelining is given up.
+        const int ndig = num_d;
+        const int limbs_total = *level + 1;
+        std::vector<void*> h_a(ndig), h_b(ndig);
+        std::vector<int> h_d(ndig);
+        int max_size = 0;
+        for (int k = 0; k < ndig; ++k) {
+            int start = 0;
+            for (int j = 0; j < k; ++j)
+                start += DECOMPlimb.at(j).size();
+            const int size = std::min((int)DECOMPlimb.at(k).size(), limbs_total - start);
+            if (size <= 0) {
+                std::cerr << "void modup, aborting" << std::endl;
+                exit(-1);
+            }
+            max_size = std::max(max_size, size);
+            h_a[k] = (void*)DECOMPlimbptr[k].data;
+            h_b[k] = (void*)DIGITlimbptr[k].data;
+            h_d[k] = digitid[k];
+        }
+        std::vector<void*> h_dat((size_t)ndig * MAXP, nullptr), h_aux((size_t)ndig * MAXP, nullptr);
+        for (int k = 0; k < ndig; ++k) {
+            const int cnt = cc.precom.constants[id].num_primeid_digit_to[k][*level];
+            for (int j = 0; j < cnt; ++j) {
+                auto& l = DIGITlimb[k][j];
+                auto& la = c0.DIGITlimb[k][j];
+                h_dat[(size_t)k * MAXP + j] = (l.index() == U32) ? (void*)std::get<U32>(l).v.data : (void*)std::get<U64>(l).v.data;
+                h_aux[(size_t)k * MAXP + j] = (la.index() == U32) ? (void*)std::get<U32>(la).v.data : (void*)std::get<U64>(la).v.data;
+            }
+        }
+        // one staging buffer: [a tabs][b tabs][dat rows][aux rows][dids]
+        const size_t nptr = 2 * (size_t)ndig + 2 * (size_t)ndig * MAXP;
+        const size_t bytes = nptr * sizeof(void*) + (size_t)ndig * sizeof(int);
+        std::vector<char> h(bytes);
+        memcpy(h.data(), h_a.data(), ndig * sizeof(void*));
+        memcpy(h.data() + ndig * sizeof(void*), h_b.data(), ndig * sizeof(void*));
+        memcpy(h.data() + 2 * ndig * sizeof(void*), h_dat.data(), h_dat.size() * sizeof(void*));
+        memcpy(h.data() + (2 * ndig + h_dat.size()) * sizeof(void*), h_aux.data(), h_aux.size() * sizeof(void*));
+        memcpy(h.data() + nptr * sizeof(void*), h_d.data(), ndig * sizeof(int));
+        char* dbuf = nullptr;
+        cudaMallocAsync((void**)&dbuf, bytes, s.ptr());
+        cudaMemcpyAsync(dbuf, h.data(), bytes, cudaMemcpyHostToDevice, s.ptr());
+        void*** d_a = (void***)dbuf;
+        void*** d_b = d_a + ndig;
+        void** d_dat = (void**)(d_b + ndig);
+        void** d_aux = d_dat + h_dat.size();
+        const int* d_d = (const int*)(dbuf + nptr * sizeof(void*));
+        {
+            dim3 blockSize{64, 2};
+            dim3 gridSize{(uint32_t)cc.N / blockSize.x, (uint32_t)ndig};
+            const int shared_bytes = sizeof(uint64_t) * max_size * blockSize.x;
+            DecompAndModUpConvMulti<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(d_a, limbs_total, d_b,
+                                                                                               d_d, getGlobals());
+        }
+        {
+            constexpr ALGO algo = ALGO_SHOUP;
+            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;
+            dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
+            dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
+            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            const uint32_t rows = (uint32_t)ndig * MAXP;
+            if (nttClusterOn(cc)) {
+                launchNTTcluster(getGlobals(), false, d_dat, DIGIT(0, 0), d_dat, (int)rows, s.ptr());
+            } else {
+            NTT_<false, algo, NTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), rows}, blockDimFirst, bytesFirst,
+                                          s.ptr()>>>(getGlobals(), d_dat, DIGIT(0, 0), d_aux);
+            NTT_<true, algo, NTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), rows}, blockDimSecond, bytesSecond,
+                                         s.ptr()>>>(getGlobals(), d_aux, DIGIT(0, 0), d_dat);
+            }
+        }
+        cudaFreeAsync(dbuf, s.ptr());
+        for (int d = 0; d < ndig; ++d) {
+            cc.digitStream.at(d).at(id).wait(s);
+            cc.digitStream2.at(d).at(id).wait(s);
         }
     }
     for (int d = 0; d < num_d; ++d) {
@@ -2447,8 +2582,8 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
         std::cout << "/** We delay the call of NTTs post-modup for non special limbs to here*/" << std::endl;
     for (int d = 0; d < num_d; ++d) {
         Stream& stream = cc.digitStream2.at(d).at(id);
-        if (limb_size > 0) {
-            uint32_t start = cc.splitSpecialMeta.at(id).size();
+        if (limb_size > 0 && modup_merge < 2) {  // level 2 did every digit above
+            uint32_t start = modup_merge ? 0 : cc.splitSpecialMeta.at(id).size();  // merged: specials too
             uint32_t size = cc.precom.constants[id].num_primeid_digit_to[d][*level] - start;
             if (size > 0) {
                 constexpr ALGO algo = ALGO_SHOUP;
@@ -2457,6 +2592,10 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
                 int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
                 int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                if (nttClusterOn(cc)) {
+                    launchNTTcluster(getGlobals(), false, DIGITlimbptr[d].data + start, DIGIT(d, start), DIGITlimbptr[d].data + start,
+                                     (int)size, stream.ptr());
+                } else {
                 NTT_<false, algo, NTT_NONE>
                     <<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst, bytesFirst, stream.ptr()>>>(
                         getGlobals(), DIGITlimbptr[d].data + start, DIGIT(d, start),
@@ -2465,6 +2604,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                     <<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond, bytesSecond, stream.ptr()>>>(
                         getGlobals(), c0.DIGITlimbptr[d].data + start, DIGIT(d, start),
                         DIGITlimbptr[d].data + start);
+                }
 
             }
             s.wait(stream);

@@ -14,6 +14,8 @@
 #include "CKKS/Conv.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
 #include "CKKS/LimbPartition.cuh"
+#include "CKKS/Discard.cuh"
+#include "NTTcluster.cuh"
 #include "LimbUtils.cuh"
 #include "NTT.cuh"
 #include "Rotation.cuh"
@@ -609,6 +611,14 @@ void LimbPartition::generateSpecialLimb(const bool zero_out, const bool for_comm
         } else {
             assert(bufferSPECIAL == nullptr);
             bufferSPECIALbytes = cc.N * SPECIALmeta.size() * 2 * sizeof(uint64_t);
+            // GPUmalloc only pools power-of-two sizes; anything else goes to cudaMallocAsync on the
+            // legacy stream, which serialises the device (measured: 46 of them per bootstrap once the
+            // fused ModDown+rescale allocates specials per relin). Round up so the buffer is pooled.
+            {
+                size_t p2 = 1;
+                while (p2 < bufferSPECIALbytes) p2 <<= 1;
+                bufferSPECIALbytes = p2;
+            }
             bufferSPECIALcudaMalloc = false;
             bufferSPECIAL = (uint64_t*)GPUmalloc(device, (int)bufferSPECIALbytes, s.ptr());
             CudaCheckErrorModNoSync;
@@ -654,20 +664,27 @@ void LimbPartition::ApplyNTT(int batch, LimbPartition::NTT_fusion_fields fields,
     // (size = limbsize - 2); stage-1 dat = limbptr + size, so the kernel sees dat[0] = the qb
     // limb and dat[1] = the qa top (both coeff domain); primeid_rescale = the TOP prime (qa).
     const int size = (limbsize != -1 ? limbsize : limb.size()) -
-                     (mode == NTT_RESCALE || mode == NTT_MULTPT) - 2 * (mode == NTT_RESCALE2);
+                     (mode == NTT_RESCALE || mode == NTT_MULTPT) - 2 * (mode == NTT_RESCALE2 || mode == NTT_MODDOWNR);
 
     for (int i = 0; i < size; i += batch) {
         uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(size - i));
 
+        if constexpr (mode == NTT_NONE && algo == ALGO_SHOUP) {
+            if (nttClusterFlag() && cc.precom.constants[0].type == 0) {  // single-pass cluster NTT (NTTcluster.cu)
+                launchNTTcluster(getGlobals(), false, limbptr.data + i, primeid_init + i, limbptr.data + i, (int)num_limbs,
+                                 STREAM(limb.at(i)).ptr());
+                continue;
+            }
+        }
         NTT_<false, algo, mode><<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
                                   STREAM(limb.at(i)).ptr()>>>(
             getGlobals(),
             (mode == NTT_RESCALE || mode == NTT_MULTPT || mode == NTT_RESCALE2) ? limbptr.data + size
-            : (mode == NTT_MODDOWN)                                             ? fields.op2->limbptr.data + i
+            : (mode == NTT_MODDOWN || mode == NTT_MODDOWNR)                     ? fields.op2->limbptr.data + i
                                                                                 : limbptr.data + i,
             primeid_init + i, auxptr.data + i, nullptr,
             (mode == NTT_RESCALE || mode == NTT_MULTPT) ? PRIMEID(limb[size])
-            : (mode == NTT_RESCALE2)                    ? PRIMEID(limb[size + 1])
+            : (mode == NTT_RESCALE2 || mode == NTT_MODDOWNR) ? PRIMEID(limb[size + 1])
                                                         : 0,
             nullptr, nullptr);
 
@@ -676,7 +693,7 @@ void LimbPartition::ApplyNTT(int batch, LimbPartition::NTT_fusion_fields fields,
             getGlobals(), auxptr.data + i, primeid_init + i, limbptr.data + i,
             mode == NTT_MULTPT ? fields.pt->limbptr.data + i : nullptr,
             (mode == NTT_RESCALE || mode == NTT_MULTPT) ? PRIMEID(limb[size])
-            : (mode == NTT_RESCALE2)                    ? PRIMEID(limb[size + 1])
+            : (mode == NTT_RESCALE2 || mode == NTT_MODDOWNR) ? PRIMEID(limb[size + 1])
                                                         : 0,
             nullptr, nullptr);
     }
@@ -725,6 +742,13 @@ void LimbPartition::ApplyINTT(int batch, LimbPartition::INTT_fusion_fields field
     for (int i = 0; i < limbsize; i += batch) {
         uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(limbsize - i));
 
+        if constexpr (algo == ALGO_SHOUP) {
+            if (nttClusterFlag() && cc.precom.constants[0].type == 0) {  // single-pass cluster INTT (NTTcluster.cu)
+                launchNTTcluster(getGlobals(), true, limbptr.data + i, primeid_init + i, limbptr.data + i, (int)num_limbs,
+                                 STREAM(limb.at(i)).ptr());
+                continue;
+            }
+        }
         INTT_<false, algo, INTT_NONE>
             <<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
                STREAM(limb.at(i)).ptr()>>>(getGlobals(), limbptr.data + i, primeid_init + i, auxptr.data + i);
@@ -2412,7 +2436,7 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
 }
 
 template <ALGO algo>
-void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special_limbs) {
+void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special_limbs, bool rescale2) {
     assert(SPECIALlimb.size() == SPECIALmeta.size());
     const int limbsize = *level + 1;
     cudaSetDevice(device);
@@ -2453,8 +2477,27 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (SPECIALlimb.size()) * blockSize.x;
 
+            if (rescale2) {
+                // Lever A: INTT the two top Q limbs in place (as rescale2 does), then ONE conversion from
+                // P u {q_b, q_a} to the limbs below q_b. NTT_MODDOWNR below multiplies by (P q_a q_b)^-1.
+                assert(limbsize >= 3 && cc.precom.constants[0].type == 0 && algo == ALGO_SHOUP);
+                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;
+                dim3 bdF{(uint32_t)(1 << ((cc.logN) / 2 - 1))}, bdS{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
+                int bF = (32 / M) * bdF.x * (2 * M + 1 + 1), bS = (32 / M) * bdS.x * (2 * M + 1 + 1);
+                INTT_<false, ALGO_SHOUP, INTT_NONE><<<dim3{cc.N / (bdF.x * M * 2), 2}, bdF, bF, s.ptr()>>>(
+                    getGlobals(), limbptr.data + limbsize - 2, PARTITION(id, limbsize - 2), auxptr.data + limbsize - 2);
+                INTT_<true, ALGO_SHOUP, INTT_NONE><<<dim3{cc.N / (bdS.x * M * 2), 2}, bdS, bS, s.ptr()>>>(
+                    getGlobals(), auxptr.data + limbsize - 2, PARTITION(id, limbsize - 2), limbptr.data + limbsize - 2);
+                const int nb = (int)SPECIALlimb.size() + 2;
+                ModDownRescale2<<<gridSize, blockSize, sizeof(uint32_t) * nb * blockSize.x, s.ptr()>>>(
+                    auxLimbs.limbptr.data, limbsize - 2, SPECIALlimbptr.data, limbptr.data + limbsize - 2,
+                    PRIMEID(limb[limbsize - 1]), PARTITION(id, 0), getGlobals());
+            } else {
             ModDown2<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
                 auxLimbs.limbptr.data, limbsize, SPECIALlimbptr.data, PARTITION(id, 0), getGlobals());
+            }
+            if (discardD2Flag())
+                discardSpecialLimbs(*this, s.ptr());  // the P limbs were consumed by ModDown2
         }
 
         if constexpr (PRINT) {
@@ -2467,8 +2510,12 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
         for (int i = 0; i < limbsize; i += cc.batch) {
             STREAM(limb.at(i)).wait(s);
         }
-        if (limbsize > 0)
-            NTT<algo, NTT_MODDOWN>(cc.batch, false, NTT_fusion_fields{.op2 = &auxLimbs});
+        if (limbsize > 0) {
+            if (rescale2)
+                NTT<algo, NTT_MODDOWNR>(cc.batch, false, NTT_fusion_fields{.op2 = &auxLimbs});
+            else
+                NTT<algo, NTT_MODDOWN>(cc.batch, false, NTT_fusion_fields{.op2 = &auxLimbs});
+        }
 
 
         if constexpr (PRINT) {
@@ -2481,6 +2528,10 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
         for (int i = 0; i < limbsize; i += cc.batch) {
             s.wait(STREAM(limb.at(i)));
         }
+        // the ModDown2 scratch was consumed by NTT_MODDOWN's first pass
+        if (discardD2Flag())
+            discardLimbTable(auxLimbs.limbptr.data, limbsize,
+                             (size_t)cc.N * (cc.precom.constants[0].type == 0 ? 4 : 8), s.ptr());
     }
     auxLimbs.getS().wait(s);
 
@@ -2490,7 +2541,7 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
 }
 
 #define YY(algo) \
-    template void LimbPartition::moddown<algo>(LimbPartition & auxLimbs, bool ntt, bool free_special_limbs);
+    template void LimbPartition::moddown<algo>(LimbPartition & auxLimbs, bool ntt, bool free_special_limbs, bool rescale2);
 #include "ntt_types.inc"
 
 #undef YY
@@ -3243,6 +3294,79 @@ void LimbPartition::binomialMult(LimbPartition& c1, LimbPartition& c2, const Lim
         d0.getS().wait(s);
         d1.getS().wait(s);
     }
+}
+
+void LimbPartition::binomialMultFrom(LimbPartition& c1, LimbPartition& c2, const LimbPartition& a0,
+                                     const LimbPartition& a1, const LimbPartition& d0, const LimbPartition& d1,
+                                     bool square) {
+    const int limbsize = getLimbSize(*level);
+    cudaSetDevice(device);
+    s.wait(c1.getS());
+    s.wait(c2.getS());
+    s.wait(a0.getS());
+    s.wait(a1.getS());
+    if (!square) {
+        s.wait(d0.getS());
+        s.wait(d1.getS());
+    }
+    for (size_t i = 0; i < limbsize; i += cc.batch) {
+        STREAM(limb[i]).wait(s);
+        int size = std::min((int)limbsize - (int)i, cc.batch);
+        if (!square) {
+            binomialMultFrom_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)size}, 128, 0, STREAM(limb[i]).ptr()>>>(
+                PARTITION(id, i), this->limbptr.data + i, c1.limbptr.data + i, c2.limbptr.data + i, a0.limbptr.data + i,
+                a1.limbptr.data + i, d0.limbptr.data + i, d1.limbptr.data + i);
+        } else {
+            binomialSquareFrom_<<<dim3{(uint32_t)cc.N / 128, (uint32_t)size}, 128, 0, STREAM(limb[i]).ptr()>>>(
+                PARTITION(id, i), this->limbptr.data + i, c1.limbptr.data + i, c2.limbptr.data + i, a0.limbptr.data + i,
+                a1.limbptr.data + i);
+        }
+    }
+    for (size_t i = 0; i < limbsize; i += cc.batch)
+        s.wait(STREAM(limb[i]));
+    c1.getS().wait(s);
+    c2.getS().wait(s);
+    a0.getS().wait(s);
+    a1.getS().wait(s);
+    if (!square) {
+        d0.getS().wait(s);
+        d1.getS().wait(s);
+    }
+}
+
+void LimbPartition::copyScaledByP(const LimbPartition& src) {
+    const int limbsize = getLimbSize(*level);
+    cudaSetDevice(device);
+    s.wait(src.getS());
+    for (int i = 0; i < limbsize; i += cc.batch) {
+        STREAM(limb[i]).wait(s);
+        uint32_t num_limbs = std::min((int)limbsize - i, cc.batch);
+        copyScaleByP_<<<dim3{(uint32_t)cc.N / 128, num_limbs}, 128, 0, STREAM(limb[i]).ptr()>>>(
+            limbptr.data + i, src.limbptr.data + i, PARTITION(id, i));
+    }
+    for (int i = 0; i < limbsize; i += cc.batch)
+        s.wait(STREAM(limb[i]));
+    src.getS().wait(s);
+}
+
+void LimbPartition::nttSpecialLimbs() {
+    cudaSetDevice(device);
+    for (size_t i = 0; i < SPECIALlimb.size(); i += cc.batch)
+        STREAM(SPECIALlimb[i]).wait(s);
+    ApplyNTT<ALGO_SHOUP, NTT_NONE>(cc.batch, NTT_fusion_fields{}, SPECIALlimb, SPECIALlimbptr, SPECIALauxptr, cc,
+                                   SPECIAL(id, 0), SPECIALlimb.size());
+    for (size_t i = 0; i < SPECIALlimb.size(); i += cc.batch)
+        s.wait(STREAM(SPECIALlimb[i]));
+}
+
+void LimbPartition::inttSpecialLimbs() {
+    cudaSetDevice(device);
+    for (size_t i = 0; i < SPECIALlimb.size(); i += cc.batch)
+        STREAM(SPECIALlimb[i]).wait(s);
+    ApplyINTT<ALGO_SHOUP, INTT_NONE>(cc.batch, INTT_fusion_fields{}, SPECIALlimb, SPECIALlimbptr, SPECIALauxptr, cc,
+                                     SPECIAL(id, 0), SPECIALlimb.size());
+    for (size_t i = 0; i < SPECIALlimb.size(); i += cc.batch)
+        s.wait(STREAM(SPECIALlimb[i]));
 }
 
 void LimbPartition::generateGatherLimb(bool iskey) {
