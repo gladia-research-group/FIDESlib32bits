@@ -437,6 +437,26 @@ __device__ __forceinline__ void moddown_fusion(char* buffer, const int logBD, co
     }
 }
 
+// Fused ModDown + composite rescale second pass (lever A): (x_j - conv_j) * B_a^{-1}, `top` = a.
+template <typename T, ALGO algo, int M>
+__device__ __forceinline__ void moddownr_fusion(char* buffer, const int logBD, const int j, const int primeid,
+                                                const int top, const T* res, const Global::Globals* Globals) {
+    const T binv = (T)G_->FMD_Binv[top * MAXP + primeid];
+    const T binv_sh = (T)G_->FMD_Binv_shoup[top * MAXP + primeid];
+    for (int i = 0; i < M; i += 1) {
+        T* A = (T*)(buffer + (i << (logBD)));
+        const int jS = swz_pos<T>(i, j);
+        T in[2] = {res[OFFSET_T(i)], res[OFFSET_T(i) | 1]};
+        if constexpr (algo != ALGO_SHOUP) {
+            A[jS] = modmult<algo>(modsub(in[0], A[jS], primeid), binv, primeid);
+            A[jS ^ 1] = modmult<algo>(modsub(in[1], A[jS ^ 1], primeid), binv, primeid);
+        } else {
+            A[jS] = modmult<algo>(modsub(in[0], A[jS], primeid), binv, primeid, binv_sh);
+            A[jS ^ 1] = modmult<algo>(modsub(in[1], A[jS ^ 1], primeid), binv, primeid, binv_sh);
+        }
+    }
+}
+
 template <typename T, ALGO algo_, int M>
 __device__ __forceinline__ void multpt_fusion(char* buffer, const int logBD, const int j, const int primeid,
                                               const int primeid_rescale, const T* res, const T* pt,

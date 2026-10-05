@@ -28,7 +28,7 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled = false);
 int BootstrapPrecapture(Context& cc);
 double GetPreScaleFactor(Context& cc, int slots);
 void ModRaise(Ciphertext& ctxt, const int slots, const uint32_t correction, const bool prescaled = false,
-              bool sparse_encaps = false);
+              const bool sparse_encaps = false, const double exactScale = 0.0, const bool aksStage0 = false);
 }  // namespace FIDESlib::CKKS
 
 #endif  //GPUCKKS_BOOTSTRAP_CUH

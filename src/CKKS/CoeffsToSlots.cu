@@ -1,3 +1,4 @@
+#include <cmath>
 //
 // Created by carlosad on 27/11/24.
 //
@@ -6,6 +7,8 @@
 #include <vector>
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
+#include "CKKS/AksKeys.cuh"
+#include "CKKS/SmallInt.cuh"
 #include "CKKS/Bootstrap.cuh"
 #include "CKKS/CoeffsToSlots.cuh"
 #include "CKKS/Context.cuh"
@@ -197,6 +200,37 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
                 std::move(c));
         }
         ++steps;
+        if (!decode && steps == 1 && cc.GetBootPrecomputation(slots).aks0) {
+            auto& pre = cc.GetBootPrecomputation(slots);
+            std::unique_ptr<Ciphertext> ref;
+            if (g_btsStageStash) {  // reference: lever-1a path (exact scale, hybrid switch) + the standard stage 0
+                ref = std::make_unique<Ciphertext>(ctxt.cc_);
+                ref->copy(ctxt);
+                const double tf = std::ldexp(1.0, pre.cts0_t);
+                smallIntScalarMultiply(cc, *ref, pre.cts0_const * tf);
+                ref->NoiseFactor *= tf;
+                ref->keySwitch(*pre.sparse_btoa);
+                auto c0 = std::make_shared<Ciphertext>(ctxt.cc_);
+                c0->copy(*ref);
+                g_btsStageStash->emplace_back("AKS-ref-switched", std::move(c0));
+            }
+            LinearTransformAKS(ctxt, step, *pre.aks0);  // CKKS/AksKeys.cuh
+            if (ref) {
+                std::vector<Plaintext*> Aptr(step.slots, nullptr);
+                for (int j = 0; j < step.gStep; ++j)
+                    for (int i = 0; i < step.bStep; ++i)
+                        if (step.bStep * j + i < step.slots)
+                            Aptr[step.bStep * j + i] = &(step.A[step.bStep * j + i]);
+                const int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
+                LinearTransform(*ref, step.slots, step.bStep, Aptr, stride, step.rotOut[0]);
+                cudaDeviceSynchronize();
+                auto c = std::make_shared<Ciphertext>(ctxt.cc_);
+                c->copy(ctxt);
+                g_btsStageStash->emplace_back("AKS-out", std::move(c));
+                g_btsStageStash->emplace_back("AKS-ref", std::shared_ptr<Ciphertext>(std::move(ref)));
+            }
+            continue;
+        }
         // computes the NTTs for each CRT limb (for the hoisted automorphisms used later on)
 
         if constexpr (AFFINE_LT && BATCHED) {

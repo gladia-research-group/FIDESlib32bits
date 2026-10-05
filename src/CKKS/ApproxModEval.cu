@@ -2,6 +2,7 @@
 // Created by carlosad on 12/11/24.
 //
 
+#include "CKKS/Discard.cuh"  // fusedRescaleFlag (lever A)
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
@@ -577,10 +578,10 @@ const std::vector<double>& coefficients, double a, double b) const {
 			// compute T_{2i+1}(y) = 2*T_i(y)*T_{i+1}(y) - y
 			T[i / 2]->adjustForMult(*T[i / 2 - 1]);
 			T[i / 2 - 1]->adjustForMult(*T[i / 2]);
-			T[i - 1]->mult(*T[i / 2 - 1], *T[i / 2], false);
+			T[i - 1]->mult(*T[i / 2 - 1], *T[i / 2], fusedRescaleFlag() != 0);
 			T[i - 1]->add(*T[i - 1]);
 			ctxt.adjustForAddOrSub(*T[i - 1]);
-			if (ctxt.NoiseLevel == 1)
+			if (ctxt.NoiseLevel == 1 && T[i - 1]->NoiseLevel == 2)
 				T[i - 1]->rescale();
 			T[i - 1]->sub(ctxt);
 			// if (ctxt.NoiseLevel == 2)
@@ -589,7 +590,7 @@ const std::vector<double>& coefficients, double a, double b) const {
 			// i is even
 			// compute T_{2i}(y) = 2*T_i(y)^2 - 1
 			T[i / 2 - 1]->adjustForMult(*T[i / 2 - 1]);
-			T[i - 1]->square(*T[i / 2 - 1], false);
+			T[i - 1]->square(*T[i / 2 - 1], fusedRescaleFlag() != 0);
 			T[i - 1]->add(*T[i - 1]);
 			T[i - 1]->addScalar(-1.0);
 			// T[i - 1]->rescale();
@@ -691,7 +692,7 @@ const std::vector<double>& coefficients, double a, double b) const {
 	for (uint32_t i = 1; i < m; i++) {
 		if (cc.rescaleTechnique == FIXEDMANUAL && T2[i - 1]->NoiseLevel == 2)
 			T2[i - 1]->rescale();
-		T2[i]->square(*T2[i - 1], false);
+		T2[i]->square(*T2[i - 1], fusedRescaleFlag() != 0);
 		T2[i]->add(*T2[i]);
 		T2[i]->addScalar(-1.0);
 
@@ -741,14 +742,14 @@ const std::vector<double>& coefficients, double a, double b) const {
 
 	for (uint32_t i = 1; i < m; i++) {
 		// compute T_{k(2*m - 1)} = 2*T_{k(2^{m-1}-1)}(y)*T_{k*2^{m-1}}(y) - T_k(y)
-		T2km1.mult(*T2[i], false);
+		T2km1.mult(*T2[i], fusedRescaleFlag() != 0);
 		T2km1.add(T2km1);
 		// T2km1.rescale();
 		T2[0]->adjustForAddOrSub(T2km1);
-		if (T2[0]->NoiseLevel == 1)
+		if (T2[0]->NoiseLevel == 1 && T2km1.NoiseLevel == 2)
 			T2km1.rescale();
 		T2km1.sub(*T2[0]);
-		if (T2[0]->NoiseLevel == 2 && i < m - 1)
+		if (T2[0]->NoiseLevel == 2 && i < m - 1 && T2km1.NoiseLevel == 2)
 			T2km1.rescale();
 
 		if constexpr (sync)
@@ -855,7 +856,7 @@ void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey
 	for (int32_t j = 1; j < r + 1; j++) {
 		if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
 			ctxt.rescale();
-		ctxt.square(false);
+		ctxt.square(fusedRescaleFlag() != 0);
 		if (FIDESlib::CKKS::g_btsStageStash) {
 			cudaDeviceSynchronize();
 			auto c = std::make_shared<FIDESlib::CKKS::Ciphertext>(ctxt.cc_);

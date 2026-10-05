@@ -10,6 +10,7 @@
 //#define NCCL
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #include <execinfo.h>
 #include <functional>
 #include <map>
@@ -26,13 +27,30 @@ int GetTargetThreads(int id);
 
 enum NVTX_CATEGORIES { NONE, LIFETIME, FUNCTION };
 
-// NVTX instrumentation was removed; these are inert no-ops kept so call sites compile unchanged.
-inline void CudaNvtxStart(const std::string&, NVTX_CATEGORIES = FUNCTION, int = 0) {}
-inline void CudaNvtxStop(const std::string& = "", NVTX_CATEGORIES = FUNCTION) {}
+// NVTX FUNCTION ranges, header-only nvtx3, OFF unless FIDESLIB_NVTX=1 (profiling only: the per-op
+// ranges give nsys a stage breakdown of the bootstrap). LIFETIME ranges stay inert (they raced).
+inline bool nvtxFunctionRangesOn() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_NVTX"); return e && std::atoi(e) != 0; }();
+    return v;
+}
+inline void CudaNvtxStart(const std::string& s, NVTX_CATEGORIES c = FUNCTION, int = 0) {
+    if (c == FUNCTION && nvtxFunctionRangesOn()) nvtxRangePushA(s.c_str());
+}
+inline void CudaNvtxStop(const std::string& = "", NVTX_CATEGORIES c = FUNCTION) {
+    if (c == FUNCTION && nvtxFunctionRangesOn()) nvtxRangePop();
+}
 struct CudaNvtxRange {
-    explicit CudaNvtxRange(const std::string&, NVTX_CATEGORIES = FUNCTION, int = 0) {}
-    explicit CudaNvtxRange(const char*, NVTX_CATEGORIES = FUNCTION, int = 0) {}
-    CudaNvtxRange(CudaNvtxRange&&) noexcept = default;
+    bool on = false;
+    explicit CudaNvtxRange(const std::string& s, NVTX_CATEGORIES c = FUNCTION, int = 0) : on(c == FUNCTION && nvtxFunctionRangesOn()) {
+        if (on) nvtxRangePushA(s.c_str());
+    }
+    explicit CudaNvtxRange(const char* s, NVTX_CATEGORIES c = FUNCTION, int = 0) : on(c == FUNCTION && nvtxFunctionRangesOn()) {
+        if (on) nvtxRangePushA(s);
+    }
+    CudaNvtxRange(CudaNvtxRange&& o) noexcept : on(o.on) { o.on = false; }
+    ~CudaNvtxRange() {
+        if (on) nvtxRangePop();
+    }
 };
 
 int getNumDevices();

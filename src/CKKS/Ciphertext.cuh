@@ -6,6 +6,7 @@
 #define FIDESLIB_CKKS_CIPHERTEXT_CUH
 
 #include <source_location>
+#include <functional>
 #include "RNSPoly.cuh"
 #include "forwardDefs.cuh"
 #include "openfhe-interface/RawCiphertext.cuh"
@@ -435,6 +436,10 @@ class Ciphertext {
      * @param free If true, frees intermediate buffers after conversion.
      */
     void modDown(bool free = false);
+    /// Lever A: ModDown of both components fused with the composite rescale (level -2, NoiseLevel -1).
+    void modDownRescale();
+    /// Lever E2: *this = src * P with zeroed special limbs (== copy(src); extend()), one pass per limb.
+    void copyExtend(const Ciphertext& src);
 
     /** @brief Increases the modulus level of the ciphertext (level up). */
     void modUp();
@@ -509,6 +514,13 @@ class Ciphertext {
      * @param ext     If true, extends ciphertexts before rotation.
      */
     void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext);
+    /// Chunked form for LinearTransform (fused single-GPU path, ext = true only): one ModUp,
+    /// then the hoisted key-switch dot is launched per limb range and `on_chunk(part, begin,
+    /// count)` runs right after each range (part 1 = special limbs, 0 = regular limbs), so the
+    /// consumer reads the rotated limbs while they are still L2-resident. The consumer must
+    /// order itself after `cc.getKeySwitchAux()`'s stream.
+    void rotate_hoisted_chunked(const std::vector<int>& indexes, std::vector<Ciphertext*> results, int chunk,
+                                const std::function<void(int part, int begin, int count)>& on_chunk);
 
     /**
      * @brief Evaluates a linear weighted sum (mutable version) over `n` ciphertexts.

@@ -553,6 +553,64 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                 }
             }
 
+            // Fused ModDown + composite rescale tables (lever A): B_a = P u {q_{a-1}, q_a}, u32 chains only.
+            if (hC_.type == 0) {
+                const int L = (int)q.size(), K = (int)p.size(), NB = K + 2;
+                if (NB <= 16) {
+                    std::vector<uint64_t> pre((size_t)MAXP * 16, 0), pre_sh((size_t)MAXP * 16, 0);
+                    std::vector<uint64_t> binv((size_t)MAXP * MAXP, 0), binv_sh((size_t)MAXP * MAXP, 0);
+                    std::vector<uint32_t> mat((size_t)MAXP * 16 * MAXP, 0), mat_sh((size_t)MAXP * 16 * MAXP, 0);
+                    for (int a = 2; a < L; ++a) {
+                        std::vector<uint64_t> bmod(NB);
+                        std::vector<int> bid(NB);
+                        for (int i = 0; i < K; ++i) {
+                            bmod[i] = p[i].p;
+                            bid[i] = L + i;
+                        }
+                        bmod[K] = q[a - 1].p;
+                        bid[K] = a - 1;
+                        bmod[K + 1] = q[a].p;
+                        bid[K + 1] = a;
+                        for (int i = 0; i < NB; ++i) {
+                            uint64_t hat = 1;  // (B / b_i) mod b_i
+                            for (int k = 0; k < NB; ++k)
+                                if (k != i)
+                                    hat = modprod(hat, bmod[k] % bmod[i], bmod[i]);
+                            pre[(size_t)a * 16 + i] = modinv(hat, bmod[i]);
+                            pre_sh[(size_t)a * 16 + i] = shoup_precomp(pre[(size_t)a * 16 + i], bid[i], host_constants);
+                            for (int j = 0; j < a - 1; ++j) {
+                                const uint64_t qj = q[j].p;
+                                uint64_t v = 1;  // (B / b_i) mod q_j
+                                for (int k = 0; k < NB; ++k)
+                                    if (k != i)
+                                        v = modprod(v, bmod[k] % qj, qj);
+                                mat[((size_t)a * 16 + i) * MAXP + j] = (uint32_t)v;
+                                mat_sh[((size_t)a * 16 + i) * MAXP + j] = (uint32_t)shoup_precomp(v, j, host_constants);
+                            }
+                        }
+                        for (int j = 0; j < a - 1; ++j) {
+                            const uint64_t qj = q[j].p;
+                            uint64_t B = 1;
+                            for (int k = 0; k < NB; ++k)
+                                B = modprod(B, bmod[k] % qj, qj);
+                            binv[(size_t)a * MAXP + j] = modinv(B, qj);
+                            binv_sh[(size_t)a * MAXP + j] = shoup_precomp(binv[(size_t)a * MAXP + j], j, host_constants);
+                        }
+                    }
+                    for (int i = 0; i < GPUid.size(); ++i) {
+                        cudaSetDevice(GPUid[i]);
+                        char* g = (char*)hG_.globals[i];
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_pre), pre.data(), pre.size() * 8, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_pre_shoup), pre_sh.data(), pre_sh.size() * 8, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_matrix32), mat.data(), mat.size() * 4, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_matrix_shoup32), mat_sh.data(), mat_sh.size() * 4, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_Binv), binv.data(), binv.size() * 8, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_Binv_shoup), binv_sh.data(), binv_sh.size() * 8, cudaMemcpyHostToDevice);
+                        CudaCheckErrorMod;
+                    }
+                }
+            }
+
             {
                 auto& src = param.raw->PHatModq;
 

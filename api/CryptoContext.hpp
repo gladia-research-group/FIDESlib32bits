@@ -62,6 +62,17 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	/// @brief Load the context to the devices.
 	void LoadContext(const PublicKey<DCRTPoly>& publicKey);
+	/// @brief Generate the aggregated-key-switching keys of CoeffsToSlots stage 0 on the GPU from the secret key
+	/// (FIDESlib CKKS/AksKeys.cuh). Needs FIDESLIB_BTS_SHIFT >= 1 and a loaded context; keygen side only.
+	/// @brief Lever 1b: draw our own sparse encapsulation secret and regenerate the two switching keys (M-4, M-2)
+	/// from it, so the aggregated key switching can bake it into its keys. Call after EvalBootstrapKeyGen and
+	/// BEFORE LoadContext.
+	void RegenerateEncapsulationKeys(const PrivateKey<DCRTPoly>& secretKey);
+	void LoadAksKeys(const PrivateKey<DCRTPoly>& secretKey);
+	/// @brief Keep the secret key on the GPU for noise-flooding-free diagnostic decryptions (FIDESlib SmallInt.cuh).
+	void LoadDiagSecret(const PrivateKey<DCRTPoly>& secretKey);
+	/// @brief Diagnostic: FIDESlib's coefficient-domain index order. Returns pi with natural[pi[i]] = stored[i].
+	std::vector<uint32_t> CoefficientOrderProbe();
 	/// @brief Free a set of (already-loaded) rotation keys to reclaim GPU memory.
 	/// Bootstrap DFT rotation indexes are protected (never removed). Intended for
 	/// auxiliary rotation keys that are no longer needed after a phase (e.g. prefill
@@ -321,6 +332,8 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	std::any cpu;
 	std::any gpu;
+	std::vector<std::vector<uint64_t>> aks_sparse_limbs_;  // the regenerated sparse secret (EVAL form over Q)
+	std::vector<uint64_t> aks_sparse_moduli_;
 	/// @brief Whether the context has been loaded to the devices.
 	bool loaded = false;
 	/// @brief List of devices the context is loaded on.

@@ -184,6 +184,18 @@ struct Global {
         uint32_t ModDown_matrix_shoup32[MAXP * MAXP];
         uint32_t DecompAndModUp_matrix32[MAXP * MAXD * MAXP * MAXP];
         uint32_t DecompAndModUp_matrix_shoup32[MAXP * MAXD * MAXP * MAXP];
+
+        // Fused ModDown + composite rescale (lever A, 2026-10-04), indexed by the TOP prime id `a` of the
+        // dropped pair (q_{a-1}, q_a): base B_a = P ∪ {q_{a-1}, q_a} (K+2 <= 16 limbs) -> Q_{< a-1}.
+        //   FMD_pre[a*16 + i]            = (B_a / b_i)^{-1} mod b_i
+        //   FMD_matrix32[(a*16 + i)*MAXP + j] = (B_a / b_i) mod q_j
+        //   FMD_Binv[a*MAXP + j]         = B_a^{-1} mod q_j
+        uint64_t FMD_pre[MAXP * 16];
+        uint64_t FMD_pre_shoup[MAXP * 16];
+        uint32_t FMD_matrix32[MAXP * 16 * MAXP];
+        uint32_t FMD_matrix_shoup32[MAXP * 16 * MAXP];
+        uint64_t FMD_Binv[MAXP * MAXP];
+        uint64_t FMD_Binv_shoup[MAXP * MAXP];
     };
 
     Globals* globals[MAXD];

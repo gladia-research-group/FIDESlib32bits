@@ -129,6 +129,13 @@ __global__ void binomialMult_(const __grid_constant__ int primeid_init, void** c
 __global__ void binomialMultExtend_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2,
                                     void** d0, void** d1);
 __global__ void binomialSquare_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2);
+__global__ void binomialMultFrom_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2, void** a0, void** a1,
+                                  void** d0, void** d1);
+__global__ void binomialSquareFrom_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2, void** a0, void** a1);
+__global__ void copyScaleByP_(void** dst, void** src, const int primeid_init);
+/// DIAGNOSTIC (wrong results): FIDESLIB_ABLATE_KB skips the key-b loads of fusedDotKSKRegen4_.
+void setAblateKb(int v);
+int ablateKbEnv();
 __global__ void binomialSquareExtend_(const __grid_constant__ int primeid_init, void** c0, void** c1, void** c2);
 
 __global__ void dotProductLtBatchedPt___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,

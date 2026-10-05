@@ -4,9 +4,12 @@
 
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/Discard.cuh"
 #include "CKKS/LinearTransform.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CudaUtils.cuh"
+#include <algorithm>
+#include <cstdlib>
 
 #if defined(__clang__)
 #include <experimental/source_location>
@@ -126,9 +129,15 @@ void MultPtBatch(std::vector<std::shared_ptr<Ciphertext>>& results, Ciphertext& 
 }
 }  // namespace FIDESlib::CKKS
 
+static int ltChunkEnv() {
+    const char* e = std::getenv("FIDESLIB_LT_CHUNK");
+    return e ? std::atoi(e) : 0;
+}
+
 void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, const std::vector<Plaintext*>& pts,
                                      int stride, int offset) {
     CudaNvtxRange r(std::string{sc::current().function_name()});
+    const int LT_CHUNK = ltChunkEnv();  // read per call so an in-process A/B can toggle it
     assert(pts.size() >= rowSize);
     for (auto i : pts) {
         assert(i != nullptr);
@@ -154,8 +163,8 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
             std::vector<Ciphertext*> fastRotationPtr;
 
             bool ext = true;
+            std::vector<int> indexes;
             {
-                std::vector<int> indexes;
                 for (int i = 0; i < bStep; ++i) {
                     fastRotationPtr.push_back(&fastRotation[i]);
                     indexes.push_back(i * stride);
@@ -169,12 +178,17 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                     }
                 }
 
-                ctxt.rotate_hoisted(indexes, fastRotationPtr, ext);
+                if (!(ext && LT_CHUNK > 0 && gStep <= 8 && cc.GPUid.size() == 1))
+                    ctxt.rotate_hoisted(indexes, fastRotationPtr, ext);
             }
 
             constexpr bool MODDOWN_HOIST = true;
             constexpr bool ONLY_C1 = true;
             constexpr bool FUSED = true;
+            // FIDESLIB_LT_CHUNK=<limbs>: interleave the hoisted key-switch dot and the LT dot per
+            // limb range so the bStep rotated ciphertexts (Q+P, ~0.5 GB per CtS stage) are read
+            // back from L2 instead of DRAM. 0 (default) = the original two whole-ciphertext passes.
+            const bool chunked = ext && LT_CHUNK > 0 && gStep <= 8 && cc.GPUid.size() == 1;
             if constexpr (FUSED) {
                 assert(rowSize == pts.size());
                 std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
@@ -213,8 +227,53 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                         }
                     }
                 }
-                DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep,
-                                                              MODDOWN_HOIST && ext);
+                if (chunked) {
+                    std::vector<RNSPoly*> cts, ptsp, res;
+                    for (auto& i : fastRotationPtr) {
+                        cts.push_back(&i->c0);
+                        cts.push_back(&i->c1);
+                    }
+                    for (auto& i : results) {
+                        res.push_back(&i->c0);
+                        res.push_back(&i->c1);
+                    }
+                    for (auto& i : Aptr)
+                        ptsp.push_back(i ? &i->c0 : nullptr);
+                    RNSPoly& in = cc.getKeySwitchAux();
+                    Stream& lt_s = fastRotationPtr[0]->c0.GPU[0].s;  // LTdotProductPtBatch launches here
+                    // the index-0 copy + extend ran on fastRotation[0]'s own streams
+                    lt_s.wait(fastRotationPtr[0]->c1.GPU[0].s);
+                    const size_t limb_bytes = (size_t)cc.N * (cc.precom.constants[0].type == 0 ? 4 : 8);
+                    std::vector<void**> rot_tables, rot_special_tables;
+                    for (auto& i : fastRotationPtr)
+                        for (auto* poly : {&i->c0, &i->c1}) {
+                            rot_tables.push_back(poly->GPU[0].limbptr.data);
+                            rot_special_tables.push_back(poly->GPU[0].SPECIALlimbptr.data);
+                        }
+                    ctxt.rotate_hoisted_chunked(indexes, fastRotationPtr, LT_CHUNK, [&](int part, int b, int n) {
+                        results[0]->c0.GPU[0].s.wait(in.GPU[0].s);  // this chunk's rotated limbs are written
+                        RNSPoly::LTdotProductPtBatch(res, cts, ptsp, bStep, gStep, 1, 1.0, true, part, b, n);
+                        // the rotated limbs of this chunk are dead after the dot: drop them from L2
+                        // without the DRAM write-back (the dot ran on lt_s, so this is ordered after it)
+                        discardLimbTables(part == 1 ? rot_special_tables : rot_tables, b, n, limb_bytes, lt_s.ptr());
+                    });
+                    // the dot read every rotated ciphertext on lt_s: order their streams (and
+                    // their scope-end frees) after it
+                    for (auto& i : fastRotationPtr) {
+                        i->c0.GPU[0].s.wait(lt_s);
+                        i->c1.GPU[0].s.wait(lt_s);
+                    }
+                    for (size_t i = 0; i < results.size(); ++i) {
+                        results[i]->multMetadata(*fastRotationPtr[0], *Aptr[i * bStep]);
+                        for (int j = 1; j < bStep; ++j)
+                            if (Aptr[i * bStep + j])
+                                results[i]->slots = std::max({results[i]->slots, fastRotationPtr[j]->slots,
+                                                              Aptr[i * bStep + j]->slots});
+                    }
+                } else {
+                    DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep,
+                                                                  MODDOWN_HOIST && ext);
+                }
 
                 // todo: for correctness, fastRotationPtr ciphertexts should not be modified until this point
 

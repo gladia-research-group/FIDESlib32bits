@@ -176,7 +176,7 @@ void RNSPoly::binomialMult(RNSPoly& c1, RNSPoly& in, const RNSPoly& d0, const RN
 
     if (!moddown) {
         this->generateSpecialLimbs(true, false);
-        CudaCheckErrorMod;
+        CudaCheckErrorModNoSync;  // was the syncing check: one cudaDeviceSynchronize per fused relin
         c1.generateSpecialLimbs(true, false);
     }
 
@@ -188,6 +188,37 @@ void RNSPoly::binomialMult(RNSPoly& c1, RNSPoly& in, const RNSPoly& d0, const RN
     this->SetModUp(!moddown);
     c1.SetModUp(!moddown);
     in.SetModUp(!moddown);
+}
+
+void RNSPoly::binomialMultFrom(RNSPoly& c1, RNSPoly& in, const RNSPoly& a0, const RNSPoly& a1, const RNSPoly& d0,
+                               const RNSPoly& d1, bool square) {
+    assert(!a0.isModUp() && !a1.isModUp() && !d0.isModUp() && !d1.isModUp());
+    this->dropToLevel(a0.level);
+    this->grow(a0.level);
+    c1.dropToLevel(a0.level);
+    c1.grow(a0.level);
+#pragma omp parallel for num_threads(cc.GPUid.size())
+    for (size_t i = 0; i < cc.GPUid.size(); ++i) {
+        assert(omp_get_num_threads() == (int)cc.GPUid.size());
+        GPU.at(i).binomialMultFrom(c1.GPU.at(i), in.GPU.at(i), a0.GPU.at(i), a1.GPU.at(i), d0.GPU.at(i), d1.GPU.at(i),
+                                   square);
+    }
+    this->SetModUp(false);
+    c1.SetModUp(false);
+    in.SetModUp(false);
+}
+
+void RNSPoly::copyScaledByP(const RNSPoly& src) {
+    assert(!src.isModUp());
+    this->dropToLevel(src.level);
+    this->grow(src.level);
+    this->generateSpecialLimbs(true, false);
+#pragma omp parallel for num_threads(cc.GPUid.size())
+    for (size_t i = 0; i < cc.GPUid.size(); ++i) {
+        assert(omp_get_num_threads() == (int)cc.GPUid.size());
+        GPU.at(i).copyScaledByP(src.GPU.at(i));
+    }
+    this->SetModUp(true);
 }
 
 void RNSPoly::add(const RNSPoly& p) {
@@ -578,7 +609,7 @@ void RNSPoly::rotateModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey&
 }
 
 template <ALGO algo>
-void RNSPoly::moddown(bool ntt, bool free, int aux_num) {
+void RNSPoly::moddown(bool ntt, bool free, int aux_num, bool rescale2) {
     if (!this->isModUp()) {
         std::cout << "RNSPoly calling MOdDown on non-modup polynomial." << std::endl;
     }
@@ -586,9 +617,12 @@ void RNSPoly::moddown(bool ntt, bool free, int aux_num) {
 
     if (cc.GPUid.size() == 1) {
         for (int i = 0; i < (int)GPU.size(); ++i) {
-            GPU.at(i).moddown<algo>(cc.getModdownAux(aux_num).GPU.at(i), ntt, free);
+            GPU.at(i).moddown<algo>(cc.getModdownAux(aux_num).GPU.at(i), ntt, free, rescale2);
         }
+        if (rescale2)
+            level -= 2;  // the fused pass also dropped the composite pair
     } else {
+        assert(!rescale2 && "fused ModDown+rescale is single-GPU only");
         RNSPoly& aux = cc.getModdownAux(aux_num);
         bool regular = true;
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
@@ -620,7 +654,7 @@ void RNSPoly::moddown(bool ntt, bool free, int aux_num) {
     this->SetModUp(false);
 }
 
-#define YY(algo) template void RNSPoly::moddown<algo>(bool ntt, bool free, int aux_num);
+#define YY(algo) template void RNSPoly::moddown<algo>(bool ntt, bool free, int aux_num, bool rescale2);
 
 #include "ntt_types.inc"
 
@@ -1407,7 +1441,7 @@ void RNSPoly::dotProduct(RNSPoly& c1, const RNSPoly& kskb, const RNSPoly& kska, 
 
 void RNSPoly::hoistedRotationFused(std::vector<int> indexes, std::vector<RNSPoly*>& c0, std::vector<RNSPoly*>& c1,
                                    const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
-                                   const RNSPoly& src_c0, const RNSPoly& src_c1) {
+                                   const RNSPoly& src_c0, const RNSPoly& src_c1, int y_begin, int y_count) {
     int n = indexes.size();
     for (size_t j = 0; j < n; ++j) {
         c0[j]->generateSpecialLimbs(false, false);
@@ -1426,7 +1460,8 @@ void RNSPoly::hoistedRotationFused(std::vector<int> indexes, std::vector<RNSPoly
             ksk_as[i] = &(ksk_a[i]->GPU[j]);
             ksk_bs[i] = &(ksk_b[i]->GPU[j]);
         }
-        GPU[j].fusedHoistRotate(n, indexes, c0s, c1s, ksk_as, ksk_bs, src_c0.GPU[j], src_c1.GPU[j], src_c0.isModUp());
+        GPU[j].fusedHoistRotate(n, indexes, c0s, c1s, ksk_as, ksk_bs, src_c0.GPU[j], src_c1.GPU[j], src_c0.isModUp(),
+                                y_begin, y_count);
     }
 
     for (size_t j = 0; j < n; ++j) {

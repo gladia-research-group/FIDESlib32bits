@@ -1,8 +1,12 @@
+#include <random>
+#include <unordered_map>
 #include "CryptoContext.hpp"
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Bootstrap.cuh"
 #include "CKKS/Ciphertext.cuh"
+#include "CKKS/AksKeys.cuh"
+#include "CKKS/SmallInt.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/LinearTransform.cuh"
@@ -211,6 +215,146 @@ void CryptoContextImpl<DCRTPoly>::ClearPlaintextStreams() {
 }
 
 // ---- Load to devices ----
+
+std::vector<uint32_t> CryptoContextImpl<DCRTPoly>::CoefficientOrderProbe() {
+	// Two structured plaintexts: coefficients all 1 (gives the per-limb constant factor FIDESlib's INTT leaves) and
+	// coefficient k = k + 1 (gives the index map). Only limb 0 is used (N + 1 < q_0).
+	auto& c		 = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	auto& cpu_cc = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+	const uint32_t N = cpu_cc->GetRingDimension();
+	auto stored = [&](bool ramp) {
+		std::vector<double> vals(N / 2, 1.0);
+		auto pt	   = cpu_cc->MakeCKKSPackedPlaintext(vals, 1, 0);
+		auto& el   = pt->GetElement<lbcrypto::DCRTPoly>();
+		el.SetFormat(Format::COEFFICIENT);
+		for (size_t i = 0; i < el.GetNumOfElements(); ++i) {
+			auto v		 = el.GetElementAtIndex(i);
+			const auto q = v.GetModulus();
+			for (uint32_t k = 0; k < N; ++k)
+				v[k] = typename lbcrypto::DCRTPoly::PolyType::Integer((ramp ? (uint64_t)k + 1 : 1ULL)) % q;
+			el.SetElementAtIndex(i, std::move(v));
+		}
+		el.SetFormat(Format::EVALUATION);
+		FIDESlib::CKKS::RawPlainText raw = FIDESlib::CKKS::GetRawPlainText(cpu_cc, pt);
+		FIDESlib::CKKS::Plaintext gp(c, raw);
+		cudaDeviceSynchronize();
+		FIDESlib::CKKS::RNSPoly t(*c, gp.c0.getLevel());
+		t.copy(gp.c0);
+		t.INTT(c->batch, true);
+		cudaDeviceSynchronize();
+		std::vector<std::vector<uint64_t>> st;
+		t.store(st);
+		cudaDeviceSynchronize();
+		return std::make_pair(st[0], (uint64_t)el.GetElementAtIndex(0).GetModulus().ConvertToInt());
+	};
+	auto [ones, q0]	 = stored(false);
+	auto [ramp, q0b] = stored(true);
+	uint64_t f = ones[0];
+	size_t nonconst = 0;
+	for (uint32_t i = 0; i < N; ++i) nonconst += (ones[i] != f);
+	auto mulmod = [&](uint64_t x, uint64_t y) { return (uint64_t)((__uint128_t)x * y % q0); };
+	auto powmod = [&](uint64_t b, uint64_t e) { uint64_t r = 1; while (e) { if (e & 1) r = mulmod(r, b); b = mulmod(b, b); e >>= 1; } return r; };
+	const uint64_t finv = powmod(f % q0, q0 - 2);
+	std::vector<uint32_t> pi(N, UINT32_MAX);
+	size_t bad = 0;
+	for (uint32_t i = 0; i < N; ++i) {
+		const uint64_t k1 = mulmod(ramp[i], finv);  // = k + 1
+		if (k1 >= 1 && k1 <= N) pi[i] = (uint32_t)(k1 - 1); else ++bad;
+	}
+	std::cerr << "[coef-order] N=" << N << " q0=" << q0 << " factor=" << f << " non-constant=" << nonconst
+			  << " unmatched=" << bad << " pi[0..7]=";
+	for (int i = 0; i < 8; ++i) std::cerr << pi[i] << " ";
+	std::cerr << "\n";
+	return pi;
+}
+
+void CryptoContextImpl<DCRTPoly>::LoadDiagSecret(const PrivateKey<DCRTPoly>& secretKey) {
+	if (!this->loaded)
+		throw std::runtime_error("LoadDiagSecret: LoadContext first");
+	auto& c		 = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
+	const auto& el = skImpl->GetPrivateElement();
+	std::vector<std::vector<uint64_t>> limbs;
+	std::vector<uint64_t> moduli;
+	for (size_t i = 0; i < el.GetNumOfElements(); ++i) {
+		const auto& v = el.GetElementAtIndex(i);
+		moduli.push_back(v.GetModulus().ConvertToInt());
+		limbs.emplace_back(v.GetLength());
+		for (size_t n = 0; n < v.GetLength(); ++n)
+			limbs.back()[n] = v[n].ConvertToInt();
+	}
+	FIDESlib::CKKS::loadDiagSecret(*c, limbs, moduli);
+}
+
+static void extractEvalLimbs(const lbcrypto::DCRTPoly& el, std::vector<std::vector<uint64_t>>& limbs,
+							 std::vector<uint64_t>& moduli) {
+	limbs.clear();
+	moduli.clear();
+	for (size_t i = 0; i < el.GetNumOfElements(); ++i) {
+		const auto& v = el.GetElementAtIndex(i);
+		moduli.push_back(v.GetModulus().ConvertToInt());
+		limbs.emplace_back(v.GetLength());
+		for (size_t n = 0; n < v.GetLength(); ++n)
+			limbs.back()[n] = v[n].ConvertToInt();
+	}
+}
+
+void CryptoContextImpl<DCRTPoly>::RegenerateEncapsulationKeys(const PrivateKey<DCRTPoly>& secretKey) {
+	if (this->loaded)
+		throw std::runtime_error("RegenerateEncapsulationKeys: call before LoadContext");
+	auto& cpu_cc = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
+	if (this->keyDist != fideslib::SPARSE_ENCAPSULATED)
+		throw std::runtime_error("RegenerateEncapsulationKeys: not a SPARSE_ENCAPSULATED context");
+	// same construction as the fork's EvalBootstrapKeyGen (ckksrns-fhe.cpp), composite chains: hybrid keys both ways
+	lbcrypto::DCRTPoly::TugType tug;
+	lbcrypto::DCRTPoly sNew(tug, skImpl->GetCryptoParameters()->GetElementParams(), Format::EVALUATION, 32);
+	extractEvalLimbs(sNew, aks_sparse_limbs_, aks_sparse_moduli_);
+	auto skNew = std::make_shared<lbcrypto::PrivateKeyImpl<lbcrypto::DCRTPoly>>(cpu_cc);
+	skNew->SetPrivateElement(std::move(sNew));
+	auto algo		= cpu_cc->GetScheme();
+	const auto M	= cpu_cc->GetCyclotomicOrder();
+	auto& evalKeys	= lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMap(skImpl->GetKeyTag());
+	// FIDESlib's own GPU-path convention (RawCiphertext.cu GenBootstrapKeys / createContextSwitchingKeys):
+	// M-2 = dense->sparse (KeySwitchGen(s, s~)), M-4 = sparse->dense (KeySwitchGen(s~, s)) — the fork's CPU keygen
+	// uses the opposite slots and is NOT what the GPU path loads.
+	evalKeys[M - 2] = algo->KeySwitchGen(skImpl, skNew);
+	evalKeys[M - 4] = algo->KeySwitchGen(skNew, skImpl);
+	std::cerr << "[aks] encapsulation keys regenerated from a held sparse secret (h=32)\n";
+}
+
+void CryptoContextImpl<DCRTPoly>::LoadAksKeys(const PrivateKey<DCRTPoly>& secretKey) {
+	if (!this->loaded)
+		throw std::runtime_error("LoadAksKeys: LoadContext first");
+	auto& c		 = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	auto& cpu_cc = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
+	const auto& el = skImpl->GetPrivateElement();  // EVAL form over Q
+	std::vector<std::vector<uint64_t>> limbs;
+	std::vector<uint64_t> moduli;
+	for (size_t i = 0; i < el.GetNumOfElements(); ++i) {
+		const auto& v = el.GetElementAtIndex(i);
+		moduli.push_back(v.GetModulus().ConvertToInt());
+		limbs.emplace_back(v.GetLength());
+		for (size_t n = 0; n < v.GetLength(); ++n)
+			limbs.back()[n] = v[n].ConvertToInt();
+	}
+	auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cpu_cc->GetScheme()->m_FHE);
+	const uint64_t seed = [] {
+		const char* e = std::getenv("FIDESLIB_AKS_SEED");
+		return e ? (uint64_t)std::strtoull(e, nullptr, 10) : 0x5eedull;
+	}();
+	for (const auto& [slots, _] : fhe->m_bootPrecomMap) {
+		if (!c->HasBootPrecomputation((int)slots))
+			continue;
+		auto& pre = c->GetBootPrecomputation((int)slots);
+		if (pre.CtS.empty() || pre.cts0_const <= 0 || (int)slots != c->N / 2)  // AKS: the dense, shifted precomputation only
+			continue;
+		if (aks_sparse_limbs_.empty())
+			throw std::runtime_error("LoadAksKeys: RegenerateEncapsulationKeys was not called before LoadContext");
+		FIDESlib::CKKS::GenerateAksStage0(c, pre, limbs, moduli, aks_sparse_limbs_, seed ^ slots);
+	}
+}
 
 void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicKey) {
 	if (this->loaded || this->devices.empty())
