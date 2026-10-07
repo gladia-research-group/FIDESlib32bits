@@ -196,6 +196,9 @@ struct Global {
         uint32_t FMD_matrix_shoup32[MAXP * 16 * MAXP];
         uint64_t FMD_Binv[MAXP * MAXP];
         uint64_t FMD_Binv_shoup[MAXP * MAXP];
+        // exact overflow correction (Halevi-Polyakov-Shoup, CT-RSA 2019): B mod q_j, and 1/b_i for the floating estimate
+        uint32_t FMD_Bmod32[MAXP * MAXP];
+        double FMD_rb[MAXP * 16];
     };
 
     Globals* globals[MAXD];

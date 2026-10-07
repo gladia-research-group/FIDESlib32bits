@@ -2,6 +2,8 @@
 // Created by carlosad on 7/05/25.
 //
 
+#include "CKKS/BootstrapPrecomputation.cuh"
+#include <iostream>
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/Discard.cuh"
@@ -130,6 +132,66 @@ void MultPtBatch(std::vector<std::shared_ptr<Ciphertext>>& results, Ciphertext& 
 }  // namespace FIDESlib::CKKS
 
 
+namespace FIDESlib::CKKS {
+// FIDESLIB_LT_FUSED_DEBUG=n: for the first n fused stage ends, compare the fused ModDown+rescale against plain ModDown +
+// rescale on a copy: max |coefficient difference| of limb 0 (centered mod q_0) for c0 and c1, plus level and scale.
+int ltFusedDebugEnv() {
+    const char* e = std::getenv("FIDESLIB_LT_FUSED_DEBUG");
+    return e ? std::atoi(e) : 0;
+}
+void ltFusedDebug(Ciphertext& x) {
+    static int seen = 0;
+    if (seen >= ltFusedDebugEnv()) return;
+    ++seen;
+    Context& cc_ = x.cc_;
+    ContextData& cc = x.cc;
+    Ciphertext a(cc_), b(cc_);
+    a.copy(x);
+    b.copy(x);
+    const int lvIn = x.getLevel();
+    const double nfIn = x.NoiseFactor;
+    a.modDown(false);
+    a.rescale();
+    b.modDownRescale();
+    cudaDeviceSynchronize();
+    auto coeffLimb0 = [&](RNSPoly& p) {
+        std::vector<std::vector<uint64_t>> l;
+        RNSPoly t(cc, p.getLevel());
+        t.copy(p);
+        t.INTT(cc.batch, true);
+        cudaDeviceSynchronize();
+        t.store(l);
+        return l;
+    };
+    const uint64_t q0 = cc.prime[0].p;
+    for (int comp = 0; comp < 2; ++comp) {
+        auto la = coeffLimb0(comp == 0 ? a.c0 : a.c1);
+        auto lb = coeffLimb0(comp == 0 ? b.c0 : b.c1);
+        int64_t maxd = 0, maxa = 0;
+        size_t nbig = 0;
+        for (size_t i = 0; i < la[0].size(); ++i) {
+            int64_t d = (int64_t)((la[0][i] + q0 - lb[0][i]) % q0);
+            if (d > (int64_t)(q0 / 2)) d -= (int64_t)q0;
+            int64_t v = (int64_t)la[0][i];
+            if (v > (int64_t)(q0 / 2)) v -= (int64_t)q0;
+            maxd = std::max<int64_t>(maxd, std::llabs(d));
+            maxa = std::max<int64_t>(maxa, std::llabs(v));
+            nbig += std::llabs(d) > 64;
+        }
+        std::cerr << "[lt_fused_dbg] #" << seen << " level " << lvIn << "->" << a.getLevel() << "/" << b.getLevel()
+                  << " NF " << nfIn << "->" << a.NoiseFactor << "/" << b.NoiseFactor << (comp == 0 ? " c0" : " c1")
+                  << ": max|diff| " << maxd << " (coeffs with |diff|>64: " << nbig << "), max|coef mod q0| " << maxa << "\n";
+    }
+}
+
+}  // namespace FIDESlib::CKKS
+using FIDESlib::CKKS::ltFusedDebugEnv;
+using FIDESlib::CKKS::ltFusedDebug;
+bool FIDESlib::CKKS::g_ltFuseAllowed = false;
+static bool ltFusedRescaleEnv() {  // read per call so an in-process A/B can toggle it
+    const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE");
+    return !(e && *e) || std::atoi(e) > 0;  // default ON (exact); FIDESLIB_LT_FUSED_RESCALE=0 restores plain ModDown
+}
 static int ltChunkEnv() {
     const char* e = std::getenv("FIDESLIB_LT_CHUNK");
     return e ? std::atoi(e) : 0;
@@ -311,8 +373,20 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                                 results[j]->modDown(false);
                         results[j]->rotate(offset, true);
                     } else {
-                        if (results[j]->c1.isModUp())
-                            results[j]->modDown(false);
+                        if (results[j]->c1.isModUp()) {
+                            // FIDESLIB_LT_FUSED_RESCALE: the stage output is deg-2 and the next stage (or EvalMod)
+                            // rescales it first; fold that rescale into this ModDown (lever A's ModDownRescale2),
+                            // skipping the rescale's INTT + re-expansion NTTs. Approximate like lever A (bits gate).
+                            if (g_ltFuseAllowed && ltFusedRescaleEnv() && results[j]->NoiseLevel == 2 && cc.compositeDegree() == 2 &&
+                                cc.GPUid.size() == 1 && results[j]->c0.isModUp()) {
+                                if (ltFusedDebugEnv()) ltFusedDebug(*results[j]);
+                                results[j]->modDownRescale();
+                                static bool logged = false;
+                                if (!logged) { logged = true; std::cerr << "[lt_fused_rescale] stage-end ModDown+rescale fused\n"; }
+                            } else {
+                                results[j]->modDown(false);
+                            }
+                        }
                     }
                 }
 
