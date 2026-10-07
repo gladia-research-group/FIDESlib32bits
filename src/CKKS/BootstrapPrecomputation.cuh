@@ -20,6 +20,14 @@ class KeySwitchingKey;
 /// Plaintext index mask the batched LT dot applies to its plaintext reads (CKKS/LimbPartitionBatch.cu); set per
 /// CtS/StC stage by LtPtMaskScope, all ones everywhere else.
 extern uint32_t g_ltPtMask;
+/// FIDESLIB_LT_FUSED_RESCALE: whether the current LT stage's end may fold the following rescale into its ModDown
+/// (false for the bootstrap's LAST stage, whose deg-2 output is the planner's landing convention).
+extern bool g_ltFuseAllowed;
+struct LtFuseScope {
+    bool old;
+    explicit LtFuseScope(bool a) : old(g_ltFuseAllowed) { g_ltFuseAllowed = a; }
+    ~LtFuseScope() { g_ltFuseAllowed = old; }
+};
 struct LtPtMaskScope {
     uint32_t old;
     // FIDESLIB_LT_COMPACT_BYPASS=1 (read per scope): full reads even when the stage has a mask (in-process gate)

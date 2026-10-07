@@ -160,8 +160,15 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
         ctxt.rescale();
 
     int steps = 0;
+    const int nStages = (int)(decode ? cc.GetBootPrecomputation(slots).StC : cc.GetBootPrecomputation(slots).CtS).size();
     for (BootstrapPrecomputation::LTstep& step :
          (decode ? cc.GetBootPrecomputation(slots).StC : cc.GetBootPrecomputation(slots).CtS)) {
+        // FIDESLIB_LT_FUSED_RESCALE=2: CtS stages only, 3: StC stages only (bisection)
+        const int fuseMode = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
+        // FIDESLIB_LT_FUSED_CTS_MASK: bit k = fuse CtS stage k (bisection; default all)
+        const int ctsMask = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_CTS_MASK"); return e ? std::atoi(e) : -1; }();
+        LtFuseScope fuseScope(!(decode && steps == nStages - 1) && !(fuseMode == 2 && decode) && !(fuseMode == 3 && !decode) &&
+                              (decode || ((ctsMask >> steps) & 1)));
         // Stage-divergence harness: stash the ciphertext ENTERING each LT stage so intra-CtS/StC
         // noise injection is attributable per stage. Inert unless a caller installed the stash.
         if (g_btsStageStash) {

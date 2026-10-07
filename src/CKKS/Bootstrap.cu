@@ -1345,6 +1345,8 @@ void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k) {
         LinearTransformAKS(ctxt, step, *pre.aks0);
         return;
     }
+    const int fuseMode = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
+    LtFuseScope fuseScope(fuseMode != 3);
     ltStep(ctxt, step);
 }
 
@@ -1431,6 +1433,8 @@ void btsStCStage(Ciphertext& ctxt, const BtsState& st, int k) {
     }
     if (k == 0 && ctxt.NoiseLevel == 2)
         ctxt.rescale();
+    const int fuseModeS = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
+    LtFuseScope fuseScope(k != (int)pre.StC.size() - 1 && fuseModeS != 2);
     ltStep(ctxt, pre.StC.at(k));
 }
 

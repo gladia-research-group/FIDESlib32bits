@@ -560,6 +560,8 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                     std::vector<uint64_t> pre((size_t)MAXP * 16, 0), pre_sh((size_t)MAXP * 16, 0);
                     std::vector<uint64_t> binv((size_t)MAXP * MAXP, 0), binv_sh((size_t)MAXP * MAXP, 0);
                     std::vector<uint32_t> mat((size_t)MAXP * 16 * MAXP, 0), mat_sh((size_t)MAXP * 16 * MAXP, 0);
+                    std::vector<uint32_t> bmod32((size_t)MAXP * MAXP, 0);
+                    std::vector<double> rb((size_t)MAXP * 16, 0.0);
                     for (int a = 2; a < L; ++a) {
                         std::vector<uint64_t> bmod(NB);
                         std::vector<int> bid(NB);
@@ -577,6 +579,7 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                                 if (k != i)
                                     hat = modprod(hat, bmod[k] % bmod[i], bmod[i]);
                             pre[(size_t)a * 16 + i] = modinv(hat, bmod[i]);
+                            rb[(size_t)a * 16 + i] = 1.0 / (double)bmod[i];
                             pre_sh[(size_t)a * 16 + i] = shoup_precomp(pre[(size_t)a * 16 + i], bid[i], host_constants);
                             for (int j = 0; j < a - 1; ++j) {
                                 const uint64_t qj = q[j].p;
@@ -593,6 +596,7 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                             uint64_t B = 1;
                             for (int k = 0; k < NB; ++k)
                                 B = modprod(B, bmod[k] % qj, qj);
+                            bmod32[(size_t)a * MAXP + j] = (uint32_t)B;
                             binv[(size_t)a * MAXP + j] = modinv(B, qj);
                             binv_sh[(size_t)a * MAXP + j] = shoup_precomp(binv[(size_t)a * MAXP + j], j, host_constants);
                         }
@@ -606,6 +610,8 @@ std::pair<std::vector<Constants>, std::unique_ptr<Global>> SetupConstants(
                         cudaMemcpy(g + offsetof(Global::Globals, FMD_matrix_shoup32), mat_sh.data(), mat_sh.size() * 4, cudaMemcpyHostToDevice);
                         cudaMemcpy(g + offsetof(Global::Globals, FMD_Binv), binv.data(), binv.size() * 8, cudaMemcpyHostToDevice);
                         cudaMemcpy(g + offsetof(Global::Globals, FMD_Binv_shoup), binv_sh.data(), binv_sh.size() * 8, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_Bmod32), bmod32.data(), bmod32.size() * 4, cudaMemcpyHostToDevice);
+                        cudaMemcpy(g + offsetof(Global::Globals, FMD_rb), rb.data(), rb.size() * 8, cudaMemcpyHostToDevice);
                         CudaCheckErrorMod;
                     }
                 }
