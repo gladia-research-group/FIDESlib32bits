@@ -2,6 +2,7 @@
 // Created by carlosad on 4/04/24.
 //
 
+#include "NTTconfig.cuh"
 #include "AddSub.cuh"
 #include "CKKS/Rescale.cuh"
 #include "ConstantsGPU.cuh"
@@ -87,8 +88,16 @@ __device__ const uint8_t* g_tc_Rinv[MAXP];
 __device__ uint64_t g_tc_mu[MAXP];
 __device__ const uint8_t* g_tc_B[MAXP];
 __device__ const uint8_t* g_tc_Binv[MAXP];
-void setTcTables(const TcTables& t, int device) {
+void setTcTables(const TcTables& t0, int device) {
     cudaSetDevice(device);
+    // FIDESLIB_TC_NTT_MIX=k (WarpDrive-style CUDA-core + tensor-core concurrency): only primes with id % k == 0 keep their
+    // tensor-core tables, the others fall back to the butterflies — blocks of one launch then run on both units at once
+    TcTables t = t0;
+    if (const char* e = std::getenv("FIDESLIB_TC_NTT_MIX"); e && std::atoi(e) > 1) {
+        const int k = std::atoi(e);
+        for (int p = 0; p < MAXP; ++p)
+            if (p % k != 0) t.B[p] = t.Binv[p] = t.R[p] = t.Rinv[p] = nullptr;
+    }
     cudaMemcpyToSymbol(g_tc_B, t.B, sizeof(t.B));
     cudaMemcpyToSymbol(g_tc_Binv, t.Binv, sizeof(t.Binv));
     cudaMemcpyToSymbol(g_tc_R, t.R, sizeof(t.R));
@@ -157,7 +166,7 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
                                        T* __restrict__ c0, const T* __restrict__ c0tilde) {
     const int tid = threadIdx.x;
     extern __shared__ char buffer[];
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     T* psi = &(((T*)buffer)[blockDim.x * 2 * M]);
     T* psi_shoup = &(((T*)buffer)[blockDim.x * (2 * M + (algo == ALGO_SHOUP))]);
@@ -357,8 +366,8 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
             T a0 = AS(i, j);
             T a1 = AS(i, j + 1);
 #pragma unroll
-            for (int k = 0; k < NTT_SHFL_STAGES; ++k) {
-                if (k)  // re-assign the pair for the stage being entered
+            for (int k = FIDESLIB_NTT_SKIP_LOW; k < NTT_SHFL_STAGES; ++k) {  // SKIP_LOW: ablation only
+                if (k > FIDESLIB_NTT_SKIP_LOW)  // re-assign the pair for the stage being entered
                     warp_pair_exchange<T>(a0, a1, tid, k - 1);
                 if constexpr (algo == 3) {
                     GS_butterfly<T, algo>(a0, a1, psis[k], primeid, psis_shoup[k]);
@@ -559,7 +568,7 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
     const int tid = threadIdx.x;
     const int j = tid << 1;
     extern __shared__ char buffer[];
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     T* psi = &(((T*)buffer)[blockDim.x * 2 * M]);
     T* psi_barret = (T*)(buffer + sizeof(T) * blockDim.x * (2 * M + (algo == ALGO_SHOUP)));
@@ -801,7 +810,7 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
                     T a0 = AS(i, j1_in);
                     T a1 = AS(i, j1_in + m);
 #pragma unroll
-                    for (int k = 0; k < NTT_SHFL_STAGES; ++k) {
+                    for (int k = 0; k < NTT_SHFL_STAGES - FIDESLIB_NTT_SKIP_LOW; ++k) {  // SKIP_LOW: ablation only
                         if (k)  // re-assign the pair for the stage being entered
                             warp_pair_exchange<T>(a0, a1, tid, NTT_SHFL_STAGES - 1 - k);
                         if constexpr (algo == 3) {
