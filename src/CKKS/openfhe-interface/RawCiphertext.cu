@@ -1302,6 +1302,42 @@ static void buildSparseB(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, FIDESl
 
 
 
+// FIDESLIB_LT_COMPACT: the index mask under which every diagonal of a CtS/StC stage is exact in its stored (NTT) layout —
+// either a period P (mask P-1) or constant aligned blocks of L (mask ~(L-1)); all ones when neither saves at least 2x.
+static uint32_t ltStageMask(FIDESlib::CKKS::BootstrapPrecomputation::LTstep& st) {
+    size_t Pmax = 1, Lmin = 0, n = 0;
+    std::vector<std::vector<std::vector<uint64_t>>> keep;
+    for (auto& pt : st.A) {
+        std::vector<std::vector<uint64_t>> limbs;
+        pt.c0.store(limbs);
+        if (limbs.empty()) continue;
+        n = limbs[0].size();
+        if (Lmin == 0) Lmin = n;
+        std::vector<std::vector<uint64_t>> chk;
+        for (size_t l : {(size_t)0, (size_t)1, limbs.size() - 1}) {
+            if (l >= limbs.size()) continue;
+            const auto& v = limbs[l];
+            size_t P = 1;
+            while (P < n) { bool ok = true; for (size_t i = P; i < n && ok; ++i) ok = v[i] == v[i % P]; if (ok) break; P <<= 1; }
+            size_t L = n;
+            while (L > 1) { bool ok = true; for (size_t b = 0; b < n && ok; b += L) for (size_t i = b + 1; i < b + L && ok; ++i) ok = v[i] == v[b]; if (ok) break; L >>= 1; }
+            Pmax = std::max(Pmax, P);
+            Lmin = std::min(Lmin, L);
+            chk.push_back(v);
+        }
+        keep.push_back(std::move(chk));
+    }
+    if (n == 0) return 0xFFFFFFFFu;
+    const size_t dP = Pmax, dB = n / std::max<size_t>(Lmin, 1);
+    if (std::min(dP, dB) * 2 > n) return 0xFFFFFFFFu;
+    const uint32_t mask = dP <= dB ? (uint32_t)(Pmax - 1) : ~(uint32_t)(Lmin - 1);
+    for (auto& chk : keep)  // the chosen mask must reproduce every checked limb exactly
+        for (auto& v : chk)
+            for (size_t i = 0; i < n; ++i)
+                if (v[i] != v[i & mask]) return 0xFFFFFFFFu;
+    return mask;
+}
+
 // FIDESLIB_BTS_RAISE_DROP="slots:k,..." (composite levels; e.g. "1:4,512:2"): per-route raise below the top modulus.
 static int raiseDropFor(int slots) {
     const char* e = std::getenv("FIDESLIB_BTS_RAISE_DROP");
@@ -1633,6 +1669,16 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
             }
             };
             ltFriendly(result.CtS, result.StC);
+            // default ON (bit-exact); FIDESLIB_LT_COMPACT=0 keeps the full streaming reads
+            if (const char* e = std::getenv("FIDESLIB_LT_COMPACT"); !(e && *e) || std::atoi(e) > 0) {
+                for (auto* v : {&result.CtS, &result.StC})
+                    for (size_t si = 0; si < v->size(); ++si) {
+                        auto& st = (*v)[si];
+                        st.ptMask = ltStageMask(st);
+                        std::cerr << "[lt_compact] slots=" << slots << (v == &result.CtS ? " CtS" : " StC") << " stage "
+                                  << si << ": mask 0x" << std::hex << st.ptMask << std::dec << "\n";
+                    }
+            }
             if (!result.CtS_orig.empty())
                 ltFriendly(result.CtS_orig, result.StC_orig);
             if (stcFirstEnv() > 0 && stcFirstRoute(slots, GPUcc.N)) {

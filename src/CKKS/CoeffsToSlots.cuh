@@ -19,5 +19,7 @@ void EvalLinearTransformPts(Ciphertext& ctxt, int slots, int bStep, std::vector<
 /// The multi-stage CtS/StC runner on an explicit stage vector (plain hoisted BSGS, no AKS); `probeTag` names the
 /// stage-divergence stash entries ("StC1-stage-").
 void EvalLTStages(Ciphertext& ctxt, std::vector<BootstrapPrecomputation::LTstep>& stages, const char* probeTag);
+/// Diagnostic: coefficient-form limbs 0..2 of the first nd diagonals of dense CtS stages 0/1 and the last StC stage.
+void dumpLtDiagCoeffs(ContextData& C, const char* dir, int nd);
 }  // namespace FIDESlib::CKKS
 #endif  //GPUCKKS_COEFFSTOSLOTS_CUH

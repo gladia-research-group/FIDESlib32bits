@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 1/10/25.
 //
+#include "CKKS/BootstrapPrecomputation.cuh"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -358,6 +359,8 @@ void LimbPartition::binomialMultAccumBatch(LimbPartition& acc0, LimbPartition& a
     }
 }
 
+uint32_t g_ltPtMask = 0xFFFFFFFFu;
+
 void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
                                         const std::vector<LimbPartition*>& pt, int bStep, int gStep, int stride,
                                         double usage, bool ext, int part, int limb_begin, int limb_count) {
@@ -560,13 +563,13 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
                 dotProductLtBatchedPt3___<<<grid, block, shmem_bytes, s.ptr()>>>(
                     data_ptrs_d + offset_out_c0, data_ptrs_d + offset_out_c1, data_ptrs_d + offset_in_c0,
                     data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, bStep, gStep, PARTITION(out[0]->id, 0) + reg_begin,
-                    num_LT);
+                    num_LT, g_ltPtMask);
             }
             if (do_special && slimbsize > 0) {
                 dotProductLtBatchedPt3___<<<sgrid, block, shmem_bytes, s.ptr()>>>(
                     data_ptrs_d + soffset_out_c0, data_ptrs_d + soffset_out_c1, data_ptrs_d + soffset_in_c0,
                     data_ptrs_d + soffset_in_c1, data_ptrs_d + soffset_pt, bStep, gStep,
-                    SPECIAL(out[0]->id, special_start) + sp_begin, num_LT);
+                    SPECIAL(out[0]->id, special_start) + sp_begin, num_LT, g_ltPtMask);
             }
         }
     }
