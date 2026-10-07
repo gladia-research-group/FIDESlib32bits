@@ -1,6 +1,7 @@
 #pragma once
 // Shared 256-point NTT/INTT core on an 8-row shared-memory tile (u32, Shoup), lifted from the two-pass
 // kernel: used by the cluster kernel (NTTcluster.cu) and the tensor-core core's table probe (NTTtc.cu).
+#include "NTTconfig.cuh"
 #include <cuda_runtime.h>
 #include "AddSub.cuh"
 #include "ConstantsGPU.cuh"
@@ -14,7 +15,7 @@ namespace FIDESlib {
 namespace ntc {
 using T = uint32_t;
 constexpr ALGO algo = ALGO_SHOUP;
-constexpr int M = 8;                 // int2 pairs per thread per row set (u32)
+constexpr int M = 8;                 // int2 pairs per thread per row set (u32); cluster/TC variants only (fixed)
 constexpr int BD = 128;              // threads per tile group (== the two-pass kernel's blockDim.x)
 constexpr int GROUPS = 4;            // tile groups per block
 constexpr int CL = 8;                // blocks per cluster

@@ -2,6 +2,7 @@
 // Created by carlosad on 25/03/24.
 //
 
+#include "NTTconfig.cuh"
 #include <cstdlib>
 #include "AddSub.cuh"
 #include "CKKS/Context.cuh"
@@ -411,7 +412,7 @@ template <typename T>
 template <ALGO algo>
 void Limb<T>::INTT() {
     assert(primeid >= 0);
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     if constexpr (1) {
         dim3 blockDim = 1 << ((cc.logN) / 2 - 1);
@@ -434,7 +435,7 @@ void Limb<T>::NTT() {
 
     if constexpr (0) {
         assert(primeid >= 0);
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         constexpr int K = 1;
 
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1)), K};
@@ -454,7 +455,7 @@ void Limb<T>::NTT() {
 
         run_in_graph<false>(exec[primeid], stream, [&]() {
             assert(primeid >= 0);
-            constexpr int M = sizeof(T) == 8 ? 4 : 8;
+            constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1 + (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
             dim3 gridDim{v.size / blockDim.x / 2 / M};
@@ -481,7 +482,7 @@ void Limb<uint64_t>::NTT_rescale_fused(const Limb<uint64_t>& l) {
 
     constexpr ALGO algo = ALGO_SHOUP;
     using T = uint64_t;
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     assert(primeid >= 0);
     assert(l.primeid >= 0);
@@ -536,7 +537,7 @@ void Limb<uint64_t>::NTT_moddown_fused(const LimbImpl& _l) {
 
         constexpr ALGO algo = ALGO_SHOUP;
         using T = uint64_t;
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -562,7 +563,7 @@ void Limb<uint32_t>::NTT_moddown_fused(const LimbImpl& _l) {
         const Limb<T>& l = std::get<U32>(_l);
 
         constexpr ALGO algo = ALGO_SHOUP;
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -594,7 +595,7 @@ void Limb<uint64_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
 
         constexpr ALGO algo = ALGO_SHOUP;
         using T = uint64_t;
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -622,7 +623,7 @@ void Limb<uint32_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
 
     constexpr ALGO algo = ALGO_SHOUP;
     using T = uint32_t;
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     assert(primeid >= 0);
     dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -695,7 +696,7 @@ void Limb<uint64_t>::INTT_from(LimbImpl& _l) {
     {
         const Limb<uint64_t>& l = std::get<U64>(_l);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -720,7 +721,7 @@ void Limb<uint32_t>::INTT_from(LimbImpl& _l) {
     {
         const Limb<T>& l = std::get<U32>(_l);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
         dim3 gridDim{v.size / blockDim.x / 2 / M};
@@ -783,7 +784,7 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
         const Limb<T>& c0 = std::get<U64>(c0_);
         const Limb<T>& c0tilde = std::get<U64>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -812,7 +813,7 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
         const Limb<T>& c0 = std::get<U32>(c0_);
         const Limb<T>& c0tilde = std::get<U32>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -850,7 +851,7 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
         const Limb<T>& c0 = std::get<U64>(c0_);
         const Limb<T>& c0tilde = std::get<U64>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -879,7 +880,7 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
         const Limb<T>& c0 = std::get<U32>(c0_);
         const Limb<T>& c0tilde = std::get<U32>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -911,7 +912,7 @@ void Limb<T>::NTT_and_ksk_dot(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& 
         const Limb<T>& kska = std::get<U64>(kska_);
         const Limb<T>& kskb = std::get<U64>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -935,7 +936,7 @@ void Limb<T>::NTT_and_ksk_dot(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& 
         const Limb<T>& kska = std::get<U32>(kska_);
         const Limb<T>& kskb = std::get<U32>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -966,7 +967,7 @@ void Limb<T>::NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbIm
         const Limb<T>& kska = std::get<U64>(kska_);
         const Limb<T>& kskb = std::get<U64>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -990,7 +991,7 @@ void Limb<T>::NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbIm
         const Limb<T>& kska = std::get<U32>(kska_);
         const Limb<T>& kskb = std::get<U32>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};

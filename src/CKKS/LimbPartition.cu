@@ -1,6 +1,7 @@
 //
 // Created by carlosad on 27/04/24.
 //
+#include "NTTconfig.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -651,15 +652,15 @@ template <ALGO algo, NTT_MODE mode>
 void LimbPartition::ApplyNTT(int batch, LimbPartition::NTT_fusion_fields fields, std::vector<LimbImpl>& limb,
                              VectorGPU<void*>& limbptr, VectorGPU<void*>& auxptr, ContextData& cc,
                              const int primeid_init, const int limbsize) {
-    const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+    const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
     // The dynamic shared size scales with the limb word size: the kernel lays out
     // `sizeof(T) * blockDim.x * (2*M + 1 + shoup)` bytes, and `32 / M` IS sizeof(T)
     // (M=8 -> 4 for u32, M=4 -> 8 for u64). Same formula at every ApplyNTT/ApplyINTT site.
     const dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
     const dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
-    const int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
-    const int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+    const int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+    const int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
     // NTT_RESCALE2: fused composite double drop. The two top limbs are consumed
     // (size = limbsize - 2); stage-1 dat = limbptr + size, so the kernel sees dat[0] = the qb
     // limb and dat[1] = the qa top (both coeff domain); primeid_rescale = the TOP prime (qa).
@@ -732,12 +733,12 @@ template <ALGO algo, INTT_MODE mode>
 void LimbPartition::ApplyINTT(int batch, LimbPartition::INTT_fusion_fields fields, std::vector<LimbImpl>& limb,
                               VectorGPU<void*>& limbptr, VectorGPU<void*>& auxptr, ContextData& cc,
                               const int primeid_init, const int limbsize) {
-    const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+    const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
     dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN - (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
     dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1 + (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
-    int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-    int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+    int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+    int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
     for (int i = 0; i < limbsize; i += batch) {
         uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(limbsize - i));
@@ -983,12 +984,12 @@ void LimbPartition::rescale() {
     if (aux_size == 0) {
         {
             constexpr ALGO algo = ALGO_SHOUP;
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int start = 0;
             for (int i = limbsize - 1; i < limbsize; i += cc.batch) {
@@ -1014,12 +1015,12 @@ void LimbPartition::rescale() {
         s.wait(auxLimbs.getS());
         if (limbsize > 0) {
             constexpr ALGO algo = ALGO_SHOUP;
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             {
                 NTT_<false, algo, NTT_RESCALE>
@@ -1072,14 +1073,14 @@ bool LimbPartition::rescale2() {
 
     cudaSetDevice(device);
     constexpr ALGO algo = ALGO_SHOUP;
-    const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8)
+    const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8)
 
     // 1. top-pair INTT (gy=2), in place via the limbs' own aux staging, on the partition stream.
     {
         dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
         dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
         INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), 2}, blockDimFirst, bytesFirst,
                                         s.ptr()>>>(getGlobals(), limbptr.data + limbsize - 2,
@@ -1094,8 +1095,8 @@ bool LimbPartition::rescale2() {
     {
         dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
         dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
-        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
-        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+        int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
+        int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == ALGO_SHOUP ? 1 : 0));
         const int size = limbsize - 2;
 
         NTT_<false, algo, NTT_RESCALE2><<<dim3{cc.N / (blockDimFirst.x * M * 2), (uint32_t)size}, blockDimFirst,
@@ -1172,12 +1173,12 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
     // Per-digit conv/NTT below still fan out on the digit streams; each s_d.wait(s) picks up the
     // merged INTT's completion.
     {
-        const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+        const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
         dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
         dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
         for (int i = 0; i < limbsize; i += cc.batch) {
             STREAM(limb.at(i)).wait(s);
@@ -1912,12 +1913,12 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
             }
 
         if constexpr (1) {  // Batched
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             for (int i = 0; i < size; i += cc.batch) {
                 STREAM(limb.at(start + i)).wait(s);
@@ -1953,12 +1954,12 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
         }
 
         if constexpr (1) {  // Batched
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int size = c0.SPECIALlimb.size();
             for (int i = 0; i < size; i += cc.batch) {
@@ -2016,12 +2017,12 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
                 if (size <= 0)
                     break;
 
-                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+                const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
                 dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 for (int i = 0; i < size; i += cc.batch) {
                     STREAM(c0.limb.at(Lstart + i)).wait(s);
@@ -2106,12 +2107,12 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
             }
 
         if constexpr (1) {  // Batched
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             for (int i = 0; i < size; i += cc.batch) {
                 STREAM(limb.at(start + i)).wait(s);
@@ -2147,12 +2148,12 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
         }
 
         if constexpr (1) {  // Batched
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int size = c0.SPECIALlimb.size();
             for (int i = 0; i < size; i += cc.batch) {
@@ -2208,12 +2209,12 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
                 if (size <= 0)
                     break;
 
-                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+                const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
                 dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 for (int i = 0; i < size; i += cc.batch) {
                     STREAM(c0.limb.at(Lstart + i)).wait(s);
@@ -2288,12 +2289,12 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
             }
 
         if constexpr (1) {  // Batched
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             for (int i = 0; i < size; i += cc.batch) {
                 STREAM(limb.at(start + i)).wait(s);
@@ -2329,12 +2330,12 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
         }
 
         if constexpr (1) {  // Batched
-            const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+            const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
             dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
             dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-            int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-            int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+            int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             int size = c0.SPECIALlimb.size();
             for (int i = 0; i < size; i += cc.batch) {
@@ -2390,12 +2391,12 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
                 if (size <= 0)
                     break;
 
-                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+                const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
                 dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
                 dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-                int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+                int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 for (int i = 0; i < size; i += cc.batch) {
                     STREAM(c0.limb.at(Lstart + i)).wait(s);
@@ -2481,9 +2482,9 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
                 // Lever A: INTT the two top Q limbs in place (as rescale2 does), then ONE conversion from
                 // P u {q_b, q_a} to the limbs below q_b. NTT_MODDOWNR below multiplies by (P q_a q_b)^-1.
                 assert(limbsize >= 3 && cc.precom.constants[0].type == 0 && algo == ALGO_SHOUP);
-                const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;
+                const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;
                 dim3 bdF{(uint32_t)(1 << ((cc.logN) / 2 - 1))}, bdS{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-                int bF = (32 / M) * bdF.x * (2 * M + 1 + 1), bS = (32 / M) * bdS.x * (2 * M + 1 + 1);
+                int bF = (M == 4 ? 8 : 4) * bdF.x * (2 * M + 1 + 1), bS = (M == 4 ? 8 : 4) * bdS.x * (2 * M + 1 + 1);
                 INTT_<false, ALGO_SHOUP, INTT_NONE><<<dim3{cc.N / (bdF.x * M * 2), 2}, bdF, bF, s.ptr()>>>(
                     getGlobals(), limbptr.data + limbsize - 2, PARTITION(id, limbsize - 2), auxptr.data + limbsize - 2);
                 INTT_<true, ALGO_SHOUP, INTT_NONE><<<dim3{cc.N / (bdS.x * M * 2), 2}, bdS, bS, s.ptr()>>>(
@@ -2633,12 +2634,12 @@ void LimbPartition::modupInto(LimbPartition& partition, LimbPartition& aux_parti
         if (size <= 0)
             break;
 
-        const int M = (cc.precom.constants[0].type == 0) ? 8 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
+        const int M = (cc.precom.constants[0].type == 0) ? FIDES_NTT_M32 : 4;  // u32 tiles are byte-parity with u64 (kernel M=8): grid must be N/(bd*M*2)
 
         dim3 blockDimFirst{(uint32_t)(1 << ((cc.logN) / 2 - 1))};
         dim3 blockDimSecond = dim3{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
-        int bytesFirst = (32 / M) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
-        int bytesSecond = (32 / M) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
+        int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
         for (int i = 0; i < size; i += cc.batch) {
             STREAM(limb.at(start + i)).wait(s);
