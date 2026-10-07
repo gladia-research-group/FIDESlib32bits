@@ -130,6 +130,7 @@ void FIDESlib::CKKS::EvalLTStages(Ciphertext& ctxt, std::vector<BootstrapPrecomp
                 if (step.bStep * j + i < step.slots)
                     Aptr[step.bStep * j + i] = &(step.A[step.bStep * j + i]);
         const int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
+        LtPtMaskScope ptMaskScope(step.ptMask);
         LinearTransform(ctxt, step.slots, step.bStep, Aptr, stride, step.rotOut[0]);
     }
 }
@@ -250,11 +251,52 @@ void FIDESlib::CKKS::EvalCoeffsToSlots(Ciphertext& ctxt, int slots, bool decode)
                 int offset = step.rotOut[0];
                 // FIDESLIB_LT_TH_B1=k: triple-hoisted baby step (two hoisted layers, k * bStep/k) — price gate
                 static const int thB1 = [] { const char* e = std::getenv("FIDESLIB_LT_TH_B1"); return e ? std::atoi(e) : 0; }();
+                LtPtMaskScope ptMaskScope(step.ptMask);
                 if (thB1 > 1 && step.bStep % thB1 == 0 && step.bStep / thB1 > 1)
                     LinearTransformTH(ctxt, step.slots, step.bStep, thB1, Aptr, stride, offset);
                 else
                     LinearTransform(ctxt, step.slots, step.bStep, Aptr, stride, offset);
             }
         }
+    }
+}
+
+
+// Diagnostic (DiagSparsityDump): coefficient-form limbs 0..2 of the first `nd` diagonals of dense CtS stages 0, 1 and the
+// last StC stage, plus the first three primes, written into `dir` (runs inside the library so the struct layout is the
+// library's own).
+void FIDESlib::CKKS::dumpLtDiagCoeffs(ContextData& C, const char* dir, int nd) {
+    auto& pre = C.GetBootPrecomputation(C.N / 2);
+    {
+        std::ofstream f(std::string(dir) + "/primes.txt");
+        for (int l = 0; l < 3; ++l) f << C.prime[l].p << "\n";
+    }
+    std::cout << "[diag_sparse] N " << C.N << " primes " << C.prime[0].p << " " << C.prime[1].p << " " << C.prime[2].p
+              << " CtS stages " << pre.CtS.size() << " StC stages " << pre.StC.size() << "\n";
+    struct Sel { const char* tag; std::vector<BootstrapPrecomputation::LTstep>* v; int stage; };
+    for (Sel s : {Sel{"cts0", &pre.CtS, 0}, Sel{"cts1", &pre.CtS, 1}, Sel{"stc2", &pre.StC, (int)pre.StC.size() - 1}}) {
+        auto& st = (*s.v)[s.stage];
+        for (int k = 0; k < std::min<int>(nd, (int)st.A.size()); ++k) {
+            std::vector<std::vector<uint64_t>> nttLimbs;
+            st.A[k].c0.store(nttLimbs);
+            cudaDeviceSynchronize();
+            const int nl = (int)nttLimbs.size();
+            std::vector<uint64_t> moduli(nl);
+            for (int l = 0; l < nl; ++l) moduli[l] = C.prime[l].p;
+            RNSPoly r(C, nl - 1);
+            r.load(nttLimbs, moduli);
+            r.INTT(C.batch, true);
+            cudaDeviceSynchronize();
+            std::vector<std::vector<uint64_t>> limbs;
+            r.store(limbs);
+            const std::string base = std::string(dir) + "/" + s.tag + "_" + std::to_string(k);
+            for (int l = 0; l < 3; ++l) {
+                std::ofstream f(base + "_l" + std::to_string(l) + ".bin", std::ios::binary);
+                f.write((const char*)limbs[l].data(), limbs[l].size() * sizeof(uint64_t));
+            }
+            std::ofstream m(base + ".meta");
+            m << st.A[k].NoiseFactor << " " << st.A[k].c0.getLevel() << "\n";
+        }
+        std::cout << "[diag_sparse] dumped " << s.tag << " (" << st.A.size() << " diagonals)\n";
     }
 }

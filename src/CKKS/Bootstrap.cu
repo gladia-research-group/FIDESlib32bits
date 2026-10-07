@@ -1322,6 +1322,7 @@ static void ltStep(Ciphertext& ctxt, BootstrapPrecomputation::LTstep& step) {
             if (step.bStep * j + i < step.slots)
                 Aptr[step.bStep * j + i] = &(step.A[step.bStep * j + i]);
     const int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
+    LtPtMaskScope ptMaskScope(step.ptMask);
     LinearTransform(ctxt, step.slots, step.bStep, Aptr, stride, step.rotOut[0]);
 }
 

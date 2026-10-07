@@ -17,6 +17,18 @@
 namespace FIDESlib::CKKS {
 
 class KeySwitchingKey;
+/// Plaintext index mask the batched LT dot applies to its plaintext reads (CKKS/LimbPartitionBatch.cu); set per
+/// CtS/StC stage by LtPtMaskScope, all ones everywhere else.
+extern uint32_t g_ltPtMask;
+struct LtPtMaskScope {
+    uint32_t old;
+    // FIDESLIB_LT_COMPACT_BYPASS=1 (read per scope): full reads even when the stage has a mask (in-process gate)
+    explicit LtPtMaskScope(uint32_t m) : old(g_ltPtMask) {
+        const char* e = std::getenv("FIDESLIB_LT_COMPACT_BYPASS");
+        g_ltPtMask = (e && *e && *e != '0') ? 0xFFFFFFFFu : m;
+    }
+    ~LtPtMaskScope() { g_ltPtMask = old; }
+};
 struct AksStage;
 
 class BootstrapPrecomputation {
@@ -35,6 +47,10 @@ class BootstrapPrecomputation {
         std::vector<Plaintext> A;
         std::vector<int> rotIn;
         std::vector<int> rotOut;
+        // FIDESLIB_LT_COMPACT: the stage's diagonals are periodic / block-constant in their stored (NTT) layout, so the
+        // LT dot reads element (idx & ptMask) — the distinct values sit in a few cache lines (L2) instead of streaming
+        // the full limb from DRAM. All ones = full read. Data is unchanged, so any path ignoring the mask stays exact.
+        uint32_t ptMask = 0xFFFFFFFFu;
     };
 
     std::vector<LTstep> StC;

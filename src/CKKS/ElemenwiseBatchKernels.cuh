@@ -143,7 +143,7 @@ __global__ void dotProductLtBatchedPt___(void*** c0_out, void*** c1_out, void***
 __global__ void dotProductLtBatchedPt2___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
                                           const int bStep, const int gStep, const int primeidInit, const int n);
 __global__ void dotProductLtBatchedPt3___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
-                                          const int bStep, const int gStep, const int primeidInit, const int n);
+                                          const int bStep, const int gStep, const int primeidInit, const int n, uint32_t ptMask = 0xFFFFFFFFu);
 
 __global__ void addScaleB_(void** a, void** b, void** c, const int primeid_init);
 __global__ void scaleByP_(void** a, const int primeid_init);

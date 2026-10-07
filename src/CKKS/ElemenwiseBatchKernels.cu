@@ -2294,7 +2294,12 @@ __device__ __forceinline__ void dotProductLtBatchedPt3Body(void*** c0_out, void*
 template <typename T, typename ACC, int GSTEP>
 __device__ __forceinline__ void dotProductLtBatchedPt3BodyG(void*** c0_out, void*** c1_out, void*** c0_in,
                                                             void*** c1_in, void*** pts, const int bStep, const int n,
-                                                            const int idx, const int primeid) {
+                                                            const int idx, const int primeid,
+                                                            const uint32_t ptMask = 0xFFFFFFFFu) {
+    const int pidx = (int)((uint32_t)idx & ptMask);  // FIDESLIB_LT_COMPACT: periodic / block-constant diagonals
+    // compact diagonals must STAY in L2 (cached load); full ones keep the shipped evict-first streaming load
+    const bool compact = ptMask != 0xFFFFFFFFu;
+    auto ptld = [compact](const T* p) -> T { return compact ? __ldg(p) : FIDESLIB_STREAM_LD(p); };
     // Wide-prime guard: the u64 accumulator's "bStep up to 2^8" bound assumes 28-bit primes
     // (2^56 products). A 30-bit limb's products are 2^60, so bStep >= 16 wraps u64 silently.
     // Reduce per chunk on wide primes; the branch is uniform per primeid.
@@ -2322,10 +2327,10 @@ __device__ __forceinline__ void dotProductLtBatchedPt3BodyG(void*** c0_out, void
                 void** p1 = pts[k * bStep * GSTEP + j * bStep + i + 1];
                 void** p2 = pts[k * bStep * GSTEP + j * bStep + i + 2];
                 void** p3 = pts[k * bStep * GSTEP + j * bStep + i + 3];
-                ACC m0 = (p0 != nullptr) ? (ACC)in0 * (ACC)FIDESLIB_STREAM_LD((T*)p0[blockIdx.y] + idx) : (ACC)0;
-                ACC m1 = (p1 != nullptr) ? (ACC)in1 * (ACC)FIDESLIB_STREAM_LD((T*)p1[blockIdx.y] + idx) : (ACC)0;
-                ACC m2 = (p2 != nullptr) ? (ACC)in2 * (ACC)FIDESLIB_STREAM_LD((T*)p2[blockIdx.y] + idx) : (ACC)0;
-                ACC m3 = (p3 != nullptr) ? (ACC)in3 * (ACC)FIDESLIB_STREAM_LD((T*)p3[blockIdx.y] + idx) : (ACC)0;
+                ACC m0 = (p0 != nullptr) ? (ACC)in0 * (ACC)ptld((const T*)p0[blockIdx.y] + pidx) : (ACC)0;
+                ACC m1 = (p1 != nullptr) ? (ACC)in1 * (ACC)ptld((const T*)p1[blockIdx.y] + pidx) : (ACC)0;
+                ACC m2 = (p2 != nullptr) ? (ACC)in2 * (ACC)ptld((const T*)p2[blockIdx.y] + pidx) : (ACC)0;
+                ACC m3 = (p3 != nullptr) ? (ACC)in3 * (ACC)ptld((const T*)p3[blockIdx.y] + pidx) : (ACC)0;
                 acc[j] = acc[j] + m0 + m1 + m2 + m3;
                 // wide primes: 4 products = 2^62 on top of a <2^31 residue — reduce per quad.
                 if (wideAcc)
@@ -2342,8 +2347,8 @@ __device__ __forceinline__ void dotProductLtBatchedPt3BodyG(void*** c0_out, void
             for (int j = 0; j < GSTEP; ++j) {
                 void** p0 = pts[k * bStep * GSTEP + j * bStep + i];
                 void** p1 = pts[k * bStep * GSTEP + j * bStep + i + 1];
-                ACC m0 = (p0 != nullptr) ? (ACC)in0 * (ACC)FIDESLIB_STREAM_LD((T*)p0[blockIdx.y] + idx) : (ACC)0;
-                ACC m1 = (p1 != nullptr) ? (ACC)in1 * (ACC)FIDESLIB_STREAM_LD((T*)p1[blockIdx.y] + idx) : (ACC)0;
+                ACC m0 = (p0 != nullptr) ? (ACC)in0 * (ACC)ptld((const T*)p0[blockIdx.y] + pidx) : (ACC)0;
+                ACC m1 = (p1 != nullptr) ? (ACC)in1 * (ACC)ptld((const T*)p1[blockIdx.y] + pidx) : (ACC)0;
                 acc[j] = acc[j] + m0 + m1;
                 if (wideAcc)
                     acc[j] = (ACC)modreduce_lazy((uint64_t)acc[j], primeid);
@@ -2357,7 +2362,7 @@ __device__ __forceinline__ void dotProductLtBatchedPt3BodyG(void*** c0_out, void
                 void** pt_partition = pts[k * bStep * GSTEP + j * bStep + i];
                 ACC mult = 0;
                 if (pt_partition != nullptr)
-                    mult = (ACC)in * (ACC)FIDESLIB_STREAM_LD((T*)pt_partition[blockIdx.y] + idx);
+                    mult = (ACC)in * (ACC)ptld((const T*)pt_partition[blockIdx.y] + pidx);
                 acc[j] = acc[j] + mult;
                 if (wideAcc)
                     acc[j] = (ACC)modreduce_lazy((uint64_t)acc[j], primeid);
@@ -2370,7 +2375,8 @@ __device__ __forceinline__ void dotProductLtBatchedPt3BodyG(void*** c0_out, void
 }
 
 __global__ void dotProductLtBatchedPt3___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
-                                          const int bStep, const int gStep, const int primeidInit, const int n) {
+                                          const int bStep, const int gStep, const int primeidInit, const int n,
+                                          uint32_t ptMask) {
     int idx = threadIdx.x + threadIdx.z * blockDim.x + blockIdx.x * blockDim.x * blockDim.z;
     const int primeid = C_.primeid_flattened[primeidInit + blockIdx.y];
 
@@ -2380,11 +2386,11 @@ __global__ void dotProductLtBatchedPt3___(void*** c0_out, void*** c1_out, void**
         dotProductLtBatchedPt3Body<uint64_t, __uint128_t>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, n, idx,
                                                           primeid, buffer);
     else if (gStep == 2)
-        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 2>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid);
+        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 2>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
     else if (gStep == 4)
-        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 4>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid);
+        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 4>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
     else if (gStep == 1)
-        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 1>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid);
+        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 1>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
     else
         dotProductLtBatchedPt3Body<uint32_t, uint64_t>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, n, idx,
                                                        primeid, buffer);
