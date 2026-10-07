@@ -14,6 +14,7 @@
 #include <cmath>
 #include <iostream>
 #include "CKKS/Bootstrap.cuh"
+#include "CKKS/BootstrapStages.cuh"
 #include "CKKS/LinearTransform.cuh"
 #include "CKKS/AksKeys.cuh"
 #include "CKKS/SmallInt.cuh"
@@ -1170,3 +1171,300 @@ int FIDESlib::CKKS::BootstrapPrecapture(FIDESlib::CKKS::Context& /*cc*/) {
     return 0;
 }
 
+
+// ======================================================================================================================
+// Staged bootstrap (BootstrapStages.cuh): the production path of bootstrapImpl, one function per stage.
+// ======================================================================================================================
+namespace FIDESlib::CKKS {
+
+BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirst) {
+    ContextData& cc = ctxt.cc;
+    BtsState st;
+    assert(slots >= ctxt.slots);
+    st.slots = slots;
+    st.oldSlots = ctxt.slots;
+    st.prescaled = prescaled;
+    auto& pre = cc.GetBootPrecomputation(slots);
+    st.isLT = pre.LT.slots == slots;
+    double qDouble = (double)cc.prime[0].p;
+    for (int j_ = 1; j_ < cc.compositeDegree(); ++j_)
+        qDouble *= (double)cc.prime[j_].p;
+    const double powP = std::pow(2, cc.param.raw->p);
+    const int32_t deg = std::round(std::log2(qDouble / powP));
+    if (deg > static_cast<int32_t>(effCorrectionFactor(cc, slots)))
+        throw std::runtime_error("Bootstrap: deg=log2(q0/2^p)=" + std::to_string(deg) + " exceeds correctionFactor=" +
+                                 std::to_string(effCorrectionFactor(cc, slots)));
+    st.correction = effCorrectionFactor(cc, slots) - deg;
+    const double post = std::pow(2, static_cast<double>(deg));
+    double preF = 1. / post;
+    st.scalar = std::llround(post);
+    st.mixedChain = std::fabs(std::log2(cc.sfAtLimb(cc.L) * post / qDouble)) > 0.5;
+    if (st.mixedChain || cc.compositeDegree() > 1) {
+        preF = cc.sfAtLimb(cc.L - cc.compositeDegree() * pre.raise_drop) / qDouble;
+        st.scalar = 1;
+    }
+    st.sparseEncaps = pre.sparse_encaps;
+    st.sparseB = pre.sparseB != nullptr &&
+                 [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
+    st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst;
+    st.stcFolded = pre.stc_first_mode == 2;
+    const double k = cc.GetBootK();
+    st.constantEvalMult = preF * (1.0 / (k * cc.N)) * cc.getBtsPreScale();
+    st.baked = pre.cts0_const;
+    st.exactOnly = [] { const char* e = std::getenv("FIDESLIB_BTS_EXACT_ONLY"); return e && std::atoi(e) > 0; }();
+    st.exactConst = st.exactOnly || (st.baked != 0 && std::fabs(st.baked / st.constantEvalMult - 1.0) < 1e-9);
+    st.aksOn = st.exactConst && st.baked != 0 && pre.aks0 != nullptr;
+    st.corFactor = (uint64_t)1 << std::llround(st.correction);
+    st.nCtS = (st.isLT || st.sparseB) ? 1 : (int)pre.CtS.size();
+    st.nStC = (st.isLT || st.sparseB) ? 1 : (int)pre.StC.size();
+    return st;
+}
+
+void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st) {
+    CudaNvtxRange r(std::string{"bts::stc_first_input"});
+    if (!st.stcFirst)
+        return;
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    const int slots = st.slots;
+    auto& pre = cc.GetBootPrecomputation(slots);
+    if (ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    const int entry = pre.stc_first_entry;
+    if (ctxt.getLevel() < entry)
+        throw std::runtime_error("[stc_first] bootstrap input at limb index " + std::to_string(ctxt.getLevel()) +
+                                 " is below the StC-first entry level " + std::to_string(entry));
+    if (ctxt.getLevel() > entry)
+        ctxt.dropToLevel(entry);
+    ctxt.slots = cc.N / 2 == slots ? slots : 2 * slots;
+    if (!st.stcFolded) {
+        if (st.isLT)
+            EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, pre.LT_first);
+        else
+            EvalLTStages(ctxt, pre.StC_first, "StC1-stage-");
+        return;
+    }
+    const int d = cc.compositeDegree();
+    const int lastL = 2 * d - 1;
+    const double nfIn = ctxt.NoiseFactor;
+    const double targetSF = cc.sfAtLimb(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT) * d - d * pre.raise_drop);
+    const int cf = (int)effCorrectionFactor(cc, slots);
+    const double ratio = cc.sfAtLimb(entry) / nfIn;
+    const double factor = std::ldexp(1.0, -cf) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
+    const std::pair<int, long long> key{cf, std::llround(std::log2(nfIn) * 1e6)};
+    constexpr size_t kLastStageCache = 24;
+    if (st.isLT) {
+        auto it = pre.lt_first_last.find(key);
+        if (it == pre.lt_first_last.end()) {
+            if (pre.lt_first_last.size() >= kLastStageCache) {
+                cudaDeviceSynchronize();
+                pre.lt_first_last.erase(pre.lt_first_last.begin());
+            }
+            std::vector<Plaintext> v;
+            for (auto& pt : pre.LT.invA)
+                v.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
+            cudaDeviceSynchronize();
+            it = pre.lt_first_last.emplace(key, std::move(v)).first;
+        }
+        EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, it->second);
+    } else {
+        if (!pre.StC_first.empty())
+            EvalLTStages(ctxt, pre.StC_first, "StC1-stage-");
+        auto it = pre.stc_first_last.find(key);
+        if (it == pre.stc_first_last.end()) {
+            if (pre.stc_first_last.size() >= kLastStageCache) {
+                cudaDeviceSynchronize();
+                pre.stc_first_last.erase(pre.stc_first_last.begin());
+            }
+            auto& s0 = pre.StC.back();
+            BootstrapPrecomputation::LTstep o;
+            o.slots = s0.slots; o.bStep = s0.bStep; o.gStep = s0.gStep; o.rotIn = s0.rotIn; o.rotOut = s0.rotOut;
+            for (auto& pt : s0.A)
+                o.A.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
+            std::vector<BootstrapPrecomputation::LTstep> v;
+            v.push_back(std::move(o));
+            cudaDeviceSynchronize();
+            it = pre.stc_first_last.emplace(key, std::move(v)).first;
+        }
+        EvalLTStages(ctxt, it->second, "StC1-last-");
+    }
+    if (ctxt.getLevel() != lastL || ctxt.NoiseLevel != 2)
+        throw std::runtime_error("[stc_first] folded last stage left the ciphertext at limb index " +
+                                 std::to_string(ctxt.getLevel()));
+}
+
+void btsModRaise(Ciphertext& ctxt, BtsState& st) {
+    CudaNvtxRange r(std::string{"bts::mod_raise"});
+    ContextData& cc = ctxt.cc;
+    ModRaise(ctxt, st.slots, st.correction, st.prescaled || (st.stcFirst && st.stcFolded), st.sparseEncaps,
+             st.exactConst ? st.constantEvalMult : 0.0, st.aksOn);
+    st.shiftedFlow = st.exactConst && st.baked != 0 && !st.aksOn;
+    if (st.exactOnly && st.baked == 0 && st.exactConst)
+        ctxt.dropToLevel(ctxt.getLevel() - cc.compositeDegree());
+    if (!st.exactConst)
+        ctxt.multScalar(st.constantEvalMult, false);
+}
+
+void btsFold(Ciphertext& ctxt, const BtsState& st) {
+    CudaNvtxRange r(std::string{"bts::fold"});
+    ContextData& cc = ctxt.cc;
+    Accumulate(ctxt, cc.GetBootPrecomputation(st.slots).accumulate_bStep, st.slots, cc.N / 2 / st.slots);
+    ctxt.slots = cc.N / 2 == st.slots ? st.slots : 2 * st.slots;
+    if (ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+}
+
+static void ltStep(Ciphertext& ctxt, BootstrapPrecomputation::LTstep& step) {
+    assert(step.slots == step.A.size());
+    std::vector<Plaintext*> Aptr(step.slots, nullptr);
+    for (int j = 0; j < step.gStep; ++j)
+        for (int i = 0; i < step.bStep; ++i)
+            if (step.bStep * j + i < step.slots)
+                Aptr[step.bStep * j + i] = &(step.A[step.bStep * j + i]);
+    const int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
+    LinearTransform(ctxt, step.slots, step.bStep, Aptr, stride, step.rotOut[0]);
+}
+
+void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k) {
+    CudaNvtxRange r(std::string{"bts::cts_stage"});
+    ContextData& cc = ctxt.cc;
+    auto& pre = cc.GetBootPrecomputation(st.slots);
+    if (st.sparseB) {
+        SparseBCoeffsToSlots(ctxt, st.slots, pre);
+        return;
+    }
+    if (st.isLT) {
+        EvalLinearTransform(ctxt, st.slots, false);
+        return;
+    }
+    if (k == 0 && ctxt.NoiseLevel == 2)  // EvalCoeffsToSlots' entry rescale
+        ctxt.rescale();
+    auto& step = pre.CtS.at(k);
+    if (k == 0 && pre.aks0) {
+        LinearTransformAKS(ctxt, step, *pre.aks0);
+        return;
+    }
+    ltStep(ctxt, step);
+}
+
+void btsEvalMod(Ciphertext& ctxt, const BtsState& st) {
+    CudaNvtxRange r(std::string{"bts::eval_mod"});
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    Ciphertext aux(cc_);
+    if (cc.N / 2 == st.slots) {
+        aux.conjugate(ctxt);
+        Ciphertext ctxtEncI(cc_);
+        ctxtEncI.sub(ctxt, aux);
+        ctxt.add(aux);
+        ctxtEncI.multMonomial(3 * 2 * cc.N / 4);
+        if (cc.rescaleTechnique == CKKS::FIXEDMANUAL) {
+            ctxt.rescale();
+            ctxtEncI.rescale();
+        }
+        approxModReduction(ctxt, ctxtEncI, cc.GetEvalKey(ctxt.keyID), st.scalar);
+    } else if (st.sparseB) {
+        auto& sb = *cc.GetBootPrecomputation(st.slots).sparseB;
+        approxModReductionSparse(ctxt, st.scalar, sb.cheb, sb.daIts);
+    } else {
+        aux.conjugate(ctxt);
+        ctxt.add(aux);
+        if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
+            ctxt.rescale();
+        approxModReductionSparse(ctxt, st.scalar);
+    }
+    if (ctxt.NoiseLevel == 2 && !(st.stcFirst && cc.N / 2 == st.slots))
+        ctxt.rescale();
+}
+
+void btsStcFirstOutput(Ciphertext& ctxt, const BtsState& st) {
+    CudaNvtxRange r(std::string{"bts::stc_first_output"});
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    auto& pre = cc.GetBootPrecomputation(st.slots);
+    const uint64_t cfAll = st.corFactor << pre.stc_first_deg;
+    if (cfAll != 1)
+        multIntScalar(ctxt, cfAll);
+    if (cc.N / 2 != st.slots) {
+        const int lv = ctxt.getLevel();
+        auto it = pre.stc_first_mask_at.find(lv);
+        if (it == pre.stc_first_mask_at.end()) {
+            const int sh = (lv - pre.stc_first_mask->c0.getLevel()) / cc.compositeDegree();
+            it = pre.stc_first_mask_at.emplace(lv, relevelPlaintext(cc_, cc, *pre.stc_first_mask, sh, 1.0)).first;
+        }
+        ctxt.multPt(it->second, false);
+        Ciphertext aux(cc_);
+        aux.rotate(ctxt, st.slots);
+        ctxt.add(aux);
+    }
+    if (st.mixedChain && ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    ctxt.slots = st.oldSlots;
+}
+
+void btsStCEnter(Ciphertext& ctxt, const BtsState& st) {
+    ContextData& cc = ctxt.cc;
+    auto& pre = cc.GetBootPrecomputation(st.slots);
+    if (!st.isLT && !st.sparseB && !pre.StC.empty()) {
+        const int stcL = pre.StC.at(0).A.at(0).c0.getLevel();
+        if (ctxt.getLevel() > stcL) {
+            if (ctxt.NoiseLevel == 2)
+                ctxt.rescale();
+            if (ctxt.getLevel() > stcL)
+                ctxt.dropToLevel(stcL);
+        }
+    }
+}
+
+void btsStCStage(Ciphertext& ctxt, const BtsState& st, int k) {
+    CudaNvtxRange r(std::string{"bts::stc_stage"});
+    ContextData& cc = ctxt.cc;
+    auto& pre = cc.GetBootPrecomputation(st.slots);
+    if (st.sparseB) {
+        SparseBSlotsToCoeffs(ctxt, st.slots, pre);
+        return;
+    }
+    if (st.isLT) {
+        EvalLinearTransform(ctxt, st.slots, true);
+        return;
+    }
+    if (k == 0 && ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    ltStep(ctxt, pre.StC.at(k));
+}
+
+void btsFinish(Ciphertext& ctxt, const BtsState& st) {
+    CudaNvtxRange r(std::string{"bts::finish"});
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    if (cc.N / 2 != st.slots && !st.sparseB) {
+        Ciphertext aux(cc_);
+        aux.rotate(ctxt, st.slots);
+        ctxt.add(aux);
+    }
+    if (st.corFactor != 1)
+        multIntScalar(ctxt, st.corFactor);
+    if (st.mixedChain && ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    ctxt.slots = st.oldSlots;
+}
+
+void BootstrapStaged(Ciphertext& ctxt, int slots, bool prescaled) {
+    BtsState st = btsBegin(ctxt, slots, prescaled, true);
+    btsStcFirstInput(ctxt, st);
+    btsModRaise(ctxt, st);
+    btsFold(ctxt, st);
+    for (int k = 0; k < st.nCtS; ++k)
+        btsCtSStage(ctxt, st, k);
+    btsEvalMod(ctxt, st);
+    if (st.stcFirst) {
+        btsStcFirstOutput(ctxt, st);
+        return;
+    }
+    btsStCEnter(ctxt, st);
+    for (int k = 0; k < st.nStC; ++k)
+        btsStCStage(ctxt, st, k);
+    btsFinish(ctxt, st);
+}
+
+}  // namespace FIDESlib::CKKS
