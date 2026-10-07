@@ -46,6 +46,8 @@ std::shared_ptr<AksStage> MakeGhsKeyStage(Context& cc_, const std::vector<std::v
 /// Key-switch a SMALL-coefficient ciphertext (|coef| < q0, e.g. right after ModRaise) with a GHS key: exact lift of
 /// c1 to Q+P (k = 3 limbs), one dot, one ModDown. Noise = ModDown rounding + c1·e/P (negligible for small c1).
 void ghsSwitchSmall(Ciphertext& ct, AksStage& key);
+/// Same switch when ct.c1 is ALREADY extended to Q+P (NTT form, isModUp): one dot, one ModDown per output.
+void ghsSwitchExt(Ciphertext& ct, AksStage& key);
 /// Replace LinearTransform for CtS stage 0; ct must be the raised ciphertext (level L, NoiseLevel 1).
 void LinearTransformAKS(Ciphertext& ct, BootstrapPrecomputation::LTstep& step, AksStage& aks);
 }  // namespace FIDESlib::CKKS

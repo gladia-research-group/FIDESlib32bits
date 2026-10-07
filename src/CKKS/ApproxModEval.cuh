@@ -23,6 +23,8 @@ void approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwit
 void multIntScalar(Ciphertext& ctxt, uint64_t op);
 
 void approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post);
+/// Same with a per-route EvalMod (lever B: the K = 24 series of the repetition-aware sparse layout).
+void approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post, std::vector<double>& coefficients, int daIts);
 
 /** Runtime scope for the arcsine EvalMod correction: 1 = force on, 0 = force off, -1 = default (off).
  *  The 3 levels it consumes must be reserved at context build (FIDESLIB_SPARSE_ARCSINE). */

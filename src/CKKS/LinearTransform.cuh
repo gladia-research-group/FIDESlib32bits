@@ -10,6 +10,9 @@
 
 namespace FIDESlib::CKKS {
 
+/// Triple-hoisted BSGS price gate (two-layer baby step, b1 * b2 = bStep); see LinearTransform.cu.
+void LinearTransformTH(Ciphertext& ctxt, int rowSize, int bStep, int b1, const std::vector<Plaintext*>& pts, int stride,
+                       int offset);
 void LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, const std::vector<Plaintext*>& pts, int stride = 1,
                      int offset = 0);
 

@@ -2,6 +2,13 @@
 // Created by carlosad on 12/11/24.
 //
 
+#include <immintrin.h>
+#include <atomic>
+#include "CKKS/Lockstep.cuh"
+#include <exception>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include "CKKS/Discard.cuh"  // fusedRescaleFlag (lever A)
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Ciphertext.cuh"
@@ -82,6 +89,55 @@ static void applyArcsineCorrection(Ciphertext& y) {
 	(void)logged;
 }
 
+// ---- FIDESLIB_EVALMOD_LOCKSTEP (CKKS/Lockstep.cuh) -------------------------------------------------------------------
+namespace {
+struct Lockstep {
+	// spin handoff: a condition-variable wake costs ~20 us per turn (52 turns per bootstrap), more than the L2 gain
+	std::atomic<int> turn{0};  // 0 = the Re thread may issue, 1 = the Im thread
+	std::atomic<bool> done[2] = {false, false};
+	void pass(int to) { turn.store(to, std::memory_order_release); }
+	void wait(int me) {
+		while (turn.load(std::memory_order_acquire) != me && !done[1 - me].load(std::memory_order_acquire))
+			_mm_pause();
+	}
+	void finish(int me) {
+		done[me].store(true, std::memory_order_release);
+		turn.store(1 - me, std::memory_order_release);
+	}
+};
+thread_local Lockstep* tlLock = nullptr;
+thread_local int tlSide = 0;
+bool lockstepEnabled() {  // read per call: a test toggles it in-process for the bit-exact gate
+	const char* e = std::getenv("FIDESLIB_EVALMOD_LOCKSTEP");
+	return e && std::atoi(e) > 0;
+}
+}  // namespace
+namespace {
+thread_local int tlDepth = 0;  // nested relinearizing ops (mult -> adjust -> mult) count once
+}
+FIDESlib::CKKS::LockstepGuard::LockstepGuard() {
+	if (tlDepth++ == 0)
+		lockstepBeforeKeySwitch();
+}
+FIDESlib::CKKS::LockstepGuard::~LockstepGuard() {
+	if (--tlDepth == 0)
+		lockstepAfterKeySwitch();
+}
+// Re thread: hand the turn to Im before each key switch and wait until Im has issued the same one.
+void FIDESlib::CKKS::lockstepBeforeKeySwitch() {
+	if (tlLock && tlSide == 0) {
+		tlLock->pass(1);
+		tlLock->wait(0);
+	}
+}
+// Im thread: right after issuing a key switch, hand the turn back so Re issues the same key switch next.
+void FIDESlib::CKKS::lockstepAfterKeySwitch() {
+	if (tlLock && tlSide == 1) {
+		tlLock->pass(0);
+		tlLock->wait(1);
+	}
+}
+
 void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey, uint64_t post) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 
@@ -94,6 +150,36 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 
 	emStageProbe("EM-in-Re", ctxtEnc);
 	emStageProbe("EM-in-Im", ctxtEncI);
+	if (COMPLEX && lockstepEnabled() && !FIDESlib::CKKS::g_btsStageStash && !tlLock) {
+		// both halves (Chebyshev + double angle) in lockstep; identical op sequences, so the key switches pair up
+		Lockstep L;
+		const int dev = ctxtEnc.c0.GPU.at(0).device;
+		std::exception_ptr err;
+		std::thread im([&] {
+			cudaSetDevice(dev);
+			tlLock = &L;
+			tlSide = 1;
+			L.wait(1);
+			try {
+				evalChebyshevSeries(ctxtEncI, cc.GetCoeffsChebyshev(), -1.0, 1.0);
+				applyDoubleAngleIterations(ctxtEncI, cc.GetDoubleAngleIts(), keySwitchingKey);
+			} catch (...) {
+				err = std::current_exception();
+			}
+			tlLock = nullptr;
+			L.finish(1);
+		});
+		tlLock = &L;
+		tlSide = 0;
+		evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), -1.0, 1.0);
+		applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+		tlLock = nullptr;
+		L.finish(0);
+		im.join();
+		if (err)
+			std::rethrow_exception(err);
+		goto after_da;
+	}
 	if constexpr (COMPLEX)
 		evalChebyshevSeries(ctxtEncI, cc.GetCoeffsChebyshev(), -1.0, 1.0);
 	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), -1.0, 1.0);
@@ -118,6 +204,7 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
 	if constexpr (COMPLEX)
 		applyDoubleAngleIterations(ctxtEncI, cc.GetDoubleAngleIts(), keySwitchingKey);
+after_da:
 	emStageProbe("EM-DA-Re", ctxtEnc);
 	emStageProbe("EM-DA-Im", ctxtEncI);
 	if (!sparseArcsineMode() && arcsineEnabled()) {
@@ -167,12 +254,17 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 }
 
 void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post) {
+	approxModReductionSparse(ctxtEnc, post, ctxtEnc.cc.GetCoeffsChebyshev(), ctxtEnc.cc.GetDoubleAngleIts());
+}
+
+void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post, std::vector<double>& coefficients,
+                                               int daIts) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	ContextData& cc = ctxtEnc.cc;
 
 	KeySwitchingKey& keySwitchingKey = cc.GetEvalKey(ctxtEnc.keyID);
 
-	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), (double)-1.0, (double)1.0);
+	evalChebyshevSeries(ctxtEnc, coefficients, (double)-1.0, (double)1.0);
 
 	if constexpr (PRINT) {
 		std::cout << "ctxtEnc res " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
@@ -182,7 +274,7 @@ void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post
 		}
 		std::cout << std::endl;
 	}
-	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+	applyDoubleAngleIterations(ctxtEnc, daIts, keySwitchingKey);
 	// dual-slots mode: this precomp carries the +3 reservation — the
 	// correction MUST run unconditionally (reserve-without-consume is fatal)
 	if (sparseArcsineMode() || arcsineEnabled())

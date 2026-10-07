@@ -176,14 +176,28 @@ std::shared_ptr<AksStage> MakeGhsKeyStage(Context& cc_, const std::vector<std::v
     return st;
 }
 
+static void ghsSwitchWithExt(Ciphertext& ct, AksStage& key, RNSPoly& ext);
+
 void ghsSwitchSmall(Ciphertext& ct, AksStage& key) {
     ContextData& cc = ct.cc;
-    const int L = cc.L, N = cc.N, K = (int)cc.specialPrime.size();
+    const int L = cc.L;
     assert(ct.getLevel() == L && key.r == 1);
     cudaSetDevice(cc.GPUid[0]);
     RNSPoly ext(cc, L);
     ext.copy(ct.c1);
     smallIntLiftToSpecial(cc, ext, 3);
+    ghsSwitchWithExt(ct, key, ext);
+}
+
+void ghsSwitchExt(Ciphertext& ct, AksStage& key) {
+    assert(ct.c1.isModUp() && key.r == 1);
+    cudaSetDevice(ct.cc.GPUid[0]);
+    ghsSwitchWithExt(ct, key, ct.c1);
+}
+
+static void ghsSwitchWithExt(Ciphertext& ct, AksStage& key, RNSPoly& ext) {
+    ContextData& cc = ct.cc;
+    const int L = cc.L, N = cc.N, K = (int)cc.specialPrime.size();
     RNSPoly acc0(cc, L), acc1(cc, L);
     acc0.generateSpecialLimbs(false, false);
     acc1.generateSpecialLimbs(false, false);
@@ -207,6 +221,10 @@ void ghsSwitchSmall(Ciphertext& ct, AksStage& key) {
     acc0.moddown(true, false, 0);
     acc1.moddown(true, false, 1);
     ct.c0.add(acc0);
+    if (&ext == &ct.c1) {  // the extended c1 is replaced by the switched one (back over Q only)
+        ct.c1.freeSpecialLimbs();
+        ct.c1.SetModUp(false);
+    }
     ct.c1.copy(acc1);
 }
 
