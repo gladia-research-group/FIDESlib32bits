@@ -76,8 +76,8 @@ class BootstrapPrecomputation {
     // rather than in the (ctxA,ctxB)-keyed secret-switching registry because both directions
     // are (main,main) with the same keyID there — the second emplace is silently dropped and
     // the M-4 fetch would return the M-2 key.
-    std::unique_ptr<KeySwitchingKey> sparse_atob;  // dense -> sparse (M-4), applied at the composite bottom
-    std::unique_ptr<KeySwitchingKey> sparse_btoa;  // sparse -> dense (M-2), applied at the raised level
+    std::shared_ptr<KeySwitchingKey> sparse_atob;  // dense -> sparse (M-4), applied at the composite bottom
+    std::shared_ptr<KeySwitchingKey> sparse_btoa;  // sparse -> dense (M-2), applied at the raised level (shared with the raise variants)
     std::shared_ptr<AksStage> aks0;  // aggregated key switching for CtS stage 0 (CKKS/AksKeys.cuh), optional
     std::shared_ptr<AksStage> ghs_btoa;  // GHS form of sparse_btoa (digit keys summed) for the small raised ciphertext
     // FIDESLIB_BTS_SHIFT: the post-raise EvalMod constant (pre / (k N) * btsPreScale) folded into the stage-0
@@ -135,6 +135,12 @@ class BootstrapPrecomputation {
         int daIts = 5;
     };
     std::unique_ptr<SparseB> sparseB;
+    // Per-site level-aware ModRaise: this route's precomputation re-levelled for a raise that stops `drop`
+    // composite levels below the top (drop > raise_drop), keyed by drop. Built by AddBootstrapRaiseVariant,
+    // served by ContextData::GetBootPrecomputation while btsRaiseDrop == drop (the wrapper's RaiseScope around a
+    // planted bootstrap whose plan carries raise_drop). Plaintexts are the base's moved down by drop - raise_drop
+    // (relevelPlaintext, exact), the last StC stage compensates sf(base top) / sf(variant top); keys are shared.
+    std::map<int, std::unique_ptr<BootstrapPrecomputation>> raise_variants;
 };
 
 }  // namespace FIDESlib::CKKS

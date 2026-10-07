@@ -167,6 +167,15 @@ class ContextData {
     void setCorrectionFactorOverride(int cf);
     int getCorrectionFactorOverride() const;
     int correctionFactorOverride = -1;
+    /** Per-site level-aware ModRaise: while > the route's static raise_drop, GetBootPrecomputation(slots) serves the
+     *  route's raise variant for that drop (AddBootstrapRaiseVariant). Set around one planted bootstrap by the
+     *  wrapper (plan 'raise_drop'; the C++ harness sets it from BTS_RAISE_VARIANT). Never read from the env here:
+     *  the precomputation setup itself goes through GetBootPrecomputation before any variant exists. */
+    int btsRaiseDrop = 0;
+    void setBtsRaiseDrop(int drop);
+    int getBtsRaiseDrop() const;
+    int btsRaiseDropEffective() const;
+    BootstrapPrecomputation& GetBootPrecomputationBase(int slots);
 
     /** Bootstrap input pre-scale (armed per call by the wrapper, same discipline as the
      *  correction-factor override): the next Bootstrap multiplies its input by this

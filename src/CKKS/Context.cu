@@ -643,12 +643,12 @@ bool ContextData::HasBootPrecomputation(int slots) {
 
     return precom.boot.contains(slots);
 }
-BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
+void ContextData::setBtsRaiseDrop(int drop) { btsRaiseDrop = drop; }
+int ContextData::getBtsRaiseDrop() const { return btsRaiseDrop; }
+int ContextData::btsRaiseDropEffective() const { return btsRaiseDrop > 0 ? btsRaiseDrop : 0; }
+
+BootstrapPrecomputation& ContextData::GetBootPrecomputationBase(int slots) {
     if (!precom.boot.contains(slots)) {
-        // was assert(...) — a NO-OP in release, so a missing slot silently
-        // default-constructed an empty precomp and Bootstrap deref'd null ->
-        // segfault. Throw with the requested slot count so the miss is visible
-        // (diagnoses the complex+dual-precomp block-0 crash).
         std::string have;
         for (const auto& [s, _] : precom.boot) have += " " + std::to_string(s);
         throw std::runtime_error(
@@ -656,6 +656,19 @@ BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
             " (have:" + have + ")");
     }
     return precom.boot[slots];
+}
+
+BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
+    BootstrapPrecomputation& base = GetBootPrecomputationBase(slots);
+    const int drop = btsRaiseDropEffective();
+    if (drop <= base.raise_drop)
+        return base;
+    auto it = base.raise_variants.find(drop);
+    if (it == base.raise_variants.end())
+        throw std::runtime_error("GetBootPrecomputation: no raise variant for drop " + std::to_string(drop) +
+                                 " at slots=" + std::to_string(slots) +
+                                 " (build it: FIDESLIB_BTS_RAISE_DROPS=k,.. or SetBootstrapRaiseDrops before LoadContext)");
+    return *it->second;
 }
 
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, int slots) {

@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <sstream>
 #include <random>
 #include <unordered_map>
 #include "CryptoContext.hpp"
@@ -445,6 +447,17 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 			for (const auto& [slots, _] : precom) {
 				FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, static_cast<int32_t>(slots), c);
 			}
+			// per-site level-aware ModRaise variants (SetBootstrapRaiseDrops / FIDESLIB_BTS_RAISE_DROPS)
+			std::set<int> drops(this->bts_raise_drops.begin(), this->bts_raise_drops.end());
+			if (const char* e = std::getenv("FIDESLIB_BTS_RAISE_DROPS"); e && *e) {
+				std::stringstream ss{std::string(e)};
+				std::string tok;
+				while (std::getline(ss, tok, ','))
+					if (!tok.empty() && std::atoi(tok.c_str()) > 0) drops.insert(std::atoi(tok.c_str()));
+			}
+			for (const auto& [slots, _] : precom)
+				for (int k : drops)
+					FIDESlib::CKKS::AddBootstrapRaiseVariant(context, static_cast<int32_t>(slots), c, k);
 		}
 	}
 

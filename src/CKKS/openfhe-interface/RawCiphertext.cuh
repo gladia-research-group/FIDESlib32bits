@@ -147,6 +147,11 @@ void AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int 
                             FIDESlib::CKKS::BootstrapPrecomputation& result);
 
 /** Used in GenBootstrapKeys and AddBootstrapKeys */
+/** Per-site level-aware ModRaise: build the route's precomputation variant for a raise stopping `drop` composite
+ *  levels below the top (base.raise_variants[drop]; base must exist, drop > base.raise_drop). */
+void AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
+                              FIDESlib::CKKS::Context& GPUcc_, int drop);
+
 std::vector<int> GetBootstrapIndexes(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
                                      FIDESlib::CKKS::BootstrapPrecomputation* result_);
 
