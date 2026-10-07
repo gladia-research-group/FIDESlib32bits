@@ -2,6 +2,7 @@
 // Created by carlosad on 24/04/24.
 //
 
+#include "CKKS/Lockstep.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/Discard.cuh"
@@ -548,6 +549,7 @@ RNSPoly& MGPUkeySwitchCore(RNSPoly& in, const KeySwitchingKey& kskEval, const bo
 }
 
 void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	assert(keyID == b.keyID);
@@ -835,6 +837,7 @@ void Ciphertext::multAccumulateBatch(const std::vector<const Ciphertext*>& a, co
 }
 
 void Ciphertext::square(bool rescale) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	Out(KEYSWITCH, " start ");
@@ -1515,6 +1518,7 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 }
 
 void Ciphertext::mult(const Ciphertext& b, const Ciphertext& c, bool rescale) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	// Lever E1: out-of-place relinearised product, no copy of an operand into *this first.
 	if (pwFuseFlag() && this != &b && this != &c && b.NoiseLevel == 1 && c.NoiseLevel == 1 &&
 	    b.getLevel() == c.getLevel() && b.keyID == c.keyID && cc.GPUid.size() == 1 && !fusedRescaleFlag()) {
@@ -1551,6 +1555,7 @@ void Ciphertext::mult(const Ciphertext& b, const Ciphertext& c, bool rescale) {
 }
 
 void Ciphertext::square(const Ciphertext& src, bool rescale) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	if (this == &src) {
 		this->square(rescale);
 	} else if (pwFuseFlag() && src.NoiseLevel == 1 && cc.GPUid.size() == 1 && !fusedRescaleFlag()) {

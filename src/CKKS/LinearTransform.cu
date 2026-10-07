@@ -129,6 +129,7 @@ void MultPtBatch(std::vector<std::shared_ptr<Ciphertext>>& results, Ciphertext& 
 }
 }  // namespace FIDESlib::CKKS
 
+
 static int ltChunkEnv() {
     const char* e = std::getenv("FIDESLIB_LT_CHUNK");
     return e ? std::atoi(e) : 0;
@@ -1299,4 +1300,107 @@ void FIDESlib::CKKS::LinearTransformSpecialPt(FIDESlib::CKKS::Ciphertext& ctxt1,
     }
 
     ctxt1.copy(result);
+}
+
+
+// Triple-hoisted BSGS (Akherati & Zhang, arXiv 2605.17222) price gate: the baby step i = i1 + b1*i2 is split into two
+// hoisted layers — rot_{i1}(ct) for i1 < b1 (one decompose of ct, b1-1 keys, moddown), then rot_{b1*i2} of each of those
+// (one decompose per i1, b2-1 SHARED keys) — so only (b1-1)+(b2-1) distinct baby keys are streamed per stage. Same key
+// switch count as the shipped hoisted step, plus b1-1 decomposes and moddowns. Without a fused multi-input key-dot the
+// shared keys are re-streamed per i1; this measures the extra-pass cost. Giant step and dot are the shipped ones.
+void FIDESlib::CKKS::LinearTransformTH(Ciphertext& ctxt, int rowSize, int bStep, int b1, const std::vector<Plaintext*>& pts,
+                                       int stride, int offset) {
+    CudaNvtxRange r(std::string{sc::current().function_name()});
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    if (bStep % b1 != 0)
+        throw std::runtime_error("LinearTransformTH: b1 must divide bStep");
+    const int b2 = bStep / b1;
+    const uint32_t gStep = ceil(static_cast<double>(rowSize) / bStep);
+    if (ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    // layer 1: R1[i1] = rot_{i1 * stride}(ct), moddowned
+    std::vector<Ciphertext> R1;
+    R1.reserve(b1);
+    std::vector<Ciphertext*> R1p;
+    std::vector<int> idx1;
+    for (int i = 0; i < b1; ++i) {
+        R1.emplace_back(cc_);
+        R1.back().growToLevel(ctxt.getLevel());
+        R1.back().dropToLevel(ctxt.getLevel());
+        R1p.push_back(&R1.back());
+        idx1.push_back(i * stride);
+    }
+    ctxt.rotate_hoisted(idx1, R1p, false);
+    // layer 2: F[i1 + b1*i2] = rot_{b1*i2*stride}(R1[i1]), left in Q+P for the hoisted dot
+    std::vector<Ciphertext> F;
+    F.reserve(bStep);
+    for (int i = 0; i < bStep; ++i) {
+        F.emplace_back(cc_);
+        F.back().growToLevel(ctxt.getLevel());
+        F.back().dropToLevel(ctxt.getLevel());
+        F.back().extend(false);
+    }
+    std::vector<int> idx2;
+    for (int i2 = 0; i2 < b2; ++i2)
+        idx2.push_back(b1 * i2 * stride);
+    for (int i1 = 0; i1 < b1; ++i1) {
+        std::vector<Ciphertext*> out;
+        for (int i2 = 0; i2 < b2; ++i2)
+            out.push_back(&F[i1 + b1 * i2]);
+        R1[i1].rotate_hoisted(idx2, out, true);
+    }
+    std::vector<Ciphertext*> fastRotationPtr;
+    for (auto& f : F)
+        fastRotationPtr.push_back(&f);
+    std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
+    for (uint32_t j = 0; j < gStep; ++j)
+        for (int i = 0; i < bStep; ++i)
+            if (bStep * (int)j + i < rowSize)
+                Aptr[bStep * j + i] = pts[bStep * j + i];
+    std::vector<std::shared_ptr<Ciphertext>> results;
+    for (uint32_t i = 0; i < gStep; ++i) {
+        results.emplace_back(std::make_shared<Ciphertext>(cc_));
+        results.back()->growToLevel(ctxt.getLevel());
+        results.back()->dropToLevel(ctxt.getLevel());
+        results.back()->extend(false);
+    }
+    for (auto& i : results)
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+            results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+        }
+    for (auto& i : fastRotationPtr)
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+            results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+        }
+    DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep, true);
+    for (auto& i : results)
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            i->c0.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+            i->c1.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+        }
+    for (uint32_t j = gStep - 1; j < gStep; --j) {
+        if (j != gStep - 1) {
+            if (results[j + 1]->c1.isModUp())
+                results[j]->extend();
+            results[j]->add(*results[j + 1]);
+            results.pop_back();
+        }
+        if (j > 0) {
+            if ((bStep * stride) % (cc.N / 2) != 0) {
+                if (results[j]->c1.isModUp())
+                    results[j]->c1.moddown(true, false);
+                results[j]->rotate((int)bStep * stride, false);
+            }
+        } else if (offset != 0) {
+            if (results[j]->c1.isModUp())
+                results[j]->c1.moddown(true, false);
+            results[j]->rotate(offset, true);
+        } else if (results[j]->c1.isModUp()) {
+            results[j]->modDown(false);
+        }
+    }
+    ctxt.takeFrom(*results[0]);
 }

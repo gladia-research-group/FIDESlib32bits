@@ -14,8 +14,10 @@
 #include <cmath>
 #include <iostream>
 #include "CKKS/Bootstrap.cuh"
+#include "CKKS/LinearTransform.cuh"
 #include "CKKS/AksKeys.cuh"
 #include "CKKS/SmallInt.cuh"
+#include "CKKS/SparseB.cuh"
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/CoeffsToSlots.cuh"
@@ -115,7 +117,7 @@ void FIDESlib::CKKS::BootstrapCPUraise(
     // COMPOSITESCALING always uses the sf/q0 normalization (OpenFHE: pre = sf[0]/qDouble,
     // no integer 2^deg recovery) — the same constants the mixed-chain arm implements.
     if (mixedChain || cc.compositeDegree() > 1) {
-        pre    = cc.sfAtLimb(cc.L) / qDouble;
+        pre    = cc.sfAtLimb(cc.L - cc.compositeDegree() * cc.GetBootPrecomputation(slots).raise_drop) / qDouble;
         scalar = 1;
     }
 
@@ -233,7 +235,30 @@ void FIDESlib::CKKS::BootstrapCPUraise(
 
 namespace FIDESlib::CKKS {
 
+static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescaled, const bool allowStcFirst);
+
+std::function<void(Ciphertext&, int, bool)> g_bootstrapOverride;
+
 void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
+    static thread_local bool inOverride = false;
+    if (g_bootstrapOverride && !inOverride) {
+        inOverride = true;
+        try {
+            g_bootstrapOverride(ctxt, slots, prescaled);
+        } catch (...) {
+            inOverride = false;
+            throw;
+        }
+        inOverride = false;
+        return;
+    }
+    bootstrapImpl(ctxt, slots, prescaled, true);
+}
+
+// FIDESLIB_BTS_STC_FIRST_AB=<dir>: in-model A/B of the StC-first order — the first few bootstraps that take it also run the
+// shipped order on a copy of the SAME input; input and both outputs are exact-decrypted (FIDESLIB_DIAG_SK=1) into <dir>
+// for the offline comparison (logs/bts_traffic/stcfirst_ab.py).
+static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescaled, const bool allowStcFirst) {
     CudaNvtxRange r(std::string{sc::current().function_name()});
 
     assert(slots >= ctxt.slots);
@@ -290,13 +315,134 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
     // COMPOSITESCALING always uses the sf/q0 normalization (OpenFHE: pre = sf[0]/qDouble,
     // no integer 2^deg recovery) — the same constants the mixed-chain arm implements.
     if (mixedChain || cc.compositeDegree() > 1) {
-        pre    = cc.sfAtLimb(cc.L) / qDouble;
+        pre    = cc.sfAtLimb(cc.L - cc.compositeDegree() * cc.GetBootPrecomputation(slots).raise_drop) / qDouble;
         scalar = 1;
     }
 
     //////////////////////////////////////////////////////////////////////
     bool sparse_encaps = cc.GetBootPrecomputation(slots).sparse_encaps;
     bool shiftedFlow = false;  // FIDESLIB_BTS_SHIFT path taken (exact scaling, +d level)
+
+    // FIDESLIB_BTS_STC_FIRST (lever A, slim order): SlotsToCoeffs on the INPUT ciphertext, at <= entry + 1 limbs,
+    // before the raise. The raised polynomial then carries (Re z ; Im z) as coefficients and EvalMod's output is the
+    // bootstrap output. The StC levels are paid from the input (entry = 2d-1 limbs for ModRaise's adjust+rescale plus
+    // d per StC stage), the landing moves up by the same amount. Sparse routes: the shipped StC_sparse is
+    // diag(U0, i U0); the fold turns its output into (1+Y^s) Q(Y) / 2, i.e. the halves (a-b ; a+b)/2 come out of
+    // EvalMod, and the mask (1-i ; 1+i) + rotate(slots) recombines z = a + ib (see BootstrapPrecomputation.cuh).
+    // lever B route (standard order); FIDESLIB_BTS_SPARSE_B_RUN=0 keeps the precomputation but runs the shipped path
+    // (calibration: the same context, both flows)
+    const bool sparseB = cc.GetBootPrecomputation(slots).sparseB != nullptr &&
+                         [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
+    const bool stcFirst = cc.GetBootPrecomputation(slots).stc_first_mode > 0 && !sparseB && allowStcFirst;
+    static int abCount = 0;
+    std::unique_ptr<Ciphertext> abRef;
+    std::string abDir;
+    if (stcFirst) {
+        if (const char* e = std::getenv("FIDESLIB_BTS_STC_FIRST_AB"); e && *e && abCount < 8) {
+            abDir = e;
+            const std::string base = abDir + "/" + std::to_string(abCount) + "-s" + std::to_string(slots);
+            cudaDeviceSynchronize();
+            exactDecryptDump(ctxt, (base + "-in.ct").c_str());
+            abRef = std::make_unique<Ciphertext>(cc_);
+            abRef->copy(ctxt);
+            bootstrapImpl(*abRef, slots, prescaled, false);  // the shipped order on the same input
+            cudaDeviceSynchronize();
+            exactDecryptDump(*abRef, (base + "-std.ct").c_str());
+            std::cerr << "[stc_first_ab] #" << abCount << " slots=" << slots << " in level " << ctxt.getLevel() << " deg "
+                      << ctxt.NoiseLevel << " NF " << ctxt.NoiseFactor << " cf " << effCorrectionFactor(cc, slots)
+                      << " -> std out level " << abRef->getLevel() << " deg " << abRef->NoiseLevel << "\n";
+        }
+    }
+    const bool stcFolded = cc.GetBootPrecomputation(slots).stc_first_mode == 2;  // last stage carries the adjust
+    if (stcFirst) {
+        auto& pre = cc.GetBootPrecomputation(slots);
+        if (ctxt.NoiseLevel == 2)
+            ctxt.rescale();
+        const int entry = pre.stc_first_entry;
+        if (ctxt.getLevel() < entry)
+            throw std::runtime_error("[stc_first] bootstrap input at limb index " + std::to_string(ctxt.getLevel()) +
+                                     " is below the StC-first entry level " + std::to_string(entry) +
+                                     " (the input must keep " + std::to_string(entry + 1) + " limbs)");
+        if (ctxt.getLevel() > entry)
+            ctxt.dropToLevel(entry);
+        ctxt.slots = cc.N / 2 == slots ? slots : 2 * slots;  // the 2*slots view the sparse StC stages are indexed in
+        btsStageProbe("pre-StC1", ctxt);
+        if (!stcFolded) {
+            if (isLT)
+                EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, pre.LT_first);
+            else
+                EvalLTStages(ctxt, pre.StC_first, "StC1-stage-");
+        } else {
+            // The last stage's plaintexts carry 2^-deg (scaleDec compensation), 2^-correction and the FLEXIBLEAUTO
+            // re-nominalization, so that after multPt + ModRaise's prescaled rescale the integers are v*targetSF*2^-c:
+            // factor = 2^-CF * (targetSF / sf(d-1)) * (sf(entry) / NF_in)   [NF_in = true scale after the drop; the
+            // stages before the last multiply NF by sf(l)/sf(entry), their rescales telescope]
+            const int d = cc.compositeDegree();
+            const int lastL = 2 * d - 1;
+            const double nfIn = ctxt.NoiseFactor;
+            const double targetSF = cc.sfAtLimb(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT) * d - d * pre.raise_drop);
+            const int cf = (int)effCorrectionFactor(cc, slots);
+            // The input-scale ratio MUST ride the plaintext (before the raise): folding it into the exact post-raise
+            // scaling also scales the q0*I term, which EvalMod needs as integer multiples (chain96/97: garbage).
+            const double ratio = cc.sfAtLimb(entry) / nfIn;
+            const double factor = std::ldexp(1.0, -cf) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
+            const std::pair<int, long long> key{cf, std::llround(std::log2(nfIn) * 1e6)};  // nominal scales per level
+            // The cached last stages must keep their special limbs (the Q-only variant lost 15 bits, chain93); the
+            // cache is bounded (each entry ~0.2 GB; a plan's distinct (CF, input level) pairs are a few tens).
+            constexpr size_t kLastStageCache = 24;
+            if (isLT) {
+                auto it = pre.lt_first_last.find(key);
+                if (it == pre.lt_first_last.end()) {
+                    if (pre.lt_first_last.size() >= kLastStageCache) {
+                        cudaDeviceSynchronize();  // the evicted plaintexts may still be read by the previous bootstrap's kernels
+                        pre.lt_first_last.erase(pre.lt_first_last.begin());
+                    }
+                    std::vector<Plaintext> v;
+                    v.reserve(pre.LT.invA.size());
+                    for (auto& pt : pre.LT.invA)
+                        v.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
+                    cudaDeviceSynchronize();
+                    it = pre.lt_first_last.emplace(key, std::move(v)).first;
+                }
+                EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, it->second);
+            } else {
+                if (!pre.StC_first.empty())
+                    EvalLTStages(ctxt, pre.StC_first, "StC1-stage-");
+                auto it = pre.stc_first_last.find(key);
+                if (it == pre.stc_first_last.end()) {
+                    if (pre.stc_first_last.size() >= kLastStageCache) {
+                        cudaDeviceSynchronize();  // the evicted plaintexts may still be read by the previous bootstrap's kernels
+                        pre.stc_first_last.erase(pre.stc_first_last.begin());
+                    }
+                    auto& st = pre.StC.back();
+                    BootstrapPrecomputation::LTstep o;
+                    o.slots = st.slots; o.bStep = st.bStep; o.gStep = st.gStep; o.rotIn = st.rotIn; o.rotOut = st.rotOut;
+                    o.A.reserve(st.A.size());
+                    for (auto& pt : st.A)
+                        o.A.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
+                    std::vector<BootstrapPrecomputation::LTstep> v;
+                    v.push_back(std::move(o));
+                    cudaDeviceSynchronize();
+                    it = pre.stc_first_last.emplace(key, std::move(v)).first;
+                }
+                EvalLTStages(ctxt, it->second, "StC1-last-");
+            }
+            // ModRaise's prescaled path expects the deg-2 ciphertext at limb index 2d-1
+            if (ctxt.getLevel() != lastL || ctxt.NoiseLevel != 2)
+                throw std::runtime_error("[stc_first] folded last stage left the ciphertext at limb index " +
+                                         std::to_string(ctxt.getLevel()) + " deg " + std::to_string(ctxt.NoiseLevel));
+        }
+        btsStageProbe("post-StC1", ctxt);
+        if (const char* e = std::getenv("FIDESLIB_BTS_STC_FIRST_DIAG"); e && std::atoi(e) > 0) {
+            static int once = 0;
+            if (once++ < 2)
+                std::cerr << "[stc_first] diag: entry limb " << entry << " sf(entry) " << cc.sfAtLimb(entry) << " sf(L) "
+                          << cc.sfAtLimb(cc.L) << " post-StC level " << ctxt.getLevel() << " NoiseLevel " << ctxt.NoiseLevel
+                          << " NF " << ctxt.NoiseFactor << " sf(level) " << cc.sfAtLimb(ctxt.getLevel())
+                          << " sf(level-d) " << cc.sfAtLimb(ctxt.getLevel() - cc.compositeDegree()) << " q0 "
+                          << qDouble << " deg " << deg << " corr " << correction << "\n";
+        }
+    }
 
     {
         // Coefficients of the Chebyshev series interpolating 1/(2 Pi) Sin(2 Pi K x)
@@ -313,7 +459,7 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
             std::cerr << "[bts_shift] WARNING: baked constant " << baked << " != runtime " << constantEvalMult
                       << " (or sparse slots): falling back to multScalar, the level gain is lost\n";
         const bool aksOn = exactConst && baked != 0 && cc.GetBootPrecomputation(slots).aks0 != nullptr;
-        ModRaise(ctxt, slots, correction, prescaled, sparse_encaps, exactConst ? constantEvalMult : 0.0, aksOn);
+        ModRaise(ctxt, slots, correction, prescaled || stcFolded, sparse_encaps, exactConst ? constantEvalMult : 0.0, aksOn);
         shiftedFlow = exactConst && baked != 0 && !aksOn;
         if (exactOnly && baked == 0 && exactConst)
             ctxt.dropToLevel(ctxt.getLevel() - cc.compositeDegree());  // standard plaintexts expect L - d
@@ -392,7 +538,22 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
         std::swap(pre.CtS, pre.CtS_orig);
         std::swap(pre.StC, pre.StC_orig);
     }
-    if (isLT) {
+    if (sparseB) {
+        if (g_btsStageStash) {  // reference: the shipped sparse CtS (+ conj) and EvalMod on the SAME folded ciphertext
+            Ciphertext ref(cc_), raux(cc_);
+            ref.copy(ctxt);
+            ref.slots = 2 * slots;
+            EvalCoeffsToSlots(ref, slots, false);
+            raux.conjugate(ref);
+            ref.add(raux);
+            btsStageProbe("post-CtS-std", ref);
+            approxModReductionSparse(ref, scalar);
+            if (ref.NoiseLevel == 2)
+                ref.rescale();
+            btsStageProbe("post-EvalMod-std", ref);
+        }
+        SparseBCoeffsToSlots(ctxt, slots, cc.GetBootPrecomputation(slots));
+    } else if (isLT) {
         EvalLinearTransform(ctxt, slots, false);
     } else {
         EvalCoeffsToSlots(ctxt, slots, false);
@@ -411,6 +572,9 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
         if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
             ctxtEncI.rescale();
         approxModReduction(ctxt, ctxtEncI, cc.GetEvalKey(ctxt.keyID), scalar);
+    } else if (sparseB) {
+        auto& sb = *cc.GetBootPrecomputation(slots).sparseB;
+        approxModReductionSparse(ctxt, scalar, sb.cheb, sb.daIts);  // the conj-add is part of SparseBCoeffsToSlots
     } else {
         aux.conjugate(ctxt);
         ctxt.add(aux);
@@ -419,16 +583,48 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
         approxModReductionSparse(ctxt, scalar);
     }
 
-    if (ctxt.NoiseLevel == 2) {
+    // StC-first dense output stays a lazy deg-2 (the landing convention of every other route: the planner models a
+    // deg-2 landing realized to deg-1 one level lower; a deg-1 output here broke the plan's degree pins)
+    if (ctxt.NoiseLevel == 2 && !(stcFirst && cc.N / 2 == slots)) {
         ctxt.rescale();
     }
 
     btsStageProbe("post-EvalMod", ctxt);
     uint64_t corFactor = (uint64_t)1 << std::llround(correction);
 
+    if (stcFirst) {  // slim order: EvalMod's output is the result; the post-factor is 2^(correction + deg) = 2^CF
+        const uint64_t cfAll = corFactor << cc.GetBootPrecomputation(slots).stc_first_deg;
+        if (cfAll != 1)
+            multIntScalar(ctxt, cfAll);
+        if (cc.N / 2 != slots) {
+            auto& pre = cc.GetBootPrecomputation(slots);
+            const int lv = ctxt.getLevel();
+            auto it = pre.stc_first_mask_at.find(lv);
+            if (it == pre.stc_first_mask_at.end()) {
+                const int sh = (lv - pre.stc_first_mask->c0.getLevel()) / cc.compositeDegree();
+                it = pre.stc_first_mask_at.emplace(lv, relevelPlaintext(cc_, cc, *pre.stc_first_mask, sh, 1.0)).first;
+            }
+            ctxt.multPt(it->second, false);
+            aux.rotate(ctxt, slots);
+            ctxt.add(aux);
+        }
+        if (mixedChain && ctxt.NoiseLevel == 2)
+            ctxt.rescale();
+        btsStageProbe("end", ctxt);
+        if (abRef) {
+            cudaDeviceSynchronize();
+            exactDecryptDump(ctxt, (abDir + "/" + std::to_string(abCount) + "-s" + std::to_string(slots) + "-slim.ct").c_str());
+            std::cerr << "[stc_first_ab] #" << abCount << " slim out level " << ctxt.getLevel() << " deg " << ctxt.NoiseLevel
+                      << " NF " << ctxt.NoiseFactor << "\n";
+            ++abCount;
+        }
+        ctxt.slots = old_slots;
+        return;
+    }
+
     // A ciphertext above the StC plaintexts' level (FIDESLIB_BTS_SHIFT with FIDESLIB_BTS_SHIFT_STC=0) is dropped to
     // it first: an exact LevelReduce, instead of the plaintext-above-ciphertext adjust path.
-    if (!isLT && !cc.GetBootPrecomputation(slots).StC.empty()) {
+    if (!isLT && !sparseB && !cc.GetBootPrecomputation(slots).StC.empty()) {
         const int stcL = cc.GetBootPrecomputation(slots).StC.at(0).A.at(0).c0.getLevel();
         if (ctxt.getLevel() > stcL) {
             if (ctxt.NoiseLevel == 2)
@@ -438,14 +634,16 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
         }
     }
     btsStageProbe("pre-StC", ctxt);
-    if (isLT) {
+    if (sparseB) {
+        SparseBSlotsToCoeffs(ctxt, slots, cc.GetBootPrecomputation(slots));  // includes the final rot(n/2) + add
+    } else if (isLT) {
         EvalLinearTransform(ctxt, slots, true);
     } else {
         EvalCoeffsToSlots(ctxt, slots, true);
     }
     btsStageProbe("post-StC", ctxt);
 
-    if (cc.N / 2 != slots) {
+    if (cc.N / 2 != slots && !sparseB) {
         aux.rotate(ctxt, slots);
         ctxt.add(aux);
     }
@@ -551,9 +749,9 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
     //------------------------------------------------------------------------------
 
     if (!prescaled) {
-        assert(ctxt.getLevel() - ctxt.NoiseLevel + 1 >= 1);
-    } else {
-        assert(ctxt.getLevel() - ctxt.NoiseLevel + 1 == 0);
+        assert(ctxt.getLevel() + 1 - cc.compositeDegree() * ctxt.NoiseLevel >= 1);
+    } else {  // deg-1 at the bottom, or deg-2 one composite level above it
+        assert(ctxt.getLevel() + 1 == cc.compositeDegree() * ctxt.NoiseLevel);
     }
     // In FLEXIBLEAUTO, raising the ciphertext to a larger number
     // of towers is a bit more complex, because we need to adjust
@@ -592,7 +790,9 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
 
     if (cc.rescaleTechnique == CKKS::FLEXIBLEAUTO || cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT) {
         uint32_t lvl = cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT;
-        double targetSF = cc.sfAtLimb(cc.L - lvl * cc.compositeDegree());
+        // the raise target's scale (FIDESLIB_BTS_RAISE_DROP: the target is raise_drop composite levels below the top)
+        double targetSF = cc.sfAtLimb(cc.L - lvl * cc.compositeDegree() -
+                                      cc.compositeDegree() * cc.GetBootPrecomputation(slots).raise_drop);
         double sourceSF = ctxt.NoiseFactor;        // ciphertext->GetScalingFactor();
         uint32_t numTowers = ctxt.getLevel() + 1;  // ciphertext->GetElements()[0].GetNumOfElements();
         // composite: the adjust's rescale drops the top d primes — divide by their product
@@ -605,7 +805,11 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         // for NATIVEINT = 128.
         // Scaling down the message by a correction factor to emulate using a larger q0.
         // This step is needed so we could use a scaling factor of up to 2^59 with q9 ~= 2^60.
-        double adjustmentFactor = (targetSF / sourceSF) * (modToDrop / sourceSF);
+        // multScalar encodes the scalar at the level's NOMINAL scale sf(level); the input's true scale is sourceSF.
+        // integers v*sourceSF -> v*sourceSF*adj*sf(level)/modToDrop = v*targetSF*2^-c for ANY sourceSF (the original
+        // (targetSF/sourceSF)*(modToDrop/sourceSF) is the sourceSF == sf(level) case; a ciphertext level-reduced
+        // from a higher level, e.g. the StC-first input, is not nominal).
+        double adjustmentFactor = (targetSF / sourceSF) * (modToDrop / cc.sfAtLimb(ctxt.getLevel()));
         double pow = std::pow((double)2.0, (double)-1.0 * (double)correction);
         adjustmentFactor *= pow;
         if constexpr (PRINT)
@@ -786,7 +990,8 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         std::cout << std::endl;
     }
     //   std::cout << "Grow" << std::endl;
-    ctxt.c0.grow(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT));
+    ctxt.c0.grow(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT) -
+                  cc.compositeDegree() * cc.GetBootPrecomputation(slots).raise_drop);  // FIDESLIB_BTS_RAISE_DROP
     //   std::cout << "Broadcast" << std::endl;
     if constexpr (PRINT) {
         CudaCheckErrorMod;
@@ -838,7 +1043,8 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         std::cout << std::endl;
     }
     //  std::cout << "Grow" << std::endl;
-    ctxt.c1.grow(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT));
+    ctxt.c1.grow(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT) -
+                  cc.compositeDegree() * cc.GetBootPrecomputation(slots).raise_drop);  // FIDESLIB_BTS_RAISE_DROP
     //  std::cout << "Broadcast" << std::endl;
     if constexpr (PRINT) {
         std::cout << "Adjustment c1  ";
@@ -879,6 +1085,7 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
     btsStageProbe("MR-raised", ctxt);
     // FIDESLIB_BTS_SHIFT: the EvalMod constant as an exact scaling of the small-coefficient ciphertext, before the
     // encapsulation switch makes the coefficients uniform (CKKS/SmallInt.cuh). Replaces multScalar + rescale.
+    bool fusedSwitched = false;
     if (exactScale > 0 && !aksStage0) {  // lever 1b: the aggregated stage 0 scales, switches and transforms at once
         const int tt = cc.GetBootPrecomputation(slots).cts0_t;
         const double tf = std::ldexp(1.0, tt);
@@ -916,10 +1123,23 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
                 btsStageProbe("X-ghs", g);
             }
         }
-        smallIntScalarMultiply(cc, ctxt, exactScaleT);
-        ctxt.NoiseFactor *= tf;
+        // fused: c1 is scaled straight into Q+P (one reconstruction, one NTT pass) and switched with the one-digit
+        // GHS key — no second lift, no 6-digit hybrid ModUp. FIDESLIB_BTS_SHIFT_FUSED=0 restores the two-step path.
+        const bool fused = sparse_encaps && cc.compositeDegree() > 1 && cc.GetBootPrecomputation(slots).ghs_btoa &&
+                           [] { const char* e = std::getenv("FIDESLIB_BTS_SHIFT_FUSED"); return e && std::atoi(e) > 0; }();  // measured +0.14 ms vs the hybrid two-step: default off
+        if (fused) {
+            const long double D = 1.0L / (long double)exactScaleT;
+            smallIntDivideKeepLevel(cc, ctxt.c0, 3, D, false);
+            smallIntDivideKeepLevel(cc, ctxt.c1, 3, D, true);  // Q + specials, NTT form, isModUp
+            ctxt.NoiseFactor *= tf;
+            ghsSwitchExt(ctxt, *cc.GetBootPrecomputation(slots).ghs_btoa);
+        } else {
+            smallIntScalarMultiply(cc, ctxt, exactScaleT);
+            ctxt.NoiseFactor *= tf;
+        }
+        fusedSwitched = fused;
     }
-    if (sparse_encaps && !aksStage0) {
+    if (sparse_encaps && !aksStage0 && !fusedSwitched) {
         if (cc.compositeDegree() > 1) {
             if (exactScale > 0 && cc.GetBootPrecomputation(slots).ghs_btoa &&
                 [] { const char* e = std::getenv("FIDESLIB_BTS_SHIFT_GHS"); return e && std::atoi(e) > 0; }()) {
@@ -949,3 +1169,4 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
 int FIDESlib::CKKS::BootstrapPrecapture(FIDESlib::CKKS::Context& /*cc*/) {
     return 0;
 }
+
