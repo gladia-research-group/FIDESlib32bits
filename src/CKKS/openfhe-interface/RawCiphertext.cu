@@ -1018,6 +1018,17 @@ std::vector<int> FIDESlib::CKKS::GetBootstrapIndexes(lbcrypto::CryptoContext<lbc
             indexes.push_back(idx);
         }
     }
+    if (slots == 1) {  // SPRU for the s = 1 route (CKKS/Spru.cuh): trace, product and recombination rotations, full keys
+        const char* e = std::getenv("FIDESLIB_SPRU");
+        if (e && std::atoi(e) > 0) {
+            const int h = std::atoi(e) > 1 ? std::atoi(e) : 64, n = 2, N2 = (int)cc->GetRingDimension() / 2;
+            for (int idx : GetAccumulateRotationIndices(4, h * n, N2 / (h * n)))
+                indexes.push_back(idx);
+            for (int s = n; s < h * n; s <<= 1)
+                indexes.push_back(s);
+            indexes.push_back(1);
+        }
+    }
     {   // lever B: full-ring indices (not reduced to the 2*slots view: the partial-sum layouts are not periodic)
         int n, r, sB, b;
         if (sparseBGeometry((int)cc->GetRingDimension(), slots, n, r, sB, b)) {
