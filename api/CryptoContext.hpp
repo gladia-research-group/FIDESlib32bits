@@ -171,6 +171,11 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void EvalBootstrapSetup(const std::vector<uint32_t>& levelBudget, std::vector<uint32_t> dim1, uint32_t slots, uint32_t correctionFactor);
 	/// @brief Generate the evaluation bootstrap keys.
 	void EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>& sk, uint32_t slots);
+	/// @brief Per-site level-aware ModRaise: raise drops (composite levels below the top) to build precomputation
+	/// variants for at LoadContext, every route; FIDESLIB_BTS_RAISE_DROPS=1,2,.. adds to the list. Selection per
+	/// bootstrap: FIDESlib::CKKS::ContextData::setBtsRaiseDrop (the wrapper's RaiseScope).
+	void SetBootstrapRaiseDrops(const std::vector<int>& drops) { bts_raise_drops = drops; }
+	std::vector<int> bts_raise_drops;
 
 	// ---- Serialization ----
 	static bool SerializeEvalMultKey(std::ostream& ser, const SerType& sertype, const std::string& keyTag = "");

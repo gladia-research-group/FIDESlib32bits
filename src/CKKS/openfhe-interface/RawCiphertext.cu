@@ -1108,7 +1108,7 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
         if (GPUcc.compositeDegree() > 1) {
             // COMPOSITESCALING: both secret-switching keys are MAIN-context standard hybrid
             // keys (see BootstrapPrecomputation::sparse_atob) — no helper GPU context at all.
-            result.sparse_atob = std::make_unique<FIDESlib::CKKS::KeySwitchingKey>(GPUcc_);
+            result.sparse_atob = std::make_shared<FIDESlib::CKKS::KeySwitchingKey>(GPUcc_);
             {
                 std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
                     std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
@@ -1116,7 +1116,7 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
                 FIDESlib::CKKS::RawKeySwitchKey rawKskEval = FIDESlib::CKKS::GetKeySwitchKey(res);
                 result.sparse_atob->Initialize(rawKskEval);
             }
-            result.sparse_btoa = std::make_unique<FIDESlib::CKKS::KeySwitchingKey>(GPUcc_);
+            result.sparse_btoa = std::make_shared<FIDESlib::CKKS::KeySwitchingKey>(GPUcc_);
             {
                 std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> res =
                     std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
@@ -1712,6 +1712,80 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
             }
         }
     }
+}
+
+// Per-site level-aware ModRaise (plan `raise_drop`): the route's precomputation re-levelled for a raise that stops
+// `drop` composite levels below the top. Every CtS/StC/LT plaintext moves down by drop - base.raise_drop (exact
+// small-integer re-level, one rounding), the last StC stage additionally carries sf(base top) / sf(variant top)
+// (the shipped StC compensates q0 / sf(raise top)), the stage-0 2^-t scale tag is preserved, the exact post-raise
+// constant is recomputed for the lower top, keys are shared with the base.
+void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> /*cc*/, int slots,
+                                              FIDESlib::CKKS::Context& GPUcc_, int drop) {
+    ContextData& GPUcc = *GPUcc_;
+    BootstrapPrecomputation& base = GPUcc.GetBootPrecomputationBase(slots);
+    if (drop <= base.raise_drop || base.raise_variants.count(drop))
+        return;
+    if (base.aks0 || base.sparseB || base.stc_first_mode > 0)
+        throw std::runtime_error("AddBootstrapRaiseVariant: not supported with FIDESLIB_AKS / BTS_SPARSE_B / BTS_STC_FIRST");
+    const int d = GPUcc.compositeDegree();
+    const int shift = -(drop - base.raise_drop);
+    const double sfBase = GPUcc.sfAtLimb(GPUcc.L - d * base.raise_drop);
+    const double sfVar = GPUcc.sfAtLimb(GPUcc.L - d * drop);
+    const double fdrop = sfBase / sfVar;
+    auto relevel = [&](const Plaintext& pt, double factor) {
+        // stage-0 plaintexts carry 2^-t in their scale bookkeeping (NoiseFactor = sf x 2^-t): keep that ratio
+        const double tag = pt.NoiseFactor / GPUcc.sfAtLimb(pt.c0.getLevel());
+        Plaintext np = relevelPlaintext(GPUcc_, GPUcc, pt, shift, factor);
+        np.NoiseFactor *= tag;
+        return np;
+    };
+    auto var = std::make_unique<BootstrapPrecomputation>();
+    var->LT.slots = base.LT.slots;
+    var->LT.bStep = base.LT.bStep;
+    for (auto& pt : base.LT.A)
+        var->LT.A.push_back(relevel(pt, 1.0));
+    for (auto& pt : base.LT.invA)  // single-LT route: invA is its only StC stage
+        var->LT.invA.push_back(relevel(pt, fdrop));
+    auto copySteps = [&](const std::vector<BootstrapPrecomputation::LTstep>& src,
+                         std::vector<BootstrapPrecomputation::LTstep>& dst, bool isStC) {
+        for (size_t si = 0; si < src.size(); ++si) {
+            BootstrapPrecomputation::LTstep o;
+            o.slots = src[si].slots;
+            o.bStep = src[si].bStep;
+            o.gStep = src[si].gStep;
+            o.rotIn = src[si].rotIn;
+            o.rotOut = src[si].rotOut;
+            o.ptMask = src[si].ptMask;
+            const double f = (isStC && si + 1 == src.size()) ? fdrop : 1.0;
+            o.A.reserve(src[si].A.size());
+            for (auto& pt : src[si].A)
+                o.A.push_back(relevel(pt, f));
+            dst.push_back(std::move(o));
+        }
+    };
+    copySteps(base.CtS, var->CtS, false);
+    copySteps(base.StC, var->StC, true);
+    var->accumulate_bStep = base.accumulate_bStep;
+    var->correctionFactor = base.correctionFactor;
+    var->sparse_encaps = base.sparse_encaps;
+    var->sparse_context = base.sparse_context;
+    var->sparse_atob = base.sparse_atob;
+    var->sparse_btoa = base.sparse_btoa;
+    var->ghs_btoa = base.ghs_btoa;
+    var->cts0_t = base.cts0_t;
+    var->raise_drop = drop;
+    if (base.cts0_const != 0) {
+        double qDouble = 1.0;
+        for (int j = 0; j < d; ++j)
+            qDouble *= (double)GPUcc.prime[j].p;
+        const double pre = sfVar / qDouble;
+        var->cts0_const = pre * (1.0 / (GPUcc.GetBootK() * GPUcc.N)) * GPUcc.getBtsPreScale();
+    }
+    cudaDeviceSynchronize();
+    std::cerr << "[bts_raise] slots=" << slots << " variant drop=" << drop << " (base " << base.raise_drop
+              << "): plaintexts re-levelled by " << shift << " composite level(s), raise top " << (GPUcc.L - d * drop)
+              << " of " << GPUcc.L << "\n";
+    base.raise_variants[drop] = std::move(var);
 }
 
 void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey, int slots,
