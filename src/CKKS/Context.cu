@@ -643,6 +643,8 @@ bool ContextData::HasBootPrecomputation(int slots) {
 
     return precom.boot.contains(slots);
 }
+void ContextData::setBtsRealPayload(bool on) { btsRealPayload = on; }
+bool ContextData::getBtsRealPayload() const { return btsRealPayload; }
 void ContextData::setBtsRaiseDrop(int drop) { btsRaiseDrop = drop; }
 int ContextData::getBtsRaiseDrop() const { return btsRaiseDrop; }
 int ContextData::btsRaiseDropEffective() const { return btsRaiseDrop > 0 ? btsRaiseDrop : 0; }

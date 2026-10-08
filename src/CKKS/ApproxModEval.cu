@@ -253,6 +253,19 @@ after_da:
 	}
 }
 
+void FIDESlib::CKKS::approxModReductionReal(Ciphertext& ctxtEnc, const KeySwitchingKey& keySwitchingKey, uint64_t post) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() });
+	ContextData& cc = ctxtEnc.cc;
+	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), -1.0, 1.0);
+	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+	if (!sparseArcsineMode() && arcsineEnabled())
+		applyArcsineCorrection(ctxtEnc);
+	if (post != 1)
+		multIntScalar(ctxtEnc, post);
+	if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
+		ctxtEnc.rescale();
+}
+
 void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post) {
 	approxModReductionSparse(ctxtEnc, post, ctxtEnc.cc.GetCoeffsChebyshev(), ctxtEnc.cc.GetDoubleAngleIts());
 }
