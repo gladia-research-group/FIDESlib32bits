@@ -21,6 +21,11 @@ struct BtsState {
     uint64_t scalar = 1, corFactor = 1;
     double constantEvalMult = 0, baked = 0;
     int nCtS = 0, nStC = 0;
+    // FIDESLIB_EVALROUND (Kim et al., ePrint 2022/1256): EvalMod returns the integer part K*x - EvalMod(x), StC maps it to
+    // q0*I, and the output is gamma*raised - StC(...): CtS rounding error enters both K*x and EvalMod(x) and cancels.
+    bool evalRound = false;
+    double erGamma = 1.0;
+    std::shared_ptr<Ciphertext> erRaised;
 };
 
 BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirst = true);
