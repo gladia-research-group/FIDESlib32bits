@@ -1783,8 +1783,8 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                 return n;
             };
             const bool stcFirstHere = stcFirstEnv() > 0 && stcFirstRoute(slots, GPUcc.N);
-            // FIDESLIB_CTS_SINGLE=1: dense route only, =2: every route. CtS acts on I + m/q0: one prime costs ~8 bits
-            // unless EvalRound cancels the error.
+            // FIDESLIB_CTS_SINGLE=1: dense route only (CtS acts on I + m/q0: one prime costs ~8 bits unless EvalRound
+            // cancels it, which covers the dense route), =2: every route
             if (const char* e = std::getenv("FIDESLIB_CTS_SINGLE");
                 e && (std::atoi(e) >= 2 || (std::atoi(e) == 1 && slots == (int)GPUcc.N / 2)) && !stcFirstHere) {
                 if (const char* a = std::getenv("FIDESLIB_AKS"); a && std::atoi(a) > 0)
@@ -1810,7 +1810,12 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                     result.stcRealA0 = std::move(nr);
                 }
             }
-            if (const char* e = std::getenv("FIDESLIB_STC_SINGLE"); e && std::atoi(e) > 0 && !stcFirstHere)
+            // under EvalRound StC carries q0*I and needs its composite scale: the dense route keeps it
+            const bool erDense = [&] {
+                const char* er = std::getenv("FIDESLIB_EVALROUND");
+                return er && std::atoi(er) > 0 && slots == (int)GPUcc.N / 2;
+            }();
+            if (const char* e = std::getenv("FIDESLIB_STC_SINGLE"); e && std::atoi(e) > 0 && !stcFirstHere && !erDense)
             {
                 result.stc_single = singlePrime(result.StC, 0, 2, "stc_single");
                 if (result.stc_single && !result.stcRealA0.empty()) {  // the real-payload stage 0 is a single stage 0

@@ -253,6 +253,15 @@ void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
         inOverride = false;
         return;
     }
+    // EvalRound lives in the staged path (the one the Python bootstrap drives)
+    static const bool staged = [] {
+        const char* e = std::getenv("FIDESLIB_EVALROUND");
+        return e && std::atoi(e) > 0;
+    }();
+    if (staged) {
+        BootstrapStaged(ctxt, slots, prescaled);
+        return;
+    }
     bootstrapImpl(ctxt, slots, prescaled, true);
 }
 
@@ -1223,6 +1232,16 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     // A real payload on the dense route enters as x + conj x = 2 Re x: one more bit of raise correction keeps the
     // EvalMod input where it was, and corFactor (taken above) keeps the output at Re x.
     st.real = cc.getBtsRealPayload() && cc.N / 2 == slots && !st.isLT && !st.sparseB && !st.stcFirst;
+    // EvalRound cancels against the raised copy's full integer part, the real route reduces half the coefficients:
+    // they cannot share a bootstrap, and EvalRound wins (single-prime CtS needs it).
+    if (st.real && [] { const char* e = std::getenv("FIDESLIB_EVALROUND"); return e && std::atoi(e) > 0; }()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[bts_real] real-payload route disabled under FIDESLIB_EVALROUND (dense bootstraps run complex)\n";
+        }
+        st.real = false;
+    }
     if (st.real) {
         if (pre.stcRealA0.empty())
             throw std::runtime_error("real-payload bootstrap without its StC variant (FIDESLIB_BTS_REAL)");
@@ -1230,6 +1249,9 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     }
     st.nCtS = (st.isLT || st.sparseB) ? 1 : (int)pre.CtS.size();
     st.nStC = (st.isLT || st.sparseB) ? 1 : (int)pre.StC.size();
+    // FIDESLIB_EVALROUND=1: dense full-StC bootstraps only (the sparse routes fold between the raise and CtS)
+    if (const char* e = std::getenv("FIDESLIB_EVALROUND"); e && std::atoi(e) > 0)
+        st.evalRound = cc.N / 2 == st.slots && !st.isLT && !st.sparseB && !st.stcFirst && !st.aksOn;
     return st;
 }
 
@@ -1321,6 +1343,14 @@ void btsModRaise(Ciphertext& ctxt, BtsState& st) {
         ctxt.dropToLevel(ctxt.getLevel() - cc.compositeDegree());
     if (!st.exactConst)
         ctxt.multScalar(st.constantEvalMult, false);
+    if (st.evalRound) {
+        // the raised copy carries the EvalMod normalization c: the output's value is R / c - StC(K x - EvalMod x)
+        if (st.constantEvalMult != 0)
+            st.erGamma = 1.0 / st.constantEvalMult;
+        st.erRaised = std::make_shared<Ciphertext>(ctxt.cc_);
+        st.erRaised->copy(ctxt);
+        btsStageProbe("ER-R", ctxt);
+    }
 }
 
 void btsFold(Ciphertext& ctxt, const BtsState& st) {
@@ -1402,7 +1432,7 @@ void btsEvalMod(Ciphertext& ctxt, const BtsState& st) {
             ctxt.rescale();
             ctxtEncI.rescale();
         }
-        approxModReduction(ctxt, ctxtEncI, cc.GetEvalKey(ctxt.keyID), st.scalar);
+        approxModReduction(ctxt, ctxtEncI, cc.GetEvalKey(ctxt.keyID), st.scalar, st.evalRound);
     } else if (st.sparseB) {
         auto& sb = *cc.GetBootPrecomputation(st.slots).sparseB;
         approxModReductionSparse(ctxt, st.scalar, sb.cheb, sb.daIts);
@@ -1492,6 +1522,20 @@ void btsFinish(Ciphertext& ctxt, const BtsState& st) {
         Ciphertext aux(cc_);
         aux.conjugate(ctxt);
         ctxt.add(aux);
+    }
+    if (st.evalRound && st.erRaised) {  // output = gamma * raised - StC(K x - EvalMod(x))
+        btsStageProbe("ER-S", ctxt);
+        Ciphertext o(cc_);
+        o.copy(*st.erRaised);
+        // gamma = 2^k * f, f in [1,2): 2^k as an exact integer product, f through the NF. Folding all of gamma into
+        // the NF makes the subtraction's scale adjustment encode a ~2^63 constant, which it gets wrong.
+        const int k = std::min(62, std::max(0, (int)std::floor(std::log2(st.erGamma))));
+        o.NoiseFactor /= st.erGamma / std::ldexp(1.0, k);
+        if (k > 0)
+            multIntScalar(o, 1ull << k);
+        o.sub(ctxt);  // the raised copy is adjusted down to the StC output's level and scale
+        ctxt.copy(o);
+        btsStageProbe("ER-O", ctxt);
     }
     if (st.corFactor != 1)
         multIntScalar(ctxt, st.corFactor);

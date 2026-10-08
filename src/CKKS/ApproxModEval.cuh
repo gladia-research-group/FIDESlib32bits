@@ -18,7 +18,7 @@ void evalChebyshevSeries(Ciphertext& ctxt, std::vector<double>& coefficients, do
 void evalHornerSeries(Ciphertext& ctxt, const std::vector<double>& coefficients);
 
 void approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey,
-                        uint64_t post);
+                        uint64_t post, bool evalRound = false);
 
 /// The dense EvalMod of a real payload: the Re chain alone. A real slot vector has m_{N-k} = -m_k, so the Im
 /// half of its coefficients repeats the Re half and needs no reduction of its own.

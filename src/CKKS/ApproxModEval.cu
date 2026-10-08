@@ -138,7 +138,7 @@ void FIDESlib::CKKS::lockstepAfterKeySwitch() {
 	}
 }
 
-void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey, uint64_t post) {
+void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey, uint64_t post, bool evalRound) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 
 	// cudaDeviceSynchronize();
@@ -150,6 +150,14 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 
 	emStageProbe("EM-in-Re", ctxtEnc);
 	emStageProbe("EM-in-Im", ctxtEncI);
+	// EvalRound: each half becomes K*x - EvalMod(x), the integer part ((1/2pi) sin(2pi K x) has gain K at the integers)
+	std::unique_ptr<Ciphertext> erRe, erIm;
+	if (evalRound) {
+		erRe = std::make_unique<Ciphertext>(ctxtEnc.cc_);
+		erRe->copy(ctxtEnc);
+		erIm = std::make_unique<Ciphertext>(ctxtEnc.cc_);
+		erIm->copy(ctxtEncI);
+	}
 	if (COMPLEX && lockstepEnabled() && !FIDESlib::CKKS::g_btsStageStash && !tlLock) {
 		// both halves (Chebyshev + double angle) in lockstep; identical op sequences, so the key switches pair up
 		Lockstep L;
@@ -207,6 +215,15 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 after_da:
 	emStageProbe("EM-DA-Re", ctxtEnc);
 	emStageProbe("EM-DA-Im", ctxtEncI);
+	if (evalRound) {
+		const uint64_t K = (uint64_t)cc.GetBootK();
+		multIntScalar(*erRe, K);
+		multIntScalar(*erIm, K);
+		erRe->sub(ctxtEnc);  // erRe (higher level) is adjusted down to EvalMod's
+		erIm->sub(ctxtEncI);
+		ctxtEnc.copy(*erRe);
+		ctxtEncI.copy(*erIm);
+	}
 	if (!sparseArcsineMode() && arcsineEnabled()) {
 		applyArcsineCorrection(ctxtEnc);
 		if constexpr (COMPLEX)
