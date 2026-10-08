@@ -93,6 +93,11 @@ class BootstrapPrecomputation {
     // FIDESLIB_BTS_RAISE_DROP: the raise targets the modulus this many composite levels below the top (the route's
     // CtS/StC plaintexts are re-levelled to match): the whole bootstrap runs on fewer limbs and lands lower.
     int raise_drop = 0;
+    // FIDESLIB_STC_SINGLE: the first `stc_single` StC stages carry one-prime-scale diagonals, so the rescale pending
+    // at the entry of StC stages 1..stc_single drops ONE prime (the output lands stc_single primes higher; even).
+    int stc_single = 0;
+    int cts_single = 0;     // FIDESLIB_CTS_SINGLE: CtS stages [cts_single_lo, cts_single_lo + cts_single) on one prime
+    int cts_single_lo = 0;
     // diagnostics (BTS_TRACE_DIR): the un-shifted plaintext stages, for a within-run reference bootstrap
     std::vector<LTstep> CtS_orig, StC_orig;
     // FIDESLIB_BTS_STC_FIRST (lever A, SOTA_2026-10-05: Lattigo "DecodeThenModUp" / slim order). SlotsToCoeffs runs on

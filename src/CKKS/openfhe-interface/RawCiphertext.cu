@@ -1734,6 +1734,95 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                           << " applied exactly in ModRaise, t = " << bts_t << "\n";
             }
 
+            // Single-prime LT stages (FIDESLIB_STC_SINGLE / FIDESLIB_CTS_SINGLE): stages [lo, lo+n) (n even) rescale by
+            // one 27-bit prime instead of a composite level, so the transform lands n primes higher. Stage lo+j sits at
+            // limb l0-j with scale q_(l0-j); the last one also carries sf(l0-n)/sf(l0), so NF/sf(level) is unchanged when
+            // the ciphertext re-enters the composite grid at l0-n; later stages move up n/2 composite levels.
+            auto singlePrime = [&](std::vector<BootstrapPrecomputation::LTstep>& stages, int lo, int n, const char* tag) -> int {
+                const int d = GPUcc.compositeDegree();
+                if (n <= 0 || n % 2 || lo + n > (int)stages.size())
+                    return 0;
+                const int top = stages.at(0).A.at(0).c0.getLevel();
+                for (size_t si = 1; si < stages.size(); ++si)
+                    if (d != 2 || stages.at(si).A.at(0).c0.getLevel() != top - d * (int)si)
+                        throw std::runtime_error(std::string(tag) + ": needs composite degree 2 and stages one level apart");
+                const int l0 = top - d * lo;
+                // a scale ratio carried by a single stage (CtS stage 0: 2^-t, FIDESLIB_BTS_SHIFT_T) would leave it 27 - t
+                // bits: it moves to the first composite stage after the window, or is spread over a whole-CtS window
+                double moved = 1.0;
+                for (int j = 0; j < n; ++j)
+                    moved *= stages.at(lo + j).A.at(0).NoiseFactor / GPUcc.sfAtLimb(stages.at(lo + j).A.at(0).c0.getLevel());
+                const bool spread = moved != 1.0 && lo + n >= (int)stages.size();
+                const double share = spread ? std::pow(moved, 1.0 / n) : 1.0;
+                for (size_t si = lo; si < stages.size(); ++si) {
+                    auto& st = stages.at(si);
+                    const int j = (int)si - lo;
+                    std::vector<Plaintext> nv;
+                    nv.reserve(st.A.size());
+                    for (auto& pt : st.A) {
+                        if (j < n) {
+                            double sc = GPUcc.modReduceFactorAt(l0 - j);
+                            if (j == n - 1)
+                                sc *= GPUcc.sfAtLimb(l0 - n) / GPUcc.sfAtLimb(l0);
+                            nv.push_back(relevelPlaintextNF(GPUcc_, GPUcc, pt, l0 - j, sc * share));
+                        } else if (j == n && moved != 1.0) {
+                            nv.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, n / 2, moved));  // integers x moved
+                            nv.back().NoiseFactor *= moved;                                     // at scale sf x moved
+                        } else {
+                            nv.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, n / 2, 1.0));
+                        }
+                    }
+                    st.A = std::move(nv);
+                }
+                cudaDeviceSynchronize();
+                std::cerr << "[" << tag << "] slots=" << slots << ": stages " << lo << ".." << lo + n - 1
+                          << " on one prime (limbs " << l0 << ".." << l0 - n + 1 << ")";
+                if (moved != 1.0)
+                    std::cerr << ", scale ratio " << moved << (spread ? " spread" : " moved to stage " + std::to_string(lo + n));
+                std::cerr << "\n";
+                return n;
+            };
+            const bool stcFirstHere = stcFirstEnv() > 0 && stcFirstRoute(slots, GPUcc.N);
+            // FIDESLIB_CTS_SINGLE=1: dense route only, =2: every route. CtS acts on I + m/q0: one prime costs ~8 bits
+            // unless EvalRound cancels the error.
+            if (const char* e = std::getenv("FIDESLIB_CTS_SINGLE");
+                e && (std::atoi(e) >= 2 || (std::atoi(e) == 1 && slots == (int)GPUcc.N / 2)) && !stcFirstHere) {
+                if (const char* a = std::getenv("FIDESLIB_AKS"); a && std::atoi(a) > 0)
+                    throw std::runtime_error("FIDESLIB_CTS_SINGLE is not supported with the AKS layout");
+                // FIDESLIB_CTS_SINGLE_LO / _N: the window (default stages 1..2; LO=0 N=4 is the whole CtS)
+                const char* el = std::getenv("FIDESLIB_CTS_SINGLE_LO");
+                const char* en = std::getenv("FIDESLIB_CTS_SINGLE_N");
+                const int lo = el && *el ? std::atoi(el) : 1, n = en && *en ? std::atoi(en) : 2;
+                result.cts_single = singlePrime(result.CtS, lo, n, "cts_single");
+                result.cts_single_lo = lo;
+                if (result.cts_single) {  // EvalMod arrives n/2 levels higher: StC follows
+                    for (auto& st : result.StC) {
+                        std::vector<Plaintext> nv;
+                        nv.reserve(st.A.size());
+                        for (auto& pt : st.A)
+                            nv.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, result.cts_single / 2, 1.0));
+                        st.A = std::move(nv);
+                    }
+                    std::vector<Plaintext> nr;
+                    nr.reserve(result.stcRealA0.size());
+                    for (auto& pt : result.stcRealA0)
+                        nr.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, result.cts_single / 2, 1.0));
+                    result.stcRealA0 = std::move(nr);
+                }
+            }
+            if (const char* e = std::getenv("FIDESLIB_STC_SINGLE"); e && std::atoi(e) > 0 && !stcFirstHere)
+            {
+                result.stc_single = singlePrime(result.StC, 0, 2, "stc_single");
+                if (result.stc_single && !result.stcRealA0.empty()) {  // the real-payload stage 0 is a single stage 0
+                    std::vector<Plaintext> nr;
+                    nr.reserve(result.stcRealA0.size());
+                    for (auto& pt : result.stcRealA0)
+                        nr.push_back(relevelPlaintextNF(GPUcc_, GPUcc, pt, pt.c0.getLevel(),
+                                                        GPUcc.modReduceFactorAt(pt.c0.getLevel())));
+                    result.stcRealA0 = std::move(nr);
+                }
+            }
+
             buildSparseB(cc, GPUcc_, GPUcc, slots, result);
 
             auto ltFriendly = [&](std::vector<BootstrapPrecomputation::LTstep>& CtS,
@@ -1875,16 +1964,39 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
             o.rotOut = src[si].rotOut;
             o.ptMask = src[si].ptMask;
             const double f = (isStC && si + 1 == src.size()) ? fdrop : 1.0;
+            // single-prime stages: to the variant's limb at its own prime, the grid re-entry factor recomputed
+            const int sLo = isStC ? 0 : base.cts_single_lo;
+            const int sN = isStC ? base.stc_single : base.cts_single;
+            const int j = (int)si - sLo;
+            const bool single = sN > 0 && j >= 0 && j < sN;
             o.A.reserve(src[si].A.size());
-            for (auto& pt : src[si].A)
-                o.A.push_back(relevel(pt, f));
+            for (auto& pt : src[si].A) {
+                if (!single) {
+                    o.A.push_back(relevel(pt, f));
+                    continue;
+                }
+                const int l = pt.c0.getLevel(), lv = l + d * shift;
+                const int l0 = l + j, l0v = lv + j;
+                double nf = pt.NoiseFactor / GPUcc.modReduceFactorAt(l) * GPUcc.modReduceFactorAt(lv);
+                if (j == sN - 1)
+                    nf *= (GPUcc.sfAtLimb(l0v - sN) / GPUcc.sfAtLimb(l0v)) / (GPUcc.sfAtLimb(l0 - sN) / GPUcc.sfAtLimb(l0));
+                o.A.push_back(relevelPlaintextNF(GPUcc_, GPUcc, pt, lv, nf * f));
+            }
             dst.push_back(std::move(o));
         }
     };
     copySteps(base.CtS, var->CtS, false);
     copySteps(base.StC, var->StC, true);
-    for (auto& pt : base.stcRealA0)
-        var->stcRealA0.push_back(relevel(pt, base.StC.size() == 1 ? fdrop : 1.0));
+    for (auto& pt : base.stcRealA0) {
+        if (base.stc_single == 0) {
+            var->stcRealA0.push_back(relevel(pt, base.StC.size() == 1 ? fdrop : 1.0));
+            continue;
+        }
+        // single-prime StC stage 0: the variant's limb at its own prime
+        const int l = pt.c0.getLevel(), lv = l + d * shift;
+        const double nf = pt.NoiseFactor / GPUcc.modReduceFactorAt(l) * GPUcc.modReduceFactorAt(lv);
+        var->stcRealA0.push_back(relevelPlaintextNF(GPUcc_, GPUcc, pt, lv, nf));
+    }
     var->accumulate_bStep = base.accumulate_bStep;
     var->correctionFactor = base.correctionFactor;
     var->sparse_encaps = base.sparse_encaps;
@@ -1894,6 +2006,9 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     var->ghs_btoa = base.ghs_btoa;
     var->cts0_t = base.cts0_t;
     var->raise_drop = drop;
+    var->stc_single = base.stc_single;
+    var->cts_single = base.cts_single;
+    var->cts_single_lo = base.cts_single_lo;
     if (base.cts0_const != 0) {
         double qDouble = 1.0;
         for (int j = 0; j < d; ++j)

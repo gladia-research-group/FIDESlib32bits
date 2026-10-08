@@ -57,6 +57,8 @@ class RNSPoly {
     int automorph_index_precomp(int idx) const;
 
     void rescale();
+    /// Drop ONE prime (the top limb) whatever the composite degree; single GPU (RescaleOneScope).
+    void rescaleOne();
 
     void sync();
 

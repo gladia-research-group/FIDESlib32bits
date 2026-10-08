@@ -54,6 +54,9 @@ void smallIntDivideFromTo(ContextData& cc, const RNSPoly& src, RNSPoly& dst, int
 /// its first 4 limbs combined with the real rescale sf(old) / (factor sf(new)): one rounding of <= 0.5 at scale). Bootstrap plaintexts are
 /// constant-allocated and cannot be grown in place, hence the copy.
 Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor = 1.0);
+/// Value-preserving re-level to limb `newL` at scale `newNF`, on or off the composite grid: the integers are divided
+/// by pt.NoiseFactor / newNF with exact rounding.
+Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt, int newL, double newNF);
 /// ct := round(c * ct) exactly (both polynomials; k = 3 source limbs: the raised ciphertext has |coef| < q0).
 /// The message is scaled by c, the scale/level bookkeeping is untouched (what multScalar + rescale achieve, one
 /// composite level cheaper); rounding adds <= 0.5 per coefficient (noise ~ (h+1)/2).

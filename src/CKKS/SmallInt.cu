@@ -385,6 +385,19 @@ Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, i
     return np;
 }
 
+Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt, int newL, double newNF) {
+    if (newL > cc.L)
+        throw std::runtime_error("relevelPlaintextNF: beyond the top level");
+    const long double D = (long double)pt.NoiseFactor / (long double)newNF;
+    Plaintext np(cc_);
+    np.c0.grow(newL);
+    smallIntDivideFromTo(cc, pt.c0, np.c0, 4, D, pt.c0.isModUp());
+    np.copyMetadata(pt);
+    np.NoiseFactor = newNF;
+    cudaDeviceSynchronize();
+    return np;
+}
+
 void smallIntScalarMultiply(ContextData& cc, Ciphertext& ct, double c) {
     assert(c > 0);
     // k = 3: compositeModRaise centres each Garner term on its own prime, so the raised coefficients lie in

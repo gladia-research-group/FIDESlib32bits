@@ -558,6 +558,11 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
         EvalLinearTransform(ctxt, slots, false);
     } else {
         EvalCoeffsToSlots(ctxt, slots, false);
+        auto& preS = cc.GetBootPrecomputation(slots);  // FIDESLIB_CTS_SINGLE window reaching the last CtS stage
+        if (preS.cts_single && preS.cts_single_lo + preS.cts_single == (int)preS.CtS.size() && ctxt.NoiseLevel == 2) {
+            RescaleOneScope one(true);
+            ctxt.rescale();
+        }
     }
     btsStageProbe("post-CtS", ctxt);
     //  std::cout << "ModRed" << std::endl;
@@ -1359,8 +1364,13 @@ void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k) {
         LinearTransformAKS(ctxt, step, *pre.aks0);
         return;
     }
+    const int cLo = pre.cts_single_lo, cHi = pre.cts_single_lo + pre.cts_single;   // single CtS stages [cLo, cHi)
+    if (k > cLo && k <= cHi && ctxt.NoiseLevel == 2) {  // stage k-1 had one-prime diagonals
+        RescaleOneScope one(true);
+        ctxt.rescale();
+    }
     const int fuseMode = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
-    LtFuseScope fuseScope(fuseMode != 3);
+    LtFuseScope fuseScope(fuseMode != 3 && !(k >= cLo && k < cHi));
     ltStep(ctxt, step);
 }
 
@@ -1368,6 +1378,13 @@ void btsEvalMod(Ciphertext& ctxt, const BtsState& st) {
     CudaNvtxRange r(std::string{"bts::eval_mod"});
     Context& cc_ = ctxt.cc_;
     ContextData& cc = ctxt.cc;
+    {   // the last CtS stage had one-prime diagonals (FIDESLIB_CTS_SINGLE window reaching the end): drop one prime
+        auto& pre = cc.GetBootPrecomputation(st.slots);
+        if (pre.cts_single && pre.cts_single_lo + pre.cts_single == st.nCtS && ctxt.NoiseLevel == 2) {
+            RescaleOneScope one(true);
+            ctxt.rescale();
+        }
+    }
     Ciphertext aux(cc_);
     if (st.real) {
         aux.conjugate(ctxt);
@@ -1453,8 +1470,12 @@ void btsStCStage(Ciphertext& ctxt, const BtsState& st, int k) {
     }
     if (k == 0 && ctxt.NoiseLevel == 2)
         ctxt.rescale();
+    if (k >= 1 && k <= pre.stc_single && ctxt.NoiseLevel == 2) {  // stage k-1 had one-prime diagonals
+        RescaleOneScope one(true);
+        ctxt.rescale();
+    }
     const int fuseModeS = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
-    LtFuseScope fuseScope(k != (int)pre.StC.size() - 1 && fuseModeS != 2);
+    LtFuseScope fuseScope(k != (int)pre.StC.size() - 1 && k >= pre.stc_single && fuseModeS != 2);
     ltStep(ctxt, pre.StC.at(k), k == 0 && st.real ? &pre.stcRealA0 : nullptr);
 }
 

@@ -201,6 +201,8 @@ class ContextData {
     /** Product of the compositeDegree ModReduceFactor entries dropped when rescaling a
      *  ciphertext whose top limb is limbTop (single factor on classic chains). */
     double modReduceProduct(int limbTop) const;
+    /** The single ModReduceFactor of the prime at limb index `limb` (one-prime rescale, RescaleOneScope). */
+    double modReduceFactorAt(int limb) const;
     int GetDoubleAngleIts();
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
     bool HasBootPrecomputation(int slots);

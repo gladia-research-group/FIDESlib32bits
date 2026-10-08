@@ -818,6 +818,10 @@ double ContextData::modReduceProduct(const int limbTop) const {
     return factor;
 }
 
+double ContextData::modReduceFactorAt(const int limb) const {
+    return param.ModReduceFactor[limb];
+}
+
 void ContextData::PrepareNCCLCommunication() {
 
     if (GPUid.size() > 1) {
