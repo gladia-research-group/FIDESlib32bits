@@ -176,6 +176,11 @@ class ContextData {
     int getBtsRaiseDrop() const;
     int btsRaiseDropEffective() const;
     BootstrapPrecomputation& GetBootPrecomputationBase(int slots);
+    /** Real-payload bootstrap on the dense route (one EvalMod chain, BootstrapPrecomputation::stcRealA0). Set around
+     *  one planted bootstrap by the wrapper (plan 'real_route'); OUT-OF-LINE ACCESSORS ONLY (see above). */
+    bool btsRealPayload = false;
+    void setBtsRealPayload(bool on);
+    bool getBtsRealPayload() const;
 
     /** Bootstrap input pre-scale (armed per call by the wrapper, same discipline as the
      *  correction-factor override): the next Bootstrap multiplies its input by this

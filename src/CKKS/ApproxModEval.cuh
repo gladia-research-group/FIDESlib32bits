@@ -20,6 +20,10 @@ void evalHornerSeries(Ciphertext& ctxt, const std::vector<double>& coefficients)
 void approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey,
                         uint64_t post);
 
+/// The dense EvalMod of a real payload: the Re chain alone. A real slot vector has m_{N-k} = -m_k, so the Im
+/// half of its coefficients repeats the Re half and needs no reduction of its own.
+void approxModReductionReal(Ciphertext& ctxtEnc, const KeySwitchingKey& keySwitchingKey, uint64_t post);
+
 void multIntScalar(Ciphertext& ctxt, uint64_t op);
 
 void approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post);

@@ -1394,6 +1394,106 @@ static FIDESlib::CKKS::Plaintext relevelTo(FIDESlib::CKKS::Context& GPUcc_, FIDE
     return FIDESlib::CKKS::relevelPlaintext(GPUcc_, GPUcc, pt, (targetLevel - cur) / d, factor);
 }
 
+static bool btsRealEnv() {
+    const char* e = std::getenv("FIDESLIB_BTS_REAL");
+    return e && std::atoi(e) > 0;
+}
+
+// StC stage 0 for a real payload (BootstrapPrecomputation::stcRealA0): OpenFHE's diagonal `ij` with the entry that
+// reads coefficient 0 halved. In OpenFHE's bit-reversed order coefficient 0 sits in StC input slot 0 (the LT-friendly
+// rotation below moves it to slot 1), and diagonal ij multiplies the input rotated by j - offset (j = ij mod g,
+// EvalSlotsToCoeffs), so that entry is slot k = (offset - j) mod slots. Every other slot is kept exactly: the
+// plaintext's integer polynomial A loses round(Re(A(zeta^e) zeta^(-e t)) / N) per coefficient t, e = 5^k mod 2N,
+// which is half of slot k. A is read through a 4-limb CRT checked against a 5th limb.
+static FIDESlib::CKKS::RawPlainText realStc0Raw(const ReadOnlyPlaintext& pt, int slots, int numRotations, int g, int ij) {
+    DCRTPoly a = pt->GetElement<DCRTPoly>();
+    const Format fmt = a.GetFormat();
+    if (fmt == Format::EVALUATION)
+        a.SwitchFormat();
+    const auto& tw = a.GetAllElements();
+    if (tw.size() < 5)
+        throw std::runtime_error("realStc0Raw: the StC plaintext needs >= 5 limbs");
+    const uint32_t N = tw[0].GetLength(), M = 2 * N;
+    using u128 = unsigned __int128;
+    uint64_t q[5];
+    for (int l = 0; l < 5; ++l)
+        q[l] = tw[l].GetModulus().ConvertToInt();
+    auto powmod = [](uint64_t b, uint64_t e, uint64_t m) {
+        uint64_t r = 1;
+        for (b %= m; e; e >>= 1, b = (u128)b * b % m)
+            if (e & 1)
+                r = (u128)r * b % m;
+        return r;
+    };
+    u128 P[4] = {1, q[0], (u128)q[0] * q[1], (u128)q[0] * q[1] * q[2]};
+    uint64_t inv[4] = {1, 0, 0, 0};
+    for (int l = 1; l < 4; ++l)
+        inv[l] = powmod((uint64_t)(P[l] % q[l]), q[l] - 2, q[l]);
+    const u128 Q = P[3] * q[3];
+    std::vector<long double> c(N);
+    for (uint32_t t = 0; t < N; ++t) {
+        u128 x = tw[0][t].ConvertToInt();
+        for (int l = 1; l < 4; ++l) {
+            const uint64_t r = tw[l][t].ConvertToInt(), xm = (uint64_t)(x % q[l]);
+            x += P[l] * ((u128)((r + q[l] - xm) % q[l]) * inv[l] % q[l]);
+        }
+        const bool neg = x > Q / 2;
+        const u128 mag = neg ? Q - x : x;
+        const uint64_t m4 = (uint64_t)(mag % q[4]);
+        if ((neg ? (q[4] - m4) % q[4] : m4) != tw[4][t].ConvertToInt())
+            throw std::runtime_error("realStc0Raw: StC plaintext coefficient exceeds the 4-limb CRT");
+        c[t] = neg ? -(long double)mag : (long double)mag;
+    }
+    const int32_t offset = (numRotations + 1) / 2 - 1;
+    const uint32_t k = (uint32_t)(((offset - ij % g) % slots + slots) % slots);
+    uint64_t e = 1;
+    for (uint32_t i = 0; i < k; ++i)
+        e = e * 5 % M;
+    const long double w = 3.14159265358979323846264338327950288L / N;
+    long double re = 0, im = 0;
+    for (uint32_t t = 0; t < N; ++t) {
+        const long double th = w * (long double)((e * t) % M);
+        re += c[t] * cosl(th);
+        im += c[t] * sinl(th);
+    }
+    DCRTPoly corr(a.GetParams(), Format::COEFFICIENT, true);
+    std::vector<long double> d(N);
+    for (uint32_t t = 0; t < N; ++t) {
+        const long double th = w * (long double)((e * t) % M);
+        d[t] = roundl((re * cosl(th) + im * sinl(th)) / N);
+    }
+    for (size_t l = 0; l < tw.size(); ++l) {
+        const uint64_t ql = tw[l].GetModulus().ConvertToInt();
+        NativeVector v(N, tw[l].GetModulus());
+        for (uint32_t t = 0; t < N; ++t) {
+            long double r = fmodl(d[t], (long double)ql);
+            if (r < 0)
+                r += ql;
+            v[t] = NativeInteger((uint64_t)r);
+        }
+        NativePoly p(tw[l].GetParams(), Format::COEFFICIENT, true);
+        p.SetValues(std::move(v), Format::COEFFICIENT);
+        corr.SetElementAtIndex(l, std::move(p));
+    }
+    a -= corr;
+    if (fmt == Format::EVALUATION)
+        a.SwitchFormat();
+    FIDESlib::CKKS::RawPlainText raw;
+    raw.numRes = a.GetAllElements().size();
+    raw.N = N;
+    raw.sub_0 = FIDESlib::CKKS::GetRawArray(a.GetAllElements());
+    raw.moduli = GetModuli(a.GetAllElements());
+    raw.format = a.GetFormat();
+    if constexpr (FIDESlib::CKKS::REVERSE) {
+        for (auto& i : raw.sub_0)
+            FIDESlib::bit_reverse_vector(i);
+    }
+    raw.Noise = pt->GetScalingFactor();
+    raw.NoiseLevel = pt->GetNoiseScaleDeg();
+    raw.slots = pt->GetSlots();
+    return raw;
+}
+
 // Sparse routes: (1+i ; 1-i) over the 2*slots view, top level (see BootstrapPrecomputation::stc_first_mask).
 static std::unique_ptr<FIDESlib::CKKS::Plaintext> makeStcFirstMask(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
                                                                    FIDESlib::CKKS::Context& GPUcc_, int slots, bool multiStage) {
@@ -1527,6 +1627,14 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                         result.StC.at(i).A.back().c0.freeSpecialLimbs();
                 }
             }
+            if (btsRealEnv() && slots == (int)GPUcc.N / 2)
+                for (int j = 0; j < invA.at(0).size(); ++j) {
+                    result.stcRealA0.emplace_back(
+                        GPUcc_, realStc0Raw(invA.at(0).at(j), slots, precom->m_paramsDec[CKKS_BOOT_PARAMS::NUM_ROTATIONS],
+                                            precom->m_paramsDec[CKKS_BOOT_PARAMS::GIANT_STEP], j));
+                    if constexpr (remove_extension)
+                        result.stcRealA0.back().c0.freeSpecialLimbs();
+                }
 
             // FIDESLIB_BTS_SHIFT = s (composite levels, default 0). FIDESlib applies the FLEXIBLEAUTO adjustment
             // BEFORE raising, so the raised ciphertext is canonical at the top level, while OpenFHE's precompute
@@ -1580,16 +1688,16 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                         const bool stage0 = (v == &result.CtS && si == 0);
                         std::vector<Plaintext> nv;
                         nv.reserve(st.A.size());
+                        const bool carries_t = aks_layout ? (v == &result.CtS && si == 1) : stage0;
+                        if (aks_layout && raiseDropFor(slots))
+                            throw std::runtime_error("FIDESLIB_BTS_RAISE_DROP is not supported with the AKS layout");
+                        const int sh = ((aks_layout && !stage0) ? bts_shift + 1 : bts_shift) - raiseDropFor(slots);
+                        // the last StC stage compensates a lower raise target: sf(top) / sf(target) (see the single-LT block)
+                        const double fdrop = (v == &result.StC && si + 1 == v->size())
+                                                 ? GPUcc.sfAtLimb(GPUcc.L) /
+                                                       GPUcc.sfAtLimb(GPUcc.L - GPUcc.compositeDegree() * raiseDropFor(slots))
+                                                 : 1.0;
                         for (auto& pt : st.A) {
-                            const bool carries_t = aks_layout ? (v == &result.CtS && si == 1) : stage0;
-                            if (aks_layout && raiseDropFor(slots))
-                                throw std::runtime_error("FIDESLIB_BTS_RAISE_DROP is not supported with the AKS layout");
-                            const int sh = ((aks_layout && !stage0) ? bts_shift + 1 : bts_shift) - raiseDropFor(slots);
-                            // the last StC stage compensates a lower raise target: sf(top) / sf(target) (see the single-LT block)
-                            const double fdrop = (v == &result.StC && si + 1 == v->size())
-                                                     ? GPUcc.sfAtLimb(GPUcc.L) /
-                                                           GPUcc.sfAtLimb(GPUcc.L - GPUcc.compositeDegree() * raiseDropFor(slots))
-                                                     : 1.0;
                             nv.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, sh, (carries_t ? tfac : 1.0) * fdrop));
                             if (carries_t)
                                 nv.back().NoiseFactor *= tfac;  // integers x 2^-t at scale sf x 2^-t: same value
@@ -1608,6 +1716,13 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                             ov.push_back(std::move(o));
                         }
                         st.A = std::move(nv);
+                        if (v == &result.StC && si == 0 && !result.stcRealA0.empty()) {  // the real-payload stage 0 moves with it
+                            std::vector<Plaintext> nr;
+                            nr.reserve(result.stcRealA0.size());
+                            for (auto& pt : result.stcRealA0)
+                                nr.push_back(relevelPlaintext(GPUcc_, GPUcc, pt, sh, fdrop));
+                            result.stcRealA0 = std::move(nr);
+                        }
                     }
                 result.cts0_const = c;
                 result.cts0_t = bts_t;
@@ -1622,7 +1737,8 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
             buildSparseB(cc, GPUcc_, GPUcc, slots, result);
 
             auto ltFriendly = [&](std::vector<BootstrapPrecomputation::LTstep>& CtS,
-                                  std::vector<BootstrapPrecomputation::LTstep>& StC) {
+                                  std::vector<BootstrapPrecomputation::LTstep>& StC,
+                                  std::vector<Plaintext>* stcRealA0 = nullptr) {
             int acc_offset = 0;
             if constexpr (MAKE_CTS_LT_FRIENDLY) {
                 for (int32_t s = 0; s < CtS.size(); s++) {
@@ -1653,6 +1769,8 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                             if (i * StC.at(s).bStep + j < StC.at(s).slots) {
                                 StC.at(s).A[i * StC.at(s).bStep + j].automorph(
                                     ReduceRotation(-acc_offset, M / 4));
+                                if (s == 0 && stcRealA0 && !stcRealA0->empty())
+                                    (*stcRealA0)[i * StC.at(s).bStep + j].automorph(ReduceRotation(-acc_offset, M / 4));
                             }
                         }
                     }
@@ -1668,7 +1786,7 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                 }
             }
             };
-            ltFriendly(result.CtS, result.StC);
+            ltFriendly(result.CtS, result.StC, &result.stcRealA0);
             // default ON (bit-exact); FIDESLIB_LT_COMPACT=0 keeps the full streaming reads
             if (const char* e = std::getenv("FIDESLIB_LT_COMPACT"); !(e && *e) || std::atoi(e) > 0) {
                 for (auto* v : {&result.CtS, &result.StC})
@@ -1765,6 +1883,8 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     };
     copySteps(base.CtS, var->CtS, false);
     copySteps(base.StC, var->StC, true);
+    for (auto& pt : base.stcRealA0)
+        var->stcRealA0.push_back(relevel(pt, base.StC.size() == 1 ? fdrop : 1.0));
     var->accumulate_bStep = base.accumulate_bStep;
     var->correctionFactor = base.correctionFactor;
     var->sparse_encaps = base.sparse_encaps;

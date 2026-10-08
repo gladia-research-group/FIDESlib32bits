@@ -1215,6 +1215,14 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     st.exactConst = st.exactOnly || (st.baked != 0 && std::fabs(st.baked / st.constantEvalMult - 1.0) < 1e-9);
     st.aksOn = st.exactConst && st.baked != 0 && pre.aks0 != nullptr;
     st.corFactor = (uint64_t)1 << std::llround(st.correction);
+    // A real payload on the dense route enters as x + conj x = 2 Re x: one more bit of raise correction keeps the
+    // EvalMod input where it was, and corFactor (taken above) keeps the output at Re x.
+    st.real = cc.getBtsRealPayload() && cc.N / 2 == slots && !st.isLT && !st.sparseB && !st.stcFirst;
+    if (st.real) {
+        if (pre.stcRealA0.empty())
+            throw std::runtime_error("real-payload bootstrap without its StC variant (FIDESLIB_BTS_REAL)");
+        st.correction += 1;
+    }
     st.nCtS = (st.isLT || st.sparseB) ? 1 : (int)pre.CtS.size();
     st.nStC = (st.isLT || st.sparseB) ? 1 : (int)pre.StC.size();
     return st;
@@ -1296,6 +1304,11 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st) {
 void btsModRaise(Ciphertext& ctxt, BtsState& st) {
     CudaNvtxRange r(std::string{"bts::mod_raise"});
     ContextData& cc = ctxt.cc;
+    if (st.real) {  // an imaginary residue would leak into the real half's coefficients
+        Ciphertext aux(ctxt.cc_);
+        aux.conjugate(ctxt);
+        ctxt.add(aux);
+    }
     ModRaise(ctxt, st.slots, st.correction, st.prescaled || (st.stcFirst && st.stcFolded), st.sparseEncaps,
              st.exactConst ? st.constantEvalMult : 0.0, st.aksOn);
     st.shiftedFlow = st.exactConst && st.baked != 0 && !st.aksOn;
@@ -1314,15 +1327,16 @@ void btsFold(Ciphertext& ctxt, const BtsState& st) {
         ctxt.rescale();
 }
 
-static void ltStep(Ciphertext& ctxt, BootstrapPrecomputation::LTstep& step) {
-    assert(step.slots == step.A.size());
+static void ltStep(Ciphertext& ctxt, BootstrapPrecomputation::LTstep& step, std::vector<Plaintext>* A = nullptr) {
+    std::vector<Plaintext>& diag = A ? *A : step.A;
+    assert(step.slots == diag.size());
     std::vector<Plaintext*> Aptr(step.slots, nullptr);
     for (int j = 0; j < step.gStep; ++j)
         for (int i = 0; i < step.bStep; ++i)
             if (step.bStep * j + i < step.slots)
-                Aptr[step.bStep * j + i] = &(step.A[step.bStep * j + i]);
+                Aptr[step.bStep * j + i] = &(diag[step.bStep * j + i]);
     const int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
-    LtPtMaskScope ptMaskScope(step.ptMask);
+    LtPtMaskScope ptMaskScope(A ? 0xFFFFFFFFu : step.ptMask);  // a substitute lacks the stage's periodic layout
     LinearTransform(ctxt, step.slots, step.bStep, Aptr, stride, step.rotOut[0]);
 }
 
@@ -1355,7 +1369,13 @@ void btsEvalMod(Ciphertext& ctxt, const BtsState& st) {
     Context& cc_ = ctxt.cc_;
     ContextData& cc = ctxt.cc;
     Ciphertext aux(cc_);
-    if (cc.N / 2 == st.slots) {
+    if (st.real) {
+        aux.conjugate(ctxt);
+        ctxt.add(aux);
+        if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
+            ctxt.rescale();
+        approxModReductionReal(ctxt, cc.GetEvalKey(ctxt.keyID), st.scalar);
+    } else if (cc.N / 2 == st.slots) {
         aux.conjugate(ctxt);
         Ciphertext ctxtEncI(cc_);
         ctxtEncI.sub(ctxt, aux);
@@ -1435,7 +1455,7 @@ void btsStCStage(Ciphertext& ctxt, const BtsState& st, int k) {
         ctxt.rescale();
     const int fuseModeS = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
     LtFuseScope fuseScope(k != (int)pre.StC.size() - 1 && fuseModeS != 2);
-    ltStep(ctxt, pre.StC.at(k));
+    ltStep(ctxt, pre.StC.at(k), k == 0 && st.real ? &pre.stcRealA0 : nullptr);
 }
 
 void btsFinish(Ciphertext& ctxt, const BtsState& st) {
@@ -1445,6 +1465,11 @@ void btsFinish(Ciphertext& ctxt, const BtsState& st) {
     if (cc.N / 2 != st.slots && !st.sparseB) {
         Ciphertext aux(cc_);
         aux.rotate(ctxt, st.slots);
+        ctxt.add(aux);
+    }
+    if (st.real) {
+        Ciphertext aux(cc_);
+        aux.conjugate(ctxt);
         ctxt.add(aux);
     }
     if (st.corFactor != 1)

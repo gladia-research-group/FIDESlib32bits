@@ -62,6 +62,10 @@ class BootstrapPrecomputation {
     };
 
     std::vector<LTstep> StC;
+    // StC stage 0 for a real payload (FIDESLIB_BTS_REAL, dense route): the entry of every diagonal that reads
+    // coefficient 0 halved. A real slot vector's coefficients satisfy m_{N-k} = -m_k, so one EvalMod chain on
+    // coefficients 0..N/2-1 and this stage give w with slots = w + conj w (StC[0]'s rotations, read in full).
+    std::vector<Plaintext> stcRealA0;
     std::vector<LTstep> CtS;
     int accumulate_bStep = 4;
     uint32_t correctionFactor;

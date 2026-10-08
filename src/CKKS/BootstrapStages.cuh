@@ -16,6 +16,7 @@ struct BtsState {
     int slots = 0, oldSlots = 0;
     bool prescaled = false, isLT = false, mixedChain = false, sparseEncaps = false, sparseB = false;
     bool stcFirst = false, stcFolded = false, exactOnly = false, exactConst = false, aksOn = false, shiftedFlow = false;
+    bool real = false;  // real payload on the dense route (ContextData::btsRealPayload)
     uint32_t correction = 0;
     uint64_t scalar = 1, corFactor = 1;
     double constantEvalMult = 0, baked = 0;
