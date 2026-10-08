@@ -355,6 +355,13 @@ void RNSPoly::rescale() {
     }  // composite loop
 }
 
+void RNSPoly::rescaleOne() {
+    if (GPU.size() != 1)
+        throw std::runtime_error("RNSPoly::rescaleOne: single GPU only");
+    GPU[0].rescale();
+    level -= 1;
+}
+
 void RNSPoly::rescaleDouble(RNSPoly& poly) {
     //    assert(GPU.size() == 1 && "Rescale Multi-GPU not implemented.");
     // d=2 single-GPU fast path — one fused double-drop pass per component (each on

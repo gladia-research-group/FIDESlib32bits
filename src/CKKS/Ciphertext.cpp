@@ -517,9 +517,19 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale) {
 	}
 }
 
+thread_local bool g_rescaleOnePrime = false;
+
 void Ciphertext::rescale() {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
+	if (g_rescaleOnePrime && cc.compositeDegree() > 1) {
+		op_count[OPS::RESCALE]++;
+		c0.rescaleOne();
+		c1.rescaleOne();
+		NoiseFactor /= cc.modReduceFactorAt(c0.getLevel() + 1);
+		NoiseLevel -= 1;
+		return;
+	}
 	// assert(this->NoiseLevel == 2);
 	if (cc.rescaleTechnique != FIXEDMANUAL) {
 		// this wouldn't do anything in OpenFHE

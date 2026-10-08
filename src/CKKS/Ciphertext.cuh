@@ -21,6 +21,14 @@ namespace FIDESlib::CKKS {
  */
 extern bool hoistRotateFused;
 
+/// One-prime rescale (FIDESLIB_STC_SINGLE): while set, Ciphertext::rescale() drops one prime, not compositeDegree().
+extern thread_local bool g_rescaleOnePrime;
+struct RescaleOneScope {
+    bool old;
+    explicit RescaleOneScope(bool a) : old(g_rescaleOnePrime) { g_rescaleOnePrime = a; }
+    ~RescaleOneScope() { g_rescaleOnePrime = old; }
+};
+
 /**
  * @brief Pinned-arena offload descriptor for one ciphertext (async KV-cache swap).
  *
@@ -444,7 +452,9 @@ class Ciphertext {
     /** @brief Increases the modulus level of the ciphertext (level up). */
     void modUp();
 
-    /** @brief Rescales the ciphertext to the next level, adjusting scaling factor. */
+    /** @brief Rescales the ciphertext to the next level, adjusting scaling factor.
+     *  Under a RescaleOneScope it drops ONE prime instead of compositeDegree() (the ciphertext then
+     *  sits off the composite level grid until a matching one-prime drop brings it back). */
     void rescale();
 
     /**
