@@ -1281,7 +1281,8 @@ static void buildSparseB(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, FIDESl
     // FIDESLIB_BTS_SHIFT: the exact post-raise scaling carries 2^t on the ciphertext and the SHIPPED stage-0 plaintexts
     // carry 2^-t; B's CtS replaces that stage, so it must carry the 2^-t itself
     const double shiftT = result.cts0_const != 0 ? std::ldexp(1.0, -result.cts0_t) : 1.0;
-    const double gc = envDouble("FIDESLIB_BTS_SPARSE_B_GC", 1.0) / sb->bootK * shiftT;
+    // ModRaise already scaled by 1/(K_raise N) (constantEvalMult, K_raise = GetBootK()); the EvalMod input must be x / bootK
+    const double gc = envDouble("FIDESLIB_BTS_SPARSE_B_GC", 1.0) * GPUcc.GetBootK() / sb->bootK * shiftT;
     const double gd = envDouble("FIDESLIB_BTS_SPARSE_B_GD", 1.0) * qDouble / GPUcc.sfAtLimb(GPUcc.L);  // scaleDec
     const int half = n / 2;
     auto encode = [&](std::vector<cd>& v) {
@@ -1977,8 +1978,12 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     BootstrapPrecomputation& base = GPUcc.GetBootPrecomputationBase(slots);
     if (drop <= base.raise_drop || base.raise_variants.count(drop))
         return;
-    if (base.aks0 || base.sparseB || base.stc_first_mode > 0)
-        throw std::runtime_error("AddBootstrapRaiseVariant: not supported with FIDESLIB_AKS / BTS_SPARSE_B / BTS_STC_FIRST");
+    if (base.sparseB) {  // a SparseB route takes no raise variants: plan it with drops off that route (PLAN_RAISE_ROUTES)
+        std::cerr << "[raise_variant] slots=" << slots << " drop " << drop << " skipped: SparseB route\n";
+        return;
+    }
+    if (base.aks0 || base.stc_first_mode > 0)
+        throw std::runtime_error("AddBootstrapRaiseVariant: not supported with FIDESLIB_AKS / BTS_STC_FIRST");
     const int d = GPUcc.compositeDegree();
     const int shift = -(drop - base.raise_drop);
     const double sfBase = GPUcc.sfAtLimb(GPUcc.L - d * base.raise_drop);

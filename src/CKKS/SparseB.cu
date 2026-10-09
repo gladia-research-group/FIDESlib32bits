@@ -24,14 +24,17 @@ using sc = std::source_location;
 using namespace FIDESlib::CKKS;
 
 const std::vector<double>& FIDESlib::CKKS::sparseBChebyshevK24() {
-    // gen_evalmod_coeffs.py target with K = 24: (2pi)^(-1/32) cos(2pi(24 y - 0.25)/32), Chebyshev-Gauss fit, DEGREE 14 (the
-    // shipped shape: same Paterson-Stockmeyer split as the K = 16 series), max |err| 1.3e-7 on [-1, 1] (K = 16 / degree 14:
-    // 2.6e-10; degree 15 would give 6.1e-8); evaluator convention (c0 doubled).
+    // (2pi)^(-1/32) cos(2pi(24 y - 0.25)/32), Chebyshev interpolation truncated at DEGREE 20 (same Paterson-Stockmeyer
+    // depth as degree 14): max |err| 2.9e-13 on [-1, 1] (degree 14: 7.6e-8, which capped the route at ~10.6 bits; the
+    // shipped K = 16 / degree 14: 1.6e-10); evaluator convention (c0 doubled).
     static const std::vector<double> c = {
-        -5.01431878575762657e-01, -2.60978240793178946e-02, -2.75969415548868668e-01, -3.76057943042463066e-02,
-        6.98674483745098551e-01,  2.06638885145157339e-02,  -1.93915485831721190e-01, -3.59503488102321097e-03,
-        2.34902992392428261e-02,  3.23162556522637483e-04,  -1.63628726064380422e-03, -1.80046787485826436e-05,
-        7.47066227217195531e-05,  6.86304599784427529e-07,  -2.47651775334633044e-06};
+        -5.01431878575762102e-01, -2.60978240793176830e-02, -2.75969415548868335e-01,
+        -3.76057943042461193e-02, 6.98674483745098551e-01, 2.06638885145157200e-02,
+        -1.93915485831718332e-01, -3.59503488102385325e-03, 2.34902992390395096e-02,
+        3.23162556614403976e-04, -1.63628724411827371e-03, -1.80046855470203313e-05,
+        7.47055232583680419e-05, 6.86710430736672347e-07, -2.41801471221991641e-06,
+        -1.91108603715104241e-08, 5.85030407613337840e-08, 4.05831352269635484e-10,
+        -1.09946346874119116e-09, -6.79891244700694627e-12, 1.65253168377321969e-11};
     return c;
 }
 
