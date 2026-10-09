@@ -3,6 +3,7 @@
 #define __RAW_CIPHER_TEXT__
 
 #include <cinttypes>
+#include <functional>
 #include <vector>
 #include "CKKS/forwardDefs.cuh"
 //#include "CKKS/BootstrapPrecomputation.cuh"
@@ -99,6 +100,9 @@ struct RawKeySwitchKey {
     // (unpatched OpenFHE / OPENFHE_KSKA_SEED=0 / threshold HE) — consumers must fall back
     // to the dense `a`.
     std::vector<uint32_t> a_seed;
+    // A seeded key's `a` is left unconverted (a single GPU regenerates it from the seed); readers that do need
+    // the dense `a` call this first when r_key[0] is empty.
+    std::function<void(RawKeySwitchKey&)> fill_a;
 };
 
 std::vector<std::vector<uint64_t>> GetRawArray(const std::vector<lbcrypto::PolyImpl<lbcrypto::NativeVector>>& polys);

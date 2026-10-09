@@ -73,8 +73,11 @@ void KeySwitchingKey::Initialize(RawKeySwitchKey& rkk, int q_band) {
         a.GPU.at(0).adoptKskASeed(rkk.a_seed, q_band);
     else if (seeded_a)
         a.GPU.at(0).expandKskADigits(rkk.a_seed);
-    else
+    else {
+        if (rkk.r_key[0].empty() && rkk.fill_a)
+            rkk.fill_a(rkk);
         a.loadDecompDigit(rkk.r_key[0], rkk.r_key_moduli[0]);
+    }
     b.loadDecompDigit(rkk.r_key[1], rkk.r_key_moduli[1]);
 
     if (const int W = kskPackBitsPolicy(cc)) {
