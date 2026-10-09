@@ -1187,7 +1187,7 @@ void RNSPoly::loadStaged(const uint8_t* base, const std::vector<size_t>& off,
 
 void RNSPoly::loadCoeffExpand(const uint8_t* arena, const std::vector<size_t>& off,
                               const std::vector<size_t>& len, int src_limbs, int target_limbs,
-                              cudaStream_t stream, int prescale_log2) {
+                              cudaStream_t stream, int prescale_log2, bool native) {
     // See RNSPoly.cuh. Mirrors ModRaise's raise mechanic (INTT → grow → raise → NTT), sourcing
     // the first `src_limbs` limbs from the pinned arena instead of an existing ciphertext.
     //
@@ -1205,8 +1205,11 @@ void RNSPoly::loadCoeffExpand(const uint8_t* arena, const std::vector<size_t>& o
     grow(src_limbs - 1, false, /*constant=*/false);   // limbs 0..src_limbs-1 WITH aux
     for (int k = 0; k < src_limbs; ++k) {
         cudaSetDevice(GPU[cc.limbGPUid[k].x].device);
-        SWITCH(GPU[cc.limbGPUid[k].x].limb[cc.limbGPUid[k].y],
-               load_async_ptr_u64src(arena + off[k], len[k] / sizeof(uint64_t), stream));
+        if (native)
+            SWITCH(GPU[cc.limbGPUid[k].x].limb[cc.limbGPUid[k].y], load_async_ptr(arena + off[k], len[k], stream));
+        else
+            SWITCH(GPU[cc.limbGPUid[k].x].limb[cc.limbGPUid[k].y],
+                   load_async_ptr_u64src(arena + off[k], len[k] / sizeof(uint64_t), stream));
     }
 
     // The limb kernels below run on the partition stream — bridge the upload once.
