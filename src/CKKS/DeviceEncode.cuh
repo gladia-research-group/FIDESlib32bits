@@ -13,7 +13,7 @@ namespace FIDESlib::CKKS {
 /// a word. Metadata as OpenFHE reports it: NoiseFactor = scale^deg, NoiseLevel = deg, slots = N/2. No host sync:
 /// the result is complete on the returned stream (the plaintext's own).
 cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double>>& values, int limbs, double scale,
-                            int deg);
+                            int deg, double* cmaxPinned = nullptr);
 
 }  // namespace FIDESlib::CKKS
 #endif

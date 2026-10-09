@@ -159,9 +159,10 @@ class RNSPoly {
     // prescale_log2 (MarkCoeffStaged): host values were encoded ÷2^k to fit the centered-lift
     // bound; after the lift every limb is multiplied back by (2^k mod q_i) — exact integer
     // un-prescale, no scale/level change.
+    // `native`: the source limbs are at native limb width (a storeStaged dump), not u64.
     void loadCoeffExpand(const uint8_t* arena, const std::vector<size_t>& off,
                          const std::vector<size_t>& len, int src_limbs, int target_limbs,
-                         cudaStream_t stream, int prescale_log2 = 0);
+                         cudaStream_t stream, int prescale_log2 = 0, bool native = false);
     void rotateModupDotKSK(RNSPoly& poly, RNSPoly& poly1, const KeySwitchingKey& key);
     void squareModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey& key);
     void generatePartialSpecialLimbs();

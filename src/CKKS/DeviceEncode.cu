@@ -140,7 +140,7 @@ void ensure(Scratch& s, ContextData& C) {
 }  // namespace
 
 cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double>>& values, int limbs, double scale,
-                            int deg) {
+                            int deg, double* cmaxPinned) {
     ContextData& C = pt.cc;
     const int N = C.N;
     std::lock_guard<std::mutex> g(g_mutex);
@@ -170,6 +170,8 @@ cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double
     }
     cudaMemsetAsync(s.cmax, 0, sizeof(unsigned long long), E);
     coeffs_<<<(N + 255) / 256, 256, 0, E>>>(in, N, scale, s.c, s.cmax);
+    if (cmaxPinned)   // the bit pattern of a non-negative double, read back as one
+        cudaMemcpyAsync(cmaxPinned, s.cmax, sizeof(double), cudaMemcpyDeviceToHost, E);
     pt.c0.grow(limbs - 1);   // with the NTT's aux buffers (constant limbs have none), as Spru.cu
     const cudaStream_t ps = pt.c0.GPU.at(0).s.ptr();
     cudaEventRecord(s.limbsReady, ps);

@@ -112,7 +112,7 @@ namespace FIDESlib::CKKS {
     void loadCoeffExpand(const RawPlainText& meta, const uint8_t* arena,
                          const std::vector<size_t>& off, const std::vector<size_t>& len,
                          int src_limbs, int target_limbs,
-                         cudaStream_t stream, int prescale_log2 = 0);
+                         cudaStream_t stream, int prescale_log2 = 0, bool native = false);
     /**
      * @brief Store this plaintext into a raw representation.
      *

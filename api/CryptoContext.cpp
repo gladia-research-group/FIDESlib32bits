@@ -1040,11 +1040,15 @@ struct DeviceDump {
 	uint8_t*					 base = nullptr;
 	size_t						 bytes = 0;
 	std::vector<size_t>			 off, len;
+	int							 limbs = 0;   // the plaintext's; the dump keeps the first composite group
 };
 std::mutex										 g_dump_mutex;
 std::unordered_map<const void*, DeviceDump>		 g_dumps;
 std::unordered_map<size_t, std::vector<uint8_t*>> g_dump_free;
-std::unordered_map<uint32_t, const void*>		 g_undumped;	   // device handle -> plaintext, dumped at eviction
+// device handle -> (plaintext, pinned max |coefficient| of its encode, or null for degree > 1): dumped at eviction
+std::unordered_map<uint32_t, std::pair<const void*, double*>> g_undumped;
+std::vector<double*> g_cmax_free;   // pinned slots, recycled
+size_t g_dump_bytes = 0, g_full_bytes = 0;
 uint8_t*										 g_slab	  = nullptr;
 size_t											 g_slab_left = 0;
 
@@ -1070,8 +1074,15 @@ uint8_t* dump_alloc_locked(size_t bytes) {
 
 void DeviceDumpForget(const void* key) {
 	std::lock_guard<std::mutex> g(g_dump_mutex);
-	for (auto u = g_undumped.begin(); u != g_undumped.end();)
-		u = (u->second == key) ? g_undumped.erase(u) : std::next(u);
+	for (auto u = g_undumped.begin(); u != g_undumped.end();) {
+		if (u->second.first != key) {
+			++u;
+			continue;
+		}
+		if (u->second.second)
+			g_cmax_free.push_back(u->second.second);
+		u = g_undumped.erase(u);
+	}
 	auto it = g_dumps.find(key);
 	if (it == g_dumps.end())
 		return;
@@ -1079,13 +1090,22 @@ void DeviceDumpForget(const void* key) {
 	g_dumps.erase(it);
 }
 
-static void dump_device_plaintext_locked(const void* key, FIDESlib::CKKS::Plaintext& dev) {
+// The dump keeps only the first composite group (d limbs): a weight's coefficients are integers below that group's
+// product, so the reload's Garner lift (loadCoeffExpand) rebuilds every other limb exactly.
+static void dump_device_plaintext_locked(const void* key, FIDESlib::CKKS::Plaintext& dev, const double* cmax) {
 	DeviceDump d;
-	const int limbs = dev.c0.getLevel() + 1;
-	d.bytes = (size_t)limbs * dev.cc.N * sizeof(uint32_t);
-	for (int l = 0; l < limbs; ++l)
+	cudaStreamSynchronize(dev.c0.GPU.at(0).s.ptr());   // the encode (and its max |coefficient| copy) is done
+	d.limbs		= dev.c0.getLevel() + 1;
+	// compact when every integer coefficient fits a quarter of the first composite group's product
+	double group = 1;
+	for (int l = 0; l < dev.cc.compositeDegree(); ++l)
+		group *= (double)dev.cc.prime[l].p;
+	const bool compact = cmax && *cmax < 0.25 * group;
+	const int  src	   = compact ? std::min(d.limbs, dev.cc.compositeDegree()) : d.limbs;
+	d.bytes = (size_t)src * dev.cc.N * sizeof(uint32_t);
+	for (int l = 0; l < src; ++l)
 		d.meta.moduli.push_back(dev.cc.prime[l].p);
-	d.meta.numRes	  = limbs;
+	d.meta.numRes	  = src;
 	d.meta.N		  = dev.cc.N;
 	d.meta.format	  = Format::EVALUATION;
 	d.meta.Noise	  = dev.NoiseFactor;
@@ -1094,11 +1114,40 @@ static void dump_device_plaintext_locked(const void* key, FIDESlib::CKKS::Plaint
 	d.base		  = dump_alloc_locked(d.bytes);
 	size_t cursor = 0;
 	const cudaStream_t ps = dev.c0.GPU.at(0).s.ptr();
-	dev.c0.storeStaged(d.base, cursor, d.off, d.len, ps, 0);
+	dev.c0.storeStaged(d.base, cursor, d.off, d.len, ps, src);
 	cudaStreamSynchronize(ps);
+	g_dump_bytes += d.bytes;
+	g_full_bytes += (size_t)d.limbs * dev.cc.N * sizeof(uint32_t);
 	if (cursor != d.bytes)
 		OPENFHE_THROW("device dump: " + std::to_string(cursor) + " bytes stored, " + std::to_string(d.bytes) + " expected");
 	g_dumps[key] = std::move(d);
+}
+
+// FIDESLIB_GPU_ENCODE_CHECK=1: a reloaded plaintext against a fresh device encode of its values, limb for limb.
+static long g_check_n = 0, g_check_bad = 0, g_check_compact = 0;
+static void check_reload_locked(FIDESlib::CKKS::Plaintext& got, const lbcrypto::Plaintext& cpu_pt, size_t total_limbs,
+                                bool compact) {
+	FIDESlib::CKKS::Plaintext ref(got.cc_);
+	cudaStreamSynchronize(FIDESlib::CKKS::encodeOnDevice(ref, cpu_pt->GetCKKSPackedValue(),
+	                                                    static_cast<int>(total_limbs - cpu_pt->GetLevel()),
+	                                                    cpu_pt->GetScalingFactor(),
+	                                                    static_cast<int>(cpu_pt->GetNoiseScaleDeg())));
+	cudaDeviceSynchronize();
+	std::vector<std::vector<uint64_t>> a, b;
+	got.c0.store(a);
+	ref.c0.store(b);
+	cudaDeviceSynchronize();
+	long bad = a.size() != b.size() || got.NoiseFactor != ref.NoiseFactor;
+	for (size_t l = 0; l < a.size() && l < b.size(); ++l)
+		for (size_t k = 0; k < a[l].size(); ++k)
+			bad += a[l][k] != b[l][k];
+	++g_check_n;
+	g_check_compact += compact;
+	g_check_bad += bad;
+	if (g_check_n % 256 == 0 || bad)
+		std::cerr << "[gpu_encode_check] reloads=" << g_check_n << " compact=" << g_check_compact
+		          << " mismatches=" << g_check_bad << " dump_MB=" << (g_dump_bytes >> 20) << " full_MB=" << (g_full_bytes >> 20)
+		          << std::endl;
 }
 
 void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stream_override) {
@@ -1121,17 +1170,36 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 			std::lock_guard<std::mutex> g(g_dump_mutex);
 			auto it = g_dumps.find(dkey);
 			if (it != g_dumps.end()) {
-				gpu_pt->loadStaged(it->second.meta, it->second.base, it->second.off, it->second.len, load_stream);
+				const DeviceDump& d = it->second;
+				if ((int)d.off.size() < d.limbs)
+					gpu_pt->loadCoeffExpand(d.meta, d.base, d.off, d.len, (int)d.off.size(), d.limbs, load_stream, 0, true);
+				else
+					gpu_pt->loadStaged(d.meta, d.base, d.off, d.len, load_stream);
 				reloaded = true;
+				if (std::getenv("FIDESLIB_GPU_ENCODE_CHECK"))
+					check_reload_locked(*gpu_pt, std::any_cast<const lbcrypto::Plaintext&>(pt->cpu), total_q_limbs(this->cpu),
+					                    (int)d.off.size() < d.limbs);
 			}
 		}
 		cudaStream_t ready = load_stream;
+		double*		 cmax = nullptr;
 		if (!reloaded) {
 			const auto& cpu_pt = std::any_cast<const lbcrypto::Plaintext&>(pt->cpu);
+			if (cpu_pt->GetNoiseScaleDeg() == 1) {
+				std::lock_guard<std::mutex> g(g_dump_mutex);
+				if (g_cmax_free.empty()) {
+					double* block = nullptr;
+					cudaMallocHost(reinterpret_cast<void**>(&block), 4096 * sizeof(double));
+					for (int i = 0; i < 4096; ++i)
+						g_cmax_free.push_back(block + i);
+				}
+				cmax = g_cmax_free.back();
+				g_cmax_free.pop_back();
+			}
 			ready = FIDESlib::CKKS::encodeOnDevice(*gpu_pt, cpu_pt->GetCKKSPackedValue(),
 			                                       static_cast<int>(total_q_limbs(this->cpu) - cpu_pt->GetLevel()),
 			                                       cpu_pt->GetScalingFactor(),
-			                                       static_cast<int>(cpu_pt->GetNoiseScaleDeg()));
+			                                       static_cast<int>(cpu_pt->GetNoiseScaleDeg()), cmax);
 			if (!plaintext_streams_enabled)
 				cudaStreamSynchronize(ready);
 		}
@@ -1140,7 +1208,7 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 		pt->loaded		= true;
 		if (!reloaded) {
 			std::lock_guard<std::mutex> g(g_dump_mutex);
-			g_undumped[handle] = dkey;
+			g_undumped[handle] = {dkey, cmax};
 		}
 		RecordPlaintextReady(handle, ready);
 		return;
@@ -3429,7 +3497,10 @@ bool CryptoContextImpl<DCRTPoly>::EvictDevicePlaintext(uint32_t handle) {
 			std::shared_ptr<void> dev = d != device_plaintexts.end() ? d->second : nullptr;
 			device_plaintexts_mutex->unlock();
 			if (dev)
-				dump_device_plaintext_locked(u->second, *std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(dev));
+				dump_device_plaintext_locked(u->second.first, *std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(dev),
+				                             u->second.second);
+			if (u->second.second)
+				g_cmax_free.push_back(u->second.second);
 			g_undumped.erase(u);
 		}
 	}
