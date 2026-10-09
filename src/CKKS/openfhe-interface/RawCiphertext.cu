@@ -497,36 +497,53 @@ FIDESlib::CKKS::RawParams FIDESlib::CKKS::GetRawParams(lbcrypto::CryptoContext<l
 
     return result;
 }
+
+// The key's digits as [digit][limb][coef], limbs converted in parallel.
+static std::vector<std::vector<std::vector<uint64_t>>> rawDigits(const std::vector<lbcrypto::DCRTPoly>& digits) {
+    std::vector<std::vector<std::vector<uint64_t>>> out(digits.size());
+    std::vector<std::pair<int, int>> jobs;
+    for (size_t j = 0; j < digits.size(); ++j) {
+        out[j].resize(digits[j].GetAllElements().size());
+        for (size_t r = 0; r < out[j].size(); ++r)
+            jobs.emplace_back((int)j, (int)r);
+    }
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int k = 0; k < (int)jobs.size(); ++k) {
+        const auto& vals = digits[jobs[k].first].GetAllElements()[jobs[k].second].GetValues();
+        auto& limb = out[jobs[k].first][jobs[k].second];
+        limb.resize(vals.GetLength());
+        for (size_t i = 0; i < limb.size(); ++i)
+            limb[i] = vals[i].ConvertToInt();
+    }
+    return out;
+}
+
 FIDESlib::CKKS::RawKeySwitchKey FIDESlib::CKKS::GetKeySwitchKey(
     std::shared_ptr<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>> ek) {
-
-    std::vector<std::vector<std::vector<uint64_t>>> a_moduli;
-    std::vector<std::vector<std::vector<std::vector<uint64_t>>>> a;
-    std::vector<std::vector<std::vector<uint64_t>>> b;
-    std::string keytag;
-
-    //for (auto a_raw = ek.get()->m_rKey; auto& i : a_raw) {
-    for (/*auto a_raw = ek.get()->m_rKey;*/ auto& i : {ek->GetAVector(), ek->GetBVector()}) {
-        std::vector<std::vector<std::vector<uint64_t>>> a_inner;
-        std::vector<std::vector<uint64_t>> a_inner_moduli;
-        for (auto& j : i) {
-            auto v = GetRawArray(j.GetAllElements() /*.m_vectors*/);
-            a_inner_moduli.emplace_back();
-            auto& a_aux = a_inner_moduli.back();
-            for (auto& p : j.GetParams()->GetParams() /*m_params->m_params*/) {
-                a_aux.push_back(p->GetModulus().ConvertToInt<uint64_t>() /* m_ciphertextModulus.m_value*/);
-            }
-            a_inner.push_back(v);
+    std::vector<std::vector<std::vector<uint64_t>>> moduli;
+    for (const auto* v : {&ek->GetAVector(), &ek->GetBVector()}) {
+        moduli.emplace_back();
+        for (const auto& j : *v) {
+            moduli.back().emplace_back();
+            for (auto& p : j.GetParams()->GetParams())
+                moduli.back().back().push_back(p->GetModulus().ConvertToInt<uint64_t>());
         }
-        a.push_back(a_inner);
-        a_moduli.push_back(a_inner_moduli);
     }
-    keytag = ek->GetKeyTag();
-
-    RawKeySwitchKey raw(std::move(a_moduli), std::move(a), std::move(b), std::move(keytag));
+    std::vector<uint32_t> seed;
 #ifdef OPENFHE_HAS_KSKA_SEED
-    raw.a_seed = ek->GetASeed();   // key seed for on-GPU regeneration of the `a` half
+    seed = ek->GetASeed();   // key seed for on-GPU regeneration of the `a` half
 #endif
+    std::vector<std::vector<std::vector<std::vector<uint64_t>>>> keys(2);
+    if (seed.empty())
+        keys[0] = rawDigits(ek->GetAVector());
+    keys[1] = rawDigits(ek->GetBVector());
+    RawKeySwitchKey raw;
+    raw.r_key_moduli = std::move(moduli);
+    raw.r_key		 = std::move(keys);
+    raw.keyid		 = ek->GetKeyTag();
+    raw.a_seed		 = std::move(seed);
+    if (!raw.a_seed.empty())
+        raw.fill_a = [ek](RawKeySwitchKey& r) { r.r_key[0] = rawDigits(ek->GetAVector()); };
     return raw;
 }
 
@@ -1127,6 +1144,8 @@ void FIDESlib::CKKS::AddBootstrapKeys(const lbcrypto::PublicKey<lbcrypto::DCRTPo
                 // sum_j D^_j D*_j == 1 (mod Q) and the P factor kills the mod-P ambiguity, so (sum b_j, sum a_j)
                 // encrypts P*s~ under s with noise sum e_j.
                 if (const char* e = std::getenv("FIDESLIB_BTS_SHIFT"); e && std::atoi(e) > 0) {
+                    if (rawKskEval2.r_key[0].empty() && rawKskEval2.fill_a)
+                        rawKskEval2.fill_a(rawKskEval2);
                     const auto& A = rawKskEval2.r_key[0];  // [digit][limb][coef]
                     const auto& B = rawKskEval2.r_key[1];
                     const auto& M = rawKskEval2.r_key_moduli[0];
@@ -1511,6 +1530,17 @@ static std::unique_ptr<FIDESlib::CKKS::Plaintext> makeStcFirstMask(lbcrypto::Cry
     return std::make_unique<FIDESlib::CKKS::Plaintext>(GPUcc_, raw);
 }
 
+// The bootstrap tables' host conversion, plaintexts in parallel (each GetRawPlainText stays serial).
+template <class Pts>
+static std::vector<FIDESlib::CKKS::RawPlainText> rawPlainTexts(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+                                                                const Pts& pts) {
+    std::vector<FIDESlib::CKKS::RawPlainText> out(pts.size());
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < (int)pts.size(); ++i)
+        out[i] = FIDESlib::CKKS::GetRawPlainText(cc, pts[i]);
+    return out;
+}
+
 void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
                                             FIDESlib::CKKS::Context& GPUcc_,
                                             FIDESlib::CKKS::BootstrapPrecomputation& result) {
@@ -1527,16 +1557,18 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                 auto auxInvA = precom->m_U0Pre;
 
                 result.LT.A.clear();
+                const auto rawA = rawPlainTexts(cc, auxA);
                 for (int i = 0; i < auxA.size(); ++i) {
-                    RawPlainText raw = GetRawPlainText(cc, auxA.at(i));
+                    const RawPlainText& raw = rawA[i];
                     result.LT.A.emplace_back(GPUcc_, raw);
                     if constexpr (remove_extension)
                         result.LT.A.back().c0.freeSpecialLimbs();
                 }
 
                 result.LT.invA.clear();
+                const auto rawInvA = rawPlainTexts(cc, auxInvA);
                 for (int i = 0; i < auxInvA.size(); ++i) {
-                    RawPlainText raw = GetRawPlainText(cc, auxInvA.at(i));
+                    const RawPlainText& raw = rawInvA[i];
                     result.LT.invA.emplace_back(GPUcc_, raw);
                     if constexpr (remove_extension)
                         result.LT.invA.back().c0.freeSpecialLimbs();
@@ -1611,8 +1643,9 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
             auto& invA = precom->m_U0PreFFT;
 
             for (int i = 0; i < A.size(); ++i) {
+                const auto raws = rawPlainTexts(cc, A.at(A.size() - 1 - i));
                 for (int j = 0; j < A.at(A.size() - 1 - i).size(); ++j) {
-                    RawPlainText raw = GetRawPlainText(cc, A.at(A.size() - 1 - i).at(j));
+                    const RawPlainText& raw = raws[j];
                     result.CtS.at(i).A.emplace_back(GPUcc_, raw);
                     if constexpr (remove_extension)
                         result.CtS.at(i).A.back().c0.freeSpecialLimbs();
@@ -1620,21 +1653,28 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
             }
 
             for (int i = 0; i < invA.size(); ++i) {
+                const auto raws = rawPlainTexts(cc, invA.at(i));
                 for (int j = 0; j < invA.at(i).size(); ++j) {
-                    RawPlainText raw = GetRawPlainText(cc, invA.at(i).at(j));
+                    const RawPlainText& raw = raws[j];
                     result.StC.at(i).A.emplace_back(GPUcc_, raw);
                     if constexpr (remove_extension)
                         result.StC.at(i).A.back().c0.freeSpecialLimbs();
                 }
             }
-            if (btsRealEnv() && slots == (int)GPUcc.N / 2)
-                for (int j = 0; j < invA.at(0).size(); ++j) {
-                    result.stcRealA0.emplace_back(
-                        GPUcc_, realStc0Raw(invA.at(0).at(j), slots, precom->m_paramsDec[CKKS_BOOT_PARAMS::NUM_ROTATIONS],
-                                            precom->m_paramsDec[CKKS_BOOT_PARAMS::GIANT_STEP], j));
+            if (btsRealEnv() && slots == (int)GPUcc.N / 2) {
+                // each stage-0 plaintext is a pure host computation: build them in parallel, upload in order
+                const int n0 = (int)invA.at(0).size();
+                std::vector<RawPlainText> real(n0);
+#pragma omp parallel for schedule(dynamic, 1)
+                for (int j = 0; j < n0; ++j)
+                    real[j] = realStc0Raw(invA.at(0).at(j), slots, precom->m_paramsDec[CKKS_BOOT_PARAMS::NUM_ROTATIONS],
+                                          precom->m_paramsDec[CKKS_BOOT_PARAMS::GIANT_STEP], j);
+                for (int j = 0; j < n0; ++j) {
+                    result.stcRealA0.emplace_back(GPUcc_, real[j]);
                     if constexpr (remove_extension)
                         result.stcRealA0.back().c0.freeSpecialLimbs();
                 }
+            }
 
             // FIDESLIB_BTS_SHIFT = s (composite levels, default 0). FIDESlib applies the FLEXIBLEAUTO adjustment
             // BEFORE raising, so the raised ciphertext is canonical at the top level, while OpenFHE's precompute
