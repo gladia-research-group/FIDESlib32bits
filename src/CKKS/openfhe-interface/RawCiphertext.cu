@@ -2000,8 +2000,12 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
         std::cerr << "[raise_variant] slots=" << slots << " drop " << drop << " skipped: SparseB route\n";
         return;
     }
-    if (base.aks0 || base.stc_first_mode > 0)
-        throw std::runtime_error("AddBootstrapRaiseVariant: not supported with FIDESLIB_AKS / BTS_STC_FIRST");
+    if (base.stc_first_mode > 0) {  // its sites raise to the top (GetBootPrecomputation serves the base)
+        std::cerr << "[raise] slots=" << slots << ": StC-first route, no variant for drop " << drop << "\n";
+        return;
+    }
+    if (base.aks0)
+        throw std::runtime_error("AddBootstrapRaiseVariant: not supported with FIDESLIB_AKS");
     const int d = GPUcc.compositeDegree();
     const int shift = -(drop - base.raise_drop);
     const double sfBase = GPUcc.sfAtLimb(GPUcc.L - d * base.raise_drop);
@@ -2112,6 +2116,10 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
 
         result.correctionFactor =
             std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_correctionFactor;
+        // The StC-first order's EvalMod runs on the slot values, not the coefficients, so its range needs a larger
+        // default correction factor (FIDESLIB_BTS_STC_FIRST_CF); a planned site's own still wins.
+        if (const char* e = std::getenv("FIDESLIB_BTS_STC_FIRST_CF"); e && *e && result.stc_first_mode > 0)
+            result.correctionFactor = std::atoi(e);
 
         if (GPUcc.param.raw->sparse_encaps) {
             result.sparse_encaps = true;

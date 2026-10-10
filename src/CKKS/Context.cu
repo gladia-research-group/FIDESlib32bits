@@ -749,6 +749,8 @@ BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
     if (drop <= base.raise_drop)
         return base;
     auto it = base.raise_variants.find(drop);
+    if (it == base.raise_variants.end() && base.stc_first_mode > 0)
+        return base;  // a StC-first route keeps no variants: the raise goes to the top and lands shallower than planned
     if (it == base.raise_variants.end() && raiseVariantBuilder && raiseDropsAllowed.count(drop)) {
         static std::mutex build_mu;
         std::lock_guard<std::mutex> g(build_mu);
