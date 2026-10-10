@@ -45,6 +45,10 @@ std::vector<std::pair<std::string, std::shared_ptr<FIDESlib::CKKS::Ciphertext>>>
 
 // Effective correction factor for this bootstrap call: the ContextData override (armed by
 // the wrapper's CorrectionScope) wins over the per-slots precomputation value.
+// StC-first's folded last stage is built at this correction factor (the planner's cf_max); a call with a smaller one
+// scales its input by the exact integer 2^(ref - cf) first.
+static constexpr int kStcFirstCfRef = 20;
+
 static uint32_t effCorrectionFactor(FIDESlib::CKKS::ContextData& cc, int slots) {
     return cc.correctionFactorOverride >= 0
                ? (uint32_t)cc.correctionFactorOverride
@@ -346,7 +350,10 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
     // (calibration: the same context, both flows)
     const bool sparseB = cc.GetBootPrecomputation(slots).sparseB != nullptr &&
                          [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
-    const bool stcFirst = cc.GetBootPrecomputation(slots).stc_first_mode > 0 && !sparseB && allowStcFirst;
+    // an input without room for the StC levels takes the shipped order (as btsBegin)
+    const bool stcFirst = cc.GetBootPrecomputation(slots).stc_first_mode > 0 && !sparseB && allowStcFirst &&
+                          (int)ctxt.getLevel() - (ctxt.NoiseLevel == 2 ? cc.compositeDegree() : 0) >=
+                              cc.GetBootPrecomputation(slots).stc_first_entry;
     static int abCount = 0;
     std::unique_ptr<Ciphertext> abRef;
     std::string abDir;
@@ -398,10 +405,14 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
             // The input-scale ratio MUST ride the plaintext (before the raise): folding it into the exact post-raise
             // scaling also scales the q0*I term, which EvalMod needs as integer multiples (chain96/97: garbage).
             const double ratio = cc.sfAtLimb(entry) / nfIn;
-            const double factor = std::ldexp(1.0, -cf) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
-            const std::pair<int, long long> key{cf, std::llround(std::log2(nfIn) * 1e6)};  // nominal scales per level
+            // built at a reference CF, keyed by the input scale alone (see btsStcFirstInput)
+            const int cfStage = std::max(cf, kStcFirstCfRef);
+            if (cfStage > cf)
+                multIntScalar(ctxt, uint64_t{1} << (cfStage - cf));
+            const double factor = std::ldexp(1.0, -cfStage) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
+            const std::pair<int, long long> key{cfStage, std::llround(std::log2(nfIn) * 1e6)};  // nominal scales per level
             // The cached last stages must keep their special limbs (the Q-only variant lost 15 bits, chain93); the
-            // cache is bounded (each entry ~0.2 GB; a plan's distinct (CF, input level) pairs are a few tens).
+            // cache is bounded (each entry ~0.2 GB; one per input scale).
             constexpr size_t kLastStageCache = 24;
             if (isLT) {
                 auto it = pre.lt_first_last.find(key);
@@ -1238,7 +1249,10 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     st.sparseEncaps = pre.sparse_encaps;
     st.sparseB = pre.sparseB != nullptr &&
                  [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
-    st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst;
+    // StC-first pays its StC levels on the input: a deeper input (a site the runtime routes dense although the plan
+    // priced it sparse) takes the shipped order instead, which lands where the sparse route would have.
+    const int inLimb = (int)ctxt.getLevel() - (ctxt.NoiseLevel == 2 ? cc.compositeDegree() : 0);
+    st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst && inLimb >= pre.stc_first_entry;
     st.stcFolded = pre.stc_first_mode == 2;
     const double k = pre.bootK > 0 ? pre.bootK : cc.GetBootK();
     st.constantEvalMult = preF * (1.0 / (k * cc.N)) * cc.getBtsPreScale();
@@ -1248,8 +1262,10 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     st.aksOn = st.exactConst && st.baked != 0 && pre.aks0 != nullptr;
     st.corFactor = (uint64_t)1 << std::llround(st.correction);
     // A real payload on the dense route enters as x + conj x = 2 Re x: one more bit of raise correction keeps the
-    // EvalMod input where it was, and corFactor (taken above) keeps the output at Re x.
-    st.real = cc.getBtsRealPayload() && cc.N / 2 == slots && !st.isLT && !st.sparseB && !st.stcFirst;
+    // EvalMod input where it was, and corFactor (taken above) keeps the output at Re x. In the StC-first order the
+    // input StC already put (Re x ; Im x) in the coefficients, so EvalMod's real chain alone returns Re x: no input
+    // conjugate, no correction, no StC variant.
+    st.real = cc.getBtsRealPayload() && cc.N / 2 == slots && !st.isLT && !st.sparseB;
     // EvalRound cancels against the raised copy's full integer part, the real route reduces half the coefficients:
     // they cannot share a bootstrap, and EvalRound wins (single-prime CtS needs it).
     if (st.real && [] { const char* e = std::getenv("FIDESLIB_EVALROUND"); return e && std::atoi(e) > 0; }()) {
@@ -1260,7 +1276,7 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
         }
         st.real = false;
     }
-    if (st.real) {
+    if (st.real && !st.stcFirst) {
         if (pre.stcRealA0.empty())
             throw std::runtime_error("real-payload bootstrap without its StC variant (FIDESLIB_BTS_REAL)");
         st.correction += 1;
@@ -1303,8 +1319,14 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st) {
     const double targetSF = cc.sfAtLimb(cc.L - (cc.rescaleTechnique == FLEXIBLEAUTOEXT) * d - d * pre.raise_drop);
     const int cf = (int)effCorrectionFactor(cc, slots);
     const double ratio = cc.sfAtLimb(entry) / nfIn;
-    const double factor = std::ldexp(1.0, -cf) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
-    const std::pair<int, long long> key{cf, std::llround(std::log2(nfIn) * 1e6)};
+    // The last stage is built at a reference correction factor and keyed by the input scale alone: a smaller CF is the
+    // exact integer 2^(cfStage - cf) put on the ciphertext first (level-free, before the raise), so one entry per input
+    // scale serves every site.
+    const int cfStage = std::max(cf, kStcFirstCfRef);
+    if (cfStage > cf)
+        multIntScalar(ctxt, uint64_t{1} << (cfStage - cf));
+    const double factor = std::ldexp(1.0, -cfStage) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
+    const std::pair<int, long long> key{cfStage, std::llround(std::log2(nfIn) * 1e6)};
     constexpr size_t kLastStageCache = 24;
     if (st.isLT) {
         auto it = pre.lt_first_last.find(key);
@@ -1349,7 +1371,7 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st) {
 void btsModRaise(Ciphertext& ctxt, BtsState& st) {
     CudaNvtxRange r(std::string{"bts::mod_raise"});
     ContextData& cc = ctxt.cc;
-    if (st.real) {  // an imaginary residue would leak into the real half's coefficients
+    if (st.real && !st.stcFirst) {  // an imaginary residue would leak into the real half's coefficients
         Ciphertext aux(ctxt.cc_);
         aux.conjugate(ctxt);
         ctxt.add(aux);
