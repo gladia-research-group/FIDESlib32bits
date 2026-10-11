@@ -2236,7 +2236,9 @@ template <typename T, typename ACC>
 __device__ __forceinline__ void dotProductLtBatchedPt3Body(void*** c0_out, void*** c1_out, void*** c0_in,
                                                            void*** c1_in, void*** pts, const int bStep,
                                                            const int gStep, const int n, const int idx,
-                                                           const int primeid, char* buffer) {
+                                                           const int primeid, char* buffer,
+                                                           const uint32_t ptMask = 0xFFFFFFFFu) {
+    const int pidx = ((ptMask >> 24) == 0x7Fu) ? (idx >> (ptMask & 0xFFu)) : (int)((uint32_t)idx & ptMask);
     const int in_stride = blockDim.x * blockDim.y * blockDim.z;
     const int block_id = (threadIdx.x + blockDim.x * threadIdx.y + blockDim.x * blockDim.y * threadIdx.z);
 
@@ -2264,7 +2266,7 @@ __device__ __forceinline__ void dotProductLtBatchedPt3Body(void*** c0_out, void*
 
                 ACC mult = 0;
                 if (pt_partition != nullptr) {
-                    mult = (ACC)in * (ACC)((T*)pt_partition[blockIdx.y])[idx];
+                    mult = (ACC)in * (ACC)((T*)pt_partition[blockIdx.y])[pidx];
                 }
                 if (i == 0)
                     acc_this_thread[j * in_stride] = mult;
@@ -2385,16 +2387,20 @@ __global__ void dotProductLtBatchedPt3___(void*** c0_out, void*** c1_out, void**
 
     if (ISU64(primeid))
         dotProductLtBatchedPt3Body<uint64_t, __uint128_t>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, n, idx,
-                                                          primeid, buffer);
+                                                          primeid, buffer, ptMask);
     else if (gStep == 2)
         dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 2>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
     else if (gStep == 4)
         dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 4>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
     else if (gStep == 1)
         dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 1>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
+    else if (gStep == 8)
+        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 8>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
+    else if (gStep == 16)
+        dotProductLtBatchedPt3BodyG<uint32_t, uint64_t, 16>(c0_out, c1_out, c0_in, c1_in, pts, bStep, n, idx, primeid, ptMask);
     else
         dotProductLtBatchedPt3Body<uint32_t, uint64_t>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, n, idx,
-                                                       primeid, buffer);
+                                                       primeid, buffer, ptMask);
 }
 
 __global__ void dotProductLtBatchedPt___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
