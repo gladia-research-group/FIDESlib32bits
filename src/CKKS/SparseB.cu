@@ -59,6 +59,9 @@ static std::vector<Plaintext>& ptsAt(Ciphertext& ctxt, std::vector<Plaintext>& t
         v.push_back(std::move(np));
     }
     cudaDeviceSynchronize();
+    if (const char* e = std::getenv("FIDESLIB_PT_SCRATCH"); !(e && e[0] == '0'))
+        for (auto& pt : v)
+            pt.c0.releaseAux();   // read-only from here on
     std::cerr << "[sparse_b] " << what << ": " << v.size() << " diagonals re-levelled to limb index " << lv << "\n";
     return cache.emplace(lv, std::move(v)).first->second;
 }

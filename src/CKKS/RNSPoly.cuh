@@ -30,6 +30,11 @@ class RNSPoly {
      *  per-poly back-pointer, `level`, is re-seated on both sides. */
     void swap(RNSPoly& other) noexcept;
 
+    /** Release the scratch (aux) buffers of every limb (Limb::releaseAux), ordered on each partition's stream: for a
+     *  polynomial that is only read from now on (a finished plaintext). */
+    void releaseAux();
+    bool auxReleased() const;
+
     void grow(int level, bool single_malloc = false, bool constant = false);
 
     void load(const std::vector<std::vector<uint64_t>>& data, const std::vector<uint64_t>& moduli);

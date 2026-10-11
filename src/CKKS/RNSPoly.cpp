@@ -1608,3 +1608,40 @@ RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool 
 }
 
 }  // namespace FIDESlib::CKKS
+namespace FIDESlib::CKKS {
+void RNSPoly::releaseAux() {
+    for (auto& part : GPU) {
+        cudaSetDevice(part.device);
+        cudaStreamSynchronize(part.s.ptr());
+        // the device pointer tables are authoritative: after a batched INTT/NTT pair a limb's data may sit in the
+        // buffer the Limb calls `aux` (the tables follow the swap, v.data does not). Make `v` the live buffer first,
+        // so the scratch freed is the other one.
+        auto fix_and_release = [&](std::vector<LimbImpl>& limbs, VectorGPU<void*>& table) {
+            const size_t n = limbs.size();
+            if (n == 0)
+                return;
+            std::vector<void*> live(n, nullptr);
+            if (table.data != nullptr && (size_t)table.size >= n)
+                cudaMemcpy(live.data(), table.data, n * sizeof(void*), cudaMemcpyDeviceToHost);
+            for (size_t i = 0; i < n; ++i)
+                std::visit(
+                    [&](auto& x) {
+                        if (live[i] != nullptr && live[i] == (void*)x.aux.data)
+                            std::swap(x.v.data, x.aux.data);
+                        x.releaseAux(part.s);
+                    },
+                    limbs[i]);
+        };
+        fix_and_release(part.limb, part.limbptr);
+        fix_and_release(part.SPECIALlimb, part.SPECIALlimbptr);
+    }
+}
+
+bool RNSPoly::auxReleased() const {
+    for (auto& part : GPU)
+        for (auto& l : part.limb)
+            if (std::visit([](auto& x) { return x.auxReleased; }, l))
+                return true;
+    return false;
+}
+}  // namespace FIDESlib::CKKS

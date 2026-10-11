@@ -34,6 +34,12 @@ class Limb {
    public:
     ~Limb() noexcept;
 
+    /** Free the NTT / in-place scratch buffer of a limb that is only read from now on (a finished plaintext), ordered
+     *  on `s`. A released limb must not be the target of an op that needs scratch (Plaintext's mutators check
+     *  RNSPoly::auxReleased and throw). */
+    void releaseAux(Stream& s);
+    bool auxReleased = false;
+
     Limb(Limb<T>&& l) noexcept;
 
     Limb(ContextData& context, const int id, Stream& stream, const int primeid = -1, bool constant = false);

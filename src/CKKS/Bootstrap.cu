@@ -412,6 +412,8 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
                     for (auto& pt : pre.LT.invA)
                         v.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
                     cudaDeviceSynchronize();
+                    for (auto& pt : v)
+                        pt.c0.releaseAux();   // read-only from here on
                     it = pre.lt_first_last.emplace(key, std::move(v)).first;
                 }
                 EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, it->second);
@@ -433,6 +435,9 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
                     std::vector<BootstrapPrecomputation::LTstep> v;
                     v.push_back(std::move(o));
                     cudaDeviceSynchronize();
+                    for (auto& stp : v)
+                        for (auto& pt : stp.A)
+                            pt.c0.releaseAux();   // read-only from here on
                     it = pre.stc_first_last.emplace(key, std::move(v)).first;
                 }
                 EvalLTStages(ctxt, it->second, "StC1-last-");

@@ -16,7 +16,14 @@ namespace FIDESlib::CKKS {
 
 template <typename T>
 Limb<T>::Limb(Limb<T>&& l) noexcept
-    : cc(l.cc), primeid(l.primeid), stream(l.stream), v(std::move(l.v)), aux(std::move(l.aux)), id(l.id), raw(l.raw) {}
+    : cc(l.cc), primeid(l.primeid), stream(l.stream), v(std::move(l.v)), aux(std::move(l.aux)), auxReleased(l.auxReleased),
+      id(l.id), raw(l.raw) {}
+
+template <typename T>
+void Limb<T>::releaseAux(Stream& s) {
+    if (!auxReleased && aux.release(s))
+        auxReleased = true;
+}
 
 template <typename T>
 Limb<T>::~Limb() noexcept {
