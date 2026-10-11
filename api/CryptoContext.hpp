@@ -296,6 +296,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void CopyCiphertextDevice(Ciphertext<DCRTPoly>& dst, const Ciphertext<DCRTPoly>& src);
 
 	Ciphertext<DCRTPoly> MakeGpuResultLike(const Ciphertext<DCRTPoly>& src);
+	Ciphertext<DCRTPoly> MakeGpuResultEmptyLike(const Ciphertext<DCRTPoly>& src);	// FIDESLIB_NOCLONE: level-matched, no limb copy
 	/// Always true: fresh GPU-op outputs carry a metadata-only CPU shadow
 	/// (CloneEmpty), never a deep copy. The FIDESLIB_LAZY_CPU_SHADOW env is no longer read.
 	static bool LazyCpuShadowEnabled();
@@ -389,6 +390,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// ---- Copy helpers ----
 
 	uint32_t CopyDeviceCiphertext(const CiphertextImpl<DCRTPoly>& ct);
+	uint32_t NewDeviceCiphertextLike(const CiphertextImpl<DCRTPoly>& ct);
 
 	// --- Map Handling ----
 

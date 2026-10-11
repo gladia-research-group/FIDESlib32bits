@@ -8,6 +8,10 @@
 #include "CryptoContext.hpp"
 
 namespace fideslib {
+// set by CryptoContextImpl::MakeGpuResultEmptyLike: the copy constructor allocates a level-matched EMPTY device
+// ciphertext (metadata only) instead of deep-copying the source's limbs (FIDESLIB_NOCLONE)
+extern thread_local bool g_no_device_copy;
+
 
 /// @brief Specialization of Ciphertext for the DCRTPoly representation.
 template <> class CiphertextImpl<DCRTPoly> {

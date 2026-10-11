@@ -66,6 +66,16 @@ template <> std::map<std::string, std::vector<lbcrypto::EvalKey<lbcrypto::DCRTPo
 template <>
 std::map<std::string, std::shared_ptr<std::map<usint, lbcrypto::EvalKey<lbcrypto::DCRTPoly>>>> lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::s_evalAutomorphismKeyMap;
 
+// FIDESLIB_NOCLONE=1: out-of-place wrappers whose result is fully overwritten (rotate, conjugate, the batch plaintext
+// products) get an empty level-matched result instead of a deep copy of the input; EvalAddMany drops its unused clone.
+static bool noClone() {
+	static const bool v = [] {
+		const char* e = std::getenv("FIDESLIB_NOCLONE");
+		return e && std::atoi(e) > 0;
+	}();
+	return v;
+}
+
 namespace fideslib {
 
 static std::vector<FIDESlib::PrimeRecord> p64{ { .p = 2305843009218281473 },
@@ -2457,9 +2467,11 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAddMany(const std::vector<
 		this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 	}
 
-	// Initialize result with the first ciphertext.
-	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ciphertexts[0]);
-	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+	// Initialize result with the first ciphertext (never read below: skipped under FIDESLIB_NOCLONE).
+	if (!noClone()) {
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ciphertexts[0]);
+		(void)result;
+	}
 
 	const size_t inSize = ciphertexts.size();
 	const size_t lim	= inSize * 2 - 2;
@@ -2803,7 +2815,7 @@ std::vector<Ciphertext<DCRTPoly>> CryptoContextImpl<DCRTPoly>::EvalMultPtBatch(c
 	pts_gpu.reserve(pts.size());
 
 	for (auto& pt : pts) {
-		Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
+		Ciphertext<DCRTPoly> result = noClone() ? this->MakeGpuResultEmptyLike(ct1) : this->MakeGpuResultLike(ct1);
 		results_gpu.push_back(
 			std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu)));
 		pts_gpu.push_back(std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(this->GetDevicePlaintext(pt->gpu)).get());
@@ -3037,6 +3049,19 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::MakeGpuResultLike(const Cipher
 	return std::make_shared<CiphertextImpl<DCRTPoly>>(*src, LazyCpuShadowEnabled());
 }
 
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::MakeGpuResultEmptyLike(const Ciphertext<DCRTPoly>& src) {
+	g_no_device_copy = true;
+	Ciphertext<DCRTPoly> r;
+	try {
+		r = std::make_shared<CiphertextImpl<DCRTPoly>>(*src, LazyCpuShadowEnabled());
+	} catch (...) {
+		g_no_device_copy = false;
+		throw;
+	}
+	g_no_device_copy = false;
+	return r;
+}
+
 void CryptoContextImpl<DCRTPoly>::CopyCiphertextDevice(Ciphertext<DCRTPoly>& dst,
 													   const Ciphertext<DCRTPoly>& src) {
 	if (this->devices.empty()) {
@@ -3167,6 +3192,13 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalRotate(const Ciphertext<DC
 	// GPU path.
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
 
+	if (noClone()) {
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ciphertext);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto src_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu));
+		res_gpu->rotateFrom(*src_gpu, index);
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ciphertext);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	res_gpu->rotate(index);
@@ -3200,7 +3232,7 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalConjugate(const Ciphertext
 
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
 
-	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ciphertext);
+	Ciphertext<DCRTPoly> result = noClone() ? this->MakeGpuResultEmptyLike(ciphertext) : this->MakeGpuResultLike(ciphertext);
 	auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto src_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu));
 	res_gpu->conjugate(*src_gpu);
@@ -3651,6 +3683,21 @@ void CryptoContextImpl<DCRTPoly>::SpecialConvolutionTransformInPlace(Ciphertext<
 }
 
 // ---- Copy helpers ----
+
+uint32_t CryptoContextImpl<DCRTPoly>::NewDeviceCiphertextLike(const CiphertextImpl<DCRTPoly>& ct) {
+	if (!ct.loaded) {
+		OPENFHE_THROW("Ciphertext not loaded to any device");
+	}
+	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	auto ct_gpu		  = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct.gpu));
+	auto new_ct		  = std::make_shared<FIDESlib::CKKS::Ciphertext>(context_gpu);
+	new_ct->c0.dropToLevel(ct_gpu->c0.getLevel());
+	new_ct->c1.dropToLevel(ct_gpu->c1.getLevel());
+	new_ct->c0.grow(ct_gpu->c0.getLevel());
+	new_ct->c1.grow(ct_gpu->c1.getLevel());
+	new_ct->copyMetadata(*ct_gpu);
+	return this->RegisterDeviceCiphertext(std::move(new_ct));
+}
 
 uint32_t CryptoContextImpl<DCRTPoly>::CopyDeviceCiphertext(const CiphertextImpl<DCRTPoly>& ct) {
 	if (!ct.loaded) {
