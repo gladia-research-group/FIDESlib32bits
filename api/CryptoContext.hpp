@@ -282,6 +282,13 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// one pinned staging copy, one upload, widened on the device.
 	Ciphertext<DCRTPoly> EvalMultPtSumEncodeRaw(const std::vector<Ciphertext<DCRTPoly>>& cts, const void* rows,
 	                                            int dtype, size_t width);
+	// The same from plaintext COEFFICIENT rows: rows[r * rowStride + k] (float32, k < N) is plaintext r's polynomial
+	// coefficient divided by the scaling factor of the ciphertexts' level, so the device encode is a rounding and an
+	// NTT. `rows` must be device-accessible (device memory or pinned host memory). Same result metadata as above.
+	Ciphertext<DCRTPoly> EvalMultCoeffRowsSum(const std::vector<Ciphertext<DCRTPoly>>& cts, const float* rows,
+	                                          size_t rowStride);
+	// Coefficients clamped by EvalMultCoeffRowsSum since the start (nonzero: a row exceeded the int64 range).
+	unsigned long long CoeffRowsOverflows() const;
 	Ciphertext<DCRTPoly> EvalMult(const Ciphertext<DCRTPoly>& ct1, double scalar);
 	Ciphertext<DCRTPoly> EvalMult(double scalar, const Ciphertext<DCRTPoly>& ct1);
 	void EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Plaintext& pt);
