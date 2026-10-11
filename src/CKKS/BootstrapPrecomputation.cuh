@@ -140,6 +140,7 @@ class BootstrapPrecomputation {
         int n = 0, r = 0, s = 0, bStep = 0, gStep = 0;
         std::vector<Plaintext> P, Q;  // BSGS pre-rotated diagonals, top level, Q limbs only
         std::map<int, std::vector<Plaintext>> P_at, Q_at;
+        std::vector<RawPlainText> P_host, Q_host;  // P, Q parked on the host once re-levelled (SparseB.cu ptsAt)
         double bootK = 24.0;
         // FIDESLIB_BTS_SHIFT: the CtS diagonals carry 2^-t in value AND in their scale bookkeeping (as the shipped stage 0),
         // undoing the 2^t the exact post-raise scaling puts on both of the ciphertext's

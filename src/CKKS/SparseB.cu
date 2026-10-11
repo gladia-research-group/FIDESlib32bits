@@ -39,17 +39,22 @@ const std::vector<double>& FIDESlib::CKKS::sparseBChebyshevK24() {
 }
 
 // The diagonals at the ciphertext's level, lifted to Q+P for the hoisted dot (built once per level).
-static std::vector<Plaintext>& ptsAt(Ciphertext& ctxt, std::vector<Plaintext>& top,
+static std::vector<Plaintext>& ptsAt(Ciphertext& ctxt, std::vector<Plaintext>& top, std::vector<RawPlainText>& host,
                                      std::map<int, std::vector<Plaintext>>& cache, const char* what, double nf = 1.0) {
     ContextData& cc = ctxt.cc;
     const int lv = ctxt.getLevel();
     auto it = cache.find(lv);
     if (it != cache.end())
         return it->second;
+    // the top-level diagonals live on the host once a re-levelled copy exists: reload them for a new level
+    std::vector<Plaintext> reloaded;
+    for (auto& raw : host)
+        reloaded.emplace_back(ctxt.cc_, raw);
+    std::vector<Plaintext>& src = top.empty() ? reloaded : top;
     const int d = cc.compositeDegree();
     std::vector<Plaintext> v;
-    v.reserve(top.size());
-    for (auto& pt : top) {
+    v.reserve(src.size());
+    for (auto& pt : src) {
         if ((pt.c0.getLevel() - lv) % d != 0)
             throw std::runtime_error(std::string("[sparse_b] ") + what + ": cannot re-level from limb index " +
                                      std::to_string(pt.c0.getLevel()) + " to " + std::to_string(lv));
@@ -62,6 +67,23 @@ static std::vector<Plaintext>& ptsAt(Ciphertext& ctxt, std::vector<Plaintext>& t
     if (const char* e = std::getenv("FIDESLIB_PT_SCRATCH"); !(e && e[0] == '0'))
         for (auto& pt : v)
             pt.c0.releaseAux();   // read-only from here on
+    // only the re-levelled copies are read from here on: park the originals on the host
+    if (!top.empty()) {
+        for (auto& pt : top) {   // not pt.store(): pt.cc_ may refer to LoadContext's (gone) local context
+            RawPlainText raw;
+            raw.numRes = pt.c0.getLevel() + 1;
+            pt.c0.store(raw.sub_0);
+            raw.N = cc.N;
+            raw.Noise = pt.NoiseFactor;
+            raw.NoiseLevel = pt.NoiseLevel;
+            raw.slots = pt.slots;
+            raw.moduli.resize(raw.numRes);
+            for (int i = 0; i < raw.numRes; ++i)
+                raw.moduli[i] = cc.prime.at(i).p;
+            host.push_back(std::move(raw));
+        }
+        std::vector<Plaintext>().swap(top);
+    }
     std::cerr << "[sparse_b] " << what << ": " << v.size() << " diagonals re-levelled to limb index " << lv << "\n";
     return cache.emplace(lv, std::move(v)).first->second;
 }
@@ -80,7 +102,7 @@ void FIDESlib::CKKS::SparseBCoeffsToSlots(Ciphertext& ctxt, int slots, Bootstrap
     if (ctxt.NoiseLevel == 2)
         ctxt.rescale();
     ctxt.slots = cc.N / 2;  // full-ring layout: the partial-sum blocks are not 2*slots-periodic
-    bsgs(ctxt, ptsAt(ctxt, sb.P, sb.P_at, "CtS", sb.ctsNF), sb.s, sb.bStep);
+    bsgs(ctxt, ptsAt(ctxt, sb.P, sb.P_host, sb.P_at, "CtS", sb.ctsNF), sb.s, sb.bStep);
     Accumulate(ctxt, pre.accumulate_bStep, sb.s, sb.r / 4);  // sum_{t < r/4} rot(t s)
     Ciphertext aux(ctxt.cc_);
     aux.conjugate(ctxt);
@@ -94,7 +116,7 @@ void FIDESlib::CKKS::SparseBSlotsToCoeffs(Ciphertext& ctxt, int slots, Bootstrap
     if (ctxt.NoiseLevel == 2)
         ctxt.rescale();
     ctxt.slots = cc.N / 2;
-    bsgs(ctxt, ptsAt(ctxt, sb.Q, sb.Q_at, "StC"), sb.s, sb.bStep);
+    bsgs(ctxt, ptsAt(ctxt, sb.Q, sb.Q_host, sb.Q_at, "StC"), sb.s, sb.bStep);
     Accumulate(ctxt, pre.accumulate_bStep, sb.n, sb.r / 2);  // sum_{t < r/2} rot(t n); leaves ctxt.slots = n
     ctxt.slots = cc.N / 2;
     Ciphertext aux(ctxt.cc_);
