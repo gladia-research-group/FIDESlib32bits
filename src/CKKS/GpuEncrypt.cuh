@@ -1,5 +1,5 @@
 //
-// FIDESLIB_GPU_ENCRYPT=1 (default off): public-key encryption on the device. The same algorithm and distributions
+// FIDESLIB_GPU_ENCRYPT (default 1; 0 restores the host encryption): public-key encryption on the device. The same algorithm and distributions
 // as OpenFHE's EncryptZeroCore (public-key form): v uniform ternary, e0/e1 discrete Gaussian of the context's
 // sigma, (pk0 v + e0, pk1 v + e1), the plaintext then added to c0. The randomness is a ChaCha12 stream
 // (KskSeedExpand.cuh's block function, its own domain word) under a per-context key from the OS entropy pool and
@@ -14,7 +14,7 @@ namespace FIDESlib::CKKS {
 
 class Ciphertext;
 
-/** FIDESLIB_GPU_ENCRYPT (default 0), settable at run time for the gate. */
+/** FIDESLIB_GPU_ENCRYPT (default 1), settable at run time for the gate. */
 bool gpuEncryptOn();
 void setGpuEncrypt(int on);
 
