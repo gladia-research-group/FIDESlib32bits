@@ -1,4 +1,5 @@
 // SPRU bootstrapping for one complex slot (see Spru.cuh).
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -116,6 +117,10 @@ __global__ void spruScatter_(const double2* Y, int N, double scale, void** limbs
 }  // namespace
 
 static thread_local bool g_spruTimed = true;
+// No cudaDeviceSynchronize fences around the device-encode path: the extraction / scatter kernels run on the legacy
+// default stream and every FIDESlib compute stream is blocking, so the legacy-stream ordering already serialises them
+// against the INTT / grow / NTT work around them. FIDESLIB_SPRU_NOSYNC=0 restores the three per-call fences.
+static const bool g_spruSync = [] { const char* e = std::getenv("FIDESLIB_SPRU_NOSYNC"); return e && std::atoi(e) == 0; }();
 static double ms_since(std::chrono::steady_clock::time_point& t0) {
     if (!g_spruTimed) return 0.0;
     cudaDeviceSynchronize();
@@ -226,7 +231,7 @@ void spruBootstrap(Ciphertext& ct, SpruKey& K, uint32_t correction, lbcrypto::Cr
         // ct is overwritten by the result at the end: transform it in place (no copy)
         ct.c0.INTT(C.batch, true);
         ct.c1.INTT(C.batch, true);
-        cudaDeviceSynchronize();
+        if (g_spruSync) cudaDeviceSynchronize();
         const uint32_t p0 = (uint32_t)C.prime[0].p, p1 = (uint32_t)C.prime[1].p;
         const uint32_t inv = [&] {
             unsigned __int128 a = p0 % p1, res = 1, e = p1 - 2;
@@ -258,11 +263,11 @@ void spruBootstrap(Ciphertext& ct, SpruKey& K, uint32_t correction, lbcrypto::Cr
             Ept.emplace_back(cc_);
             Ept.back().c0.grow(topL);
         }
-        cudaDeviceSynchronize();  // the limb buffers are written on the default stream below
+        if (g_spruSync) cudaDeviceSynchronize();  // the limb buffers are written on the default stream below
         for (int u = 0; u < 2 * n; ++u)
             spruScatter_<<<(N + 255) / 256, 256>>>(in + (size_t)u * N, N, targetSFv, Ept[u].c0.GPU.at(0).limbptr.data,
                                                    K.primes, topL + 1);
-        cudaDeviceSynchronize();
+        if (g_spruSync) cudaDeviceSynchronize();
         for (auto& pt : Ept) {
             pt.c0.NTT(C.batch, false);
             pt.NoiseFactor = targetSFv;
