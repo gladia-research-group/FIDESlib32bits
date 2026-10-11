@@ -13,6 +13,7 @@
 
 #include "CKKS/Context.cuh"
 #include "CKKS/Conv.cuh"
+#include "CKKS/ModUpConv2.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
 #include "CKKS/LimbPartition.cuh"
 #include "CKKS/Discard.cuh"
@@ -1224,7 +1225,10 @@ void LimbPartition::modup(LimbPartition& aux_partition) {
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (size /*DECOMPlimb[d].size()*/) * blockSize.x;
-            DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s_d.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(DECOMPlimbptr[d].data, *level + 1, DIGITlimbptr[d].data, digitid[d], getGlobals(), cc.precom.constants[id], size, s_d.ptr());
+            else
+                DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s_d.ptr()>>>(
                 DECOMPlimbptr[d].data, *level + 1, DIGITlimbptr[d].data, digitid[d], getGlobals());
         }
         if constexpr (PRINT) {
@@ -1949,7 +1953,10 @@ void LimbPartition::multModupDotKSK(LimbPartition& c1, const LimbPartition& c1ti
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (DECOMPlimb[d].size()) * blockSize.x;
-            DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(DECOMPlimbptr[d].data, level_plus_1, DIGITlimbptr[d].data, digitid[d], getGlobals(), cc.precom.constants[id], (int)DECOMPlimb[d].size(), s.ptr());
+            else
+                DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
                 DECOMPlimbptr[d].data, level_plus_1, DIGITlimbptr[d].data, digitid[d], getGlobals());
         }
 
@@ -2143,7 +2150,10 @@ void LimbPartition::rotateModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (DECOMPlimb[d].size()) * blockSize.x;
-            DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(DECOMPlimbptr[d].data, level_plus_1, DIGITlimbptr[d].data, digitid[d], getGlobals(), cc.precom.constants[id], (int)DECOMPlimb[d].size(), s.ptr());
+            else
+                DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
                 DECOMPlimbptr[d].data, level_plus_1, DIGITlimbptr[d].data, digitid[d], getGlobals());
         }
 
@@ -2325,7 +2335,10 @@ void LimbPartition::squareModupDotKSK(LimbPartition& c1, LimbPartition& c0, cons
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (DECOMPlimb[d].size()) * blockSize.x;
-            DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(DECOMPlimbptr[d].data, level_plus_1, DIGITlimbptr[d].data, digitid[d], getGlobals(), cc.precom.constants[id], (int)DECOMPlimb[d].size(), s.ptr());
+            else
+                DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
                 DECOMPlimbptr[d].data, level_plus_1, DIGITlimbptr[d].data, digitid[d], getGlobals());
         }
 
@@ -2667,7 +2680,10 @@ void LimbPartition::modupInto(LimbPartition& partition, LimbPartition& aux_parti
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (size /*DECOMPlimb[d].size()*/) * blockSize.x;
-            DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(partition.DECOMPlimbptr[d].data, *level + 1, partition.DIGITlimbptr[d].data, digitid[d], getGlobals(), cc.precom.constants[id], size, s.ptr());
+            else
+                DecompAndModUpConv<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
                 partition.DECOMPlimbptr[d].data, *level + 1, partition.DIGITlimbptr[d].data, digitid[d], getGlobals());
         }
 

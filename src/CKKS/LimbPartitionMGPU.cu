@@ -9,6 +9,7 @@
 #include <string>
 #include "CKKS/Context.cuh"
 #include "CKKS/Conv.cuh"
+#include "CKKS/ModUpConv2.cuh"
 #include "CKKS/ElemenwiseBatchKernels.cuh"
 #include "CKKS/LimbPartition.cuh"
 #include "CKKS/Discard.cuh"
@@ -1284,7 +1285,10 @@ void LimbPartition::modup_ksk_moddown_mgpu(
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (size /*DECOMPlimb[d].size()*/) * blockSize.x;
 
-            DecompAndModUpConv<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream1.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(DECOMPlimbptr[d_].data, *level + 1, DIGITlimbptr[d_].data, digitid[d_], getGlobals(), cc.precom.constants[id], size, stream1.ptr());
+            else
+                DecompAndModUpConv<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream1.ptr()>>>(
                 DECOMPlimbptr[d_].data, *level + 1, DIGITlimbptr[d_].data, digitid[d_], getGlobals());
 
             cc.digitStream2.at(d_).at(id).wait(stream1); /** Get dependency for limb NTTs later */
@@ -2450,7 +2454,10 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (size /*DECOMPlimb[d].size()*/) * blockSize.x;
-            DecompAndModUpConv<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream1.ptr()>>>(
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2(DECOMPlimbptr[d_].data, *level + 1, DIGITlimbptr[d_].data, digitid[d_], getGlobals(), cc.precom.constants[id], size, stream1.ptr());
+            else
+                DecompAndModUpConv<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream1.ptr()>>>(
                 DECOMPlimbptr[d_].data, *level + 1, DIGITlimbptr[d_].data, digitid[d_], getGlobals());
             cc.digitStream2.at(d_).at(id).wait(stream1); /** Get dependency for limb NTTs later */
             if constexpr (PRINT)
@@ -2534,7 +2541,10 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             dim3 blockSize{64, 2};
             dim3 gridSize{(uint32_t)cc.N / blockSize.x, (uint32_t)ndig};
             const int shared_bytes = sizeof(uint64_t) * max_size * blockSize.x;
-            DecompAndModUpConvMulti<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(d_a, limbs_total, d_b,
+            if (modUpConv2On() && cc.precom.constants[id].type == 0)
+                launchModUpConv2Multi(d_a, limbs_total, d_b, d_d, h_d.data(), ndig, getGlobals(), cc.precom.constants[id], max_size, s.ptr());
+            else
+                DecompAndModUpConvMulti<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(d_a, limbs_total, d_b,
                                                                                                d_d, getGlobals());
         }
         {
