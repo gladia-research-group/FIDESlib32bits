@@ -112,9 +112,9 @@ bool compactPlaintext(Plaintext& pt, uint32_t mask) {
     return true;
 }
 
-Plaintext expandCompact(const Plaintext& src) {
+Plaintext expandCompact(Context& cc, const Plaintext& src) {
     Plaintext& pt = const_cast<Plaintext&>(src);  // read-only use of its limbs and streams
-    Plaintext np(pt.cc_);
+    Plaintext np(cc);
     np.c0.grow(pt.c0.getLevel());
     if (pt.c0.isModUp()) {
         np.c0.generateSpecialLimbs(false, false);

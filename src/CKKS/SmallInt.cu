@@ -372,7 +372,7 @@ void smallIntDivideFromTo(ContextData& cc, const RNSPoly& src, RNSPoly& dst, int
 
 Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor) {
     if (pt.compactMask != 0xFFFFFFFFu) {
-        Plaintext full = expandCompact(pt);
+        Plaintext full = expandCompact(cc_, pt);
         return relevelPlaintext(cc_, cc, full, shift, factor);
     }
     const int d = cc.compositeDegree();
@@ -392,7 +392,7 @@ Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, i
 
 Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt, int newL, double newNF) {
     if (pt.compactMask != 0xFFFFFFFFu) {
-        Plaintext full = expandCompact(pt);
+        Plaintext full = expandCompact(cc_, pt);
         return relevelPlaintextNF(cc_, cc, full, newL, newNF);
     }
     if (newL > cc.L)

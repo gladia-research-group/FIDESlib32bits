@@ -28,8 +28,9 @@ inline uint32_t ptCompactFullMask(uint32_t enc) {
 /// pt.compactMask holds the encoding the LT dot reads with.
 bool compactPlaintext(Plaintext& pt, uint32_t mask);
 
-/// A full-storage copy of a compact plaintext (its own limbs, scratch included); `pt` itself when it is full.
-Plaintext expandCompact(const Plaintext& pt);
+/// A full-storage copy of a compact plaintext (its own limbs, scratch included), in context `cc` (not pt.cc_: a
+/// table built at LoadContext refers to a context object that no longer exists).
+Plaintext expandCompact(Context& cc, const Plaintext& pt);
 
 /// Compact every masked CtS / StC stage of `pre` (and its raise variants). A stage is compacted only when every one of
 /// its plaintexts verifies; its ptMask then becomes the compact encoding. Returns (plaintexts compacted, bytes freed).
