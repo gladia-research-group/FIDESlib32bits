@@ -87,8 +87,11 @@ inline void breakpoint() {}
         }                                                                                    \
     } while (0)
 
+bool errcheckOn();     // FIDESLIB_ERRCHECK=1: the per-launch cudaGetLastError polls (off by default: ~1.8M calls/token)
+bool ompRegionsOn();   // FIDESLIB_OMP_REGIONS=1: single-GPU `omp parallel` regions (off by default: they run inline)
 #define CudaCheckErrorModNoSync                                                                                   \
     do {                                                                                                          \
+        if (!FIDESlib::errcheckOn()) break;                                                                       \
         /*cudaDeviceSynchronize();*/                                                                              \
         cudaError_t e = cudaGetLastError();                                                                       \
         if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled && e != cudaErrorGraphExecUpdateFailure \

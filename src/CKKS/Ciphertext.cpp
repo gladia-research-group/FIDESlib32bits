@@ -1226,13 +1226,13 @@ void Ciphertext::conjugate(const Ciphertext& c) {
 */
 		/*
 		RNSPoly& aux = MGPUkeySwitchCore(in, cc.GetRotationKey(index, c.keyID, slots), true);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
 		for (int i = 0; i < (int)cc.GPUid.size(); ++i) {
 			assert(omp_get_num_threads() == (int)cc.GPUid.size());
 			c1.GPU.at(i).automorph(index, 1, &in.GPU.at(i), c1.isModUp());
 		}
 		c0.add(aux);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
 		for (int i = 0; i < (int)cc.GPUid.size(); ++i) {
 			assert(omp_get_num_threads() == (int)cc.GPUid.size());
 			c0.GPU.at(i).automorph(index, 1, nullptr, c0.isModUp());
