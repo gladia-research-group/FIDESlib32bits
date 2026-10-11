@@ -1608,6 +1608,66 @@ bool Ciphertext::multPtInto(const Ciphertext& c, const Plaintext& pt) {
 	return true;
 }
 
+bool Ciphertext::subInto(const Ciphertext& a, const Ciphertext& b) {
+	if (this == &a || this == &b || a.keyID != b.keyID || a.getLevel() != b.getLevel() || a.NoiseLevel != b.NoiseLevel ||
+	    a.c0.isModUp() || a.c1.isModUp() || b.c0.isModUp() || b.c1.isModUp() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::ADD]++;
+	c0.dropToLevel(a.getLevel());
+	c1.dropToLevel(a.getLevel());
+	c0.grow(a.getLevel());
+	c1.grow(a.getLevel());
+	c0.subFrom(a.c0, b.c0);
+	c1.subFrom(a.c1, b.c1);
+	this->copyMetadata(a);
+	this->addMetadata(*this, b);
+	return true;
+}
+
+bool Ciphertext::multScalarInto(const Ciphertext& c, double scalar) {
+	if (this == &c || c.NoiseLevel != 1 || c.c0.isModUp() || c.c1.isModUp() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULTSCALAR]++;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	auto elem = cc.ElemForEvalMult(c.c0.getLevel(), scalar);
+	c0.multScalarFrom(c.c0, elem);
+	c1.multScalarFrom(c.c1, elem);
+	this->copyMetadata(c);
+	NoiseLevel += 1;
+	NoiseFactor *= cc.sfAtLimb(c0.getLevel());
+	return true;
+}
+
+bool Ciphertext::addScalarInto(const Ciphertext& c, double scalar) {
+	if (this == &c || scalar == 0.0 || c.c0.isModUp() || c.c1.isModUp() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::ADDSCALAR]++;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	auto elem = cc.ElemForEvalAddOrSub(c.c0.getLevel(), std::abs(scalar), c.NoiseLevel);
+	if (scalar < 0.0)
+		for (auto i = 0u; i < elem.size(); ++i)
+			elem[i] = cc.prime[i].p - elem[i];
+	c0.addScalarFrom(c.c0, elem);
+	c1.copy(c.c1);
+	this->copyMetadata(c);
+	return true;
+}
+
 void Ciphertext::mult(const Ciphertext& b, const Ciphertext& c, bool rescale) {
 	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	// Lever E1: out-of-place relinearised product, no copy of an operand into *this first.

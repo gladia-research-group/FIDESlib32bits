@@ -432,6 +432,11 @@ class Ciphertext {
     bool multInto(const Ciphertext& b, const Ciphertext& c);
     bool addInto(const Ciphertext& a, const Ciphertext& b);
     bool multPtInto(const Ciphertext& c, const Plaintext& pt);
+    /// FIDESLIB_NOCLONE=3: this <- a - b, c * scalar, c + scalar, written once from the sources under the same
+    /// conditions (no level / scale adjustment needed; products from noise level 1); false = nothing written.
+    bool subInto(const Ciphertext& a, const Ciphertext& b);
+    bool multScalarInto(const Ciphertext& c, double scalar);
+    bool addScalarInto(const Ciphertext& c, double scalar);
 
     /**
      * @brief Computes the complex conjugate of ciphertext `c` and stores it in *this*.

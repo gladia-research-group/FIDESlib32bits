@@ -52,6 +52,11 @@ class RNSPoly {
     void add(const RNSPoly& a, const RNSPoly& b);
 
     void sub(const RNSPoly& p);
+    /// FIDESLIB_NOCLONE=3 write-once ops (NoClone3.cu), over this poly's current limbs: this <- a - b,
+    /// src * elem, src + elem (elem: one scalar per prime, as multScalar / addScalar take).
+    void subFrom(const RNSPoly& a, const RNSPoly& b);
+    void multScalarFrom(const RNSPoly& src, const std::vector<uint64_t>& elem);
+    void addScalarFrom(const RNSPoly& src, const std::vector<uint64_t>& elem);
 
     void multPt(const RNSPoly& p, bool rescale);
 
