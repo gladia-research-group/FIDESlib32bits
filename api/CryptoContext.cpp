@@ -2190,6 +2190,19 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Encrypt(const PrivateKey<DCRTP
 	return Encrypt(pt, sk);
 }
 
+// FIDESLIB_FAST_DECRYPT=1: the host container a device ciphertext is decrypted in is built empty instead of by a
+// dummy secret-key encryption (~16 ms at 4 towers); the decrypted values are identical.
+static std::atomic<int> g_fast_decrypt{ [] {
+	const char* e = std::getenv("FIDESLIB_FAST_DECRYPT");
+	return e ? std::atoi(e) : 0;
+}() };
+static bool fast_decrypt_on() {
+	return g_fast_decrypt.load(std::memory_order_relaxed) > 0;
+}
+void SetFastDecrypt(int on) {
+	g_fast_decrypt.store(on, std::memory_order_relaxed);
+}
+
 DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, const PrivateKey<DCRTPoly>& sk, Plaintext* pt) {
 
 	if (pt == nullptr) {
@@ -2198,12 +2211,22 @@ DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, con
 
 	auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 	auto& ct_cpu  = std::any_cast<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ct->cpu);
+	static const bool ddbg = std::getenv("FIDESLIB_DECRYPT_DEBUG") != nullptr;
+	auto dt0			   = std::chrono::steady_clock::now();
+	auto dlap			   = [&](const char* what) {
+		  if (!ddbg)
+			  return;
+		  auto t1 = std::chrono::steady_clock::now();
+		  std::fprintf(stderr, "[decdbg]   %s %.3f ms\n", what, std::chrono::duration<double, std::milli>(t1 - dt0).count());
+		  dt0 = t1;
+	};
 
 	// Copy ciphertext to CPU if needed.
 	if (ct->loaded) {
 		auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
 		FIDESlib::CKKS::RawCipherText raw_ct;
 		ct_gpu->store(raw_ct);
+		dlap("store");
 
 		// Check if CPU ciphertext has enough levels to hold GPU ciphertext.
 		// A metadata-only shadow (FIDESLIB_LAZY_CPU_SHADOW) reports 0 and takes the
@@ -2215,22 +2238,44 @@ DecryptResult CryptoContextImpl<DCRTPoly>::Decrypt(Ciphertext<DCRTPoly>& ct, con
 								: ct_cpu->GetElements()[0].GetAllElements().size();
 		size_t gpu_levels = raw_ct.numRes;
 
-		if (cpu_levels < gpu_levels) {
+		if (cpu_levels < gpu_levels && fast_decrypt_on()) {
+			// An empty container over the ciphertext's towers: the import below writes every value and every
+			// field the decrypt reads (level, scale, degree, key tag, slots).
+			auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
+			const auto& full = context->GetCryptoParameters()->GetElementParams();
+			auto p			 = std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::DCRTPoly::Integer>>(*full);
+			while (p->GetParams().size() > gpu_levels)
+				p->PopLastParam();
+			auto c = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(context, skImpl->GetKeyTag(),
+																					lbcrypto::CKKS_PACKED_ENCODING);
+			c->SetElements({ lbcrypto::DCRTPoly(p, Format::EVALUATION, true),
+							 lbcrypto::DCRTPoly(p, Format::EVALUATION, true) });
+			c->SetLevel(full->GetParams().size() - gpu_levels);
+			c->SetNoiseScaleDeg(1);
+			ct_cpu = std::move(c);
+			dlap("container");
+		} else if (cpu_levels < gpu_levels) {
 			// Create a fresh ciphertext at the top level with enough space
 			std::vector<double> dummy(1, 0.0);
 			// OpenFHE's encode `level` param counts primes dropped (composite-safe): cc.L - limb.
 			auto pt_dummy = context->MakeCKKSPackedPlaintext(dummy, 1, ct_gpu->cc.L - ct_gpu->getLevel());
 			auto& skImpl  = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
 			ct_cpu		  = context->Encrypt(skImpl, pt_dummy);
+			dlap("dummy encrypt");
 		}
 
 		// Overwrite cpu ct with the data from GPU.
 		FIDESlib::CKKS::GetOpenFHECipherText(ct_cpu, raw_ct);
+		dlap("import");
 	}
 
 	auto& skImpl = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(sk->pimpl);
 	lbcrypto::Plaintext ptImpl;
 	auto res = context->Decrypt(skImpl, ct_cpu, &ptImpl);
+	if (ddbg)
+		std::fprintf(stderr, "[decdbg] towers %zu nsd %zu\n", ct_cpu->GetElements()[0].GetNumOfElements(),
+					 (size_t)ct_cpu->GetNoiseScaleDeg());
+	dlap("openfhe decrypt+decode");
 
 	if (pt->get() != nullptr) {
 
