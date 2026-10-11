@@ -342,6 +342,19 @@ void FIDESlib::CKKS::multIntScalar(Ciphertext& ctxt, uint64_t op) {
 	ctxt.c1.multScalar(op_);
 }
 
+// FIDESLIB_LAZY_PS=1 (lazy-BSGS Paterson-Stockmeyer, Lee et al. EUROCRYPT 2022): the top-level product cu*qu and the
+// last product of T_{k(2^m-1)} only feed the final sum, so both are accumulated as tensors and relinearized ONCE (one
+// key switch less per series). Taken only when both products land at the seed's level and scale; otherwise eager.
+struct LazyTop {
+	Ciphertext* cu = nullptr;  // (T2[m-1] + cu), the left factor
+	Ciphertext* qu = nullptr;
+	Ciphertext* su = nullptr;
+};
+static bool lazyPsOn() {
+	static const bool v = [] { const char* e = std::getenv("FIDESLIB_LAZY_PS"); return e && std::atoi(e) > 0; }();
+	return v;
+}
+
 void innerEvalChebyshevPS(const Ciphertext& ctxt,
   Ciphertext& out,
   const std::vector<double>& coefficients,
@@ -350,7 +363,8 @@ void innerEvalChebyshevPS(const Ciphertext& ctxt,
   const std::vector<Ciphertext*>& T,
   const std::vector<Ciphertext*>& T2,
   int level_offset = 0,
-  int max_m		   = 1000) {
+  int max_m		   = 1000,
+  LazyTop* lazy	   = nullptr) {
 	FIDESlib::CudaNvtxRange r(std::string{ sc::current().function_name() });
 	/*
 Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DCRTPoly> x,
@@ -577,6 +591,13 @@ Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DC
 		}
 		if (cc.rescaleTechnique == FIXEDMANUAL && out.NoiseLevel == 2)
 			cu.rescale();
+		if (lazy && level_offset == 0 && m == (uint32_t)max_m && &cu == &out) {
+			// hand the factors back: the caller sums cu*qu with T_{k(2^m-1)}'s last product under one key switch
+			lazy->qu = new Ciphertext(std::move(qu));
+			lazy->su = new Ciphertext(std::move(su));
+			lazy->cu = &cu;
+			return;
+		}
 		cu.mult(qu, false);
 		cu.add(su); // cu aliases out
 	}
@@ -862,8 +883,11 @@ const std::vector<double>& coefficients, double a, double b) const {
 		// }
 	}
 
+	const bool lazy = lazyPsOn() && m >= 2;
 	for (uint32_t i = 1; i < m; i++) {
 		// compute T_{k(2*m - 1)} = 2*T_{k(2^{m-1}-1)}(y)*T_{k*2^{m-1}}(y) - T_k(y)
+		if (lazy && i == m - 1)
+			break;   // its last product joins the final sum (FIDESLIB_LAZY_PS)
 		T2km1.mult(*T2[i], fusedRescaleFlag() != 0);
 		T2km1.add(T2km1);
 		// T2km1.rescale();
@@ -901,13 +925,52 @@ const std::vector<double>& coefficients, double a, double b) const {
 	//  cc->LevelReduceInPlace(T2.front(), nullptr);
 	*/
 
-	if constexpr (true) {
-		Ciphertext out(cc_);
+	if (lazy) {
+		LazyTop lz;
+		innerEvalChebyshevPS(ctxt, ctxt, f2, k, m, T, T2, 0, m, &lz);
+		std::unique_ptr<Ciphertext> quP(lz.qu), suP(lz.su);
+		bool done = false;
+		if (lz.cu == &ctxt && quP && suP) {
+			// -2 X exactly (modular subtractions only), X = T_{k(2^{m-1}-1)}
+			Ciphertext negX2(cc_);
+			negX2.copy(T2km1);
+			negX2.sub(T2km1);
+			negX2.sub(T2km1);
+			negX2.sub(T2km1);
+			Ciphertext acc(cc_);
+			acc.copy(*suP);   // seed: su sits at the products' level and scale
+			if (acc.multAccumulateChecked({&ctxt, &negX2}, {quP.get(), T2[m - 1]})) {
+				// + T_k (the "- T_k" of T_{k(2^m-1)}, subtracted): same alignment as the eager path
+				T2[0]->adjustForAddOrSub(acc);
+				if (T2[0]->NoiseLevel == 1 && acc.NoiseLevel == 2)
+					acc.rescale();
+				acc.add(*T2[0]);
+				ctxt.copy(acc);
+				done = true;
+			}
+		}
+		if (!done) {   // eager fallback: finish both products the shipped way
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				std::cerr << "[lazy_ps] products not aligned: eager fallback\n";
+			}
+			if (lz.cu == &ctxt && quP && suP) {
+				ctxt.mult(*quP, false);
+				ctxt.add(*suP);
+			}
+			T2km1.mult(*T2[m - 1], fusedRescaleFlag() != 0);
+			T2km1.add(T2km1);
+			T2[0]->adjustForAddOrSub(T2km1);
+			if (T2[0]->NoiseLevel == 1 && T2km1.NoiseLevel == 2)
+				T2km1.rescale();
+			T2km1.sub(*T2[0]);
+			ctxt.sub(T2km1);
+		}
+	} else {
 		innerEvalChebyshevPS(ctxt, ctxt, f2, k, m, T, T2, 0, m);
-		// ctxt.copy(out);
+		ctxt.sub(T2km1);
 	}
-
-	ctxt.sub(T2km1);
 	/*
 
 	Ciphertext<DCRTPoly> result;

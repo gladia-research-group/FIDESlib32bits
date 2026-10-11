@@ -342,6 +342,9 @@ class Ciphertext {
      * Σ relin(d2_j) == relin(Σ d2_j). No rescale, mirroring serial mult(rescale=false).
      */
     void multAccumulateBatch(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b);
+    /** this (a deg-2 seed at the products' level and scale) += sum_j a_j * b_j with ONE key switch; false (nothing done)
+     *  when a pair does not land at this level with this scale. */
+    bool multAccumulateChecked(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b);
 
     /**
      * @brief Multiplies both polynomial components by a scalar without pre‑checks.
