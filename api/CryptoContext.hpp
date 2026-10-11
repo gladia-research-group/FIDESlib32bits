@@ -271,6 +271,17 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// the NoiseLevel-2 lane-0 product; all as/bs NoiseLevel-1 at acc's level). GPU-only.
 	void EvalMultCtAccumBatch(Ciphertext<DCRTPoly>& acc, const std::vector<Ciphertext<DCRTPoly>>& as,
 	                          const std::vector<Ciphertext<DCRTPoly>>& bs);
+	// Streamed-weight inner sum: Σ_i cts[i] * encode(vals[i]), each row encoded ON THE DEVICE at the
+	// ciphertexts' level (full slots, NoiseScaleDeg 1, the level's scaling factor) and folded into ONE
+	// accumulator by addMultPt: no host plaintext objects, no per-product ciphertexts. Same result as
+	// EvalMult(cts[0], pt0) + ... + EvalMult(cts[n-1], pt_{n-1}) (NoiseLevel-2, no rescale). All cts
+	// NoiseLevel 1 at one level. GPU-only.
+	Ciphertext<DCRTPoly> EvalMultPtSumEncode(const std::vector<Ciphertext<DCRTPoly>>& cts,
+	                                         const std::vector<std::vector<std::complex<double>>>& vals);
+	// The same from n raw host rows of `width` values (dtype 0 float32, 1 float64, 2 complex64, 3 complex128):
+	// one pinned staging copy, one upload, widened on the device.
+	Ciphertext<DCRTPoly> EvalMultPtSumEncodeRaw(const std::vector<Ciphertext<DCRTPoly>>& cts, const void* rows,
+	                                            int dtype, size_t width);
 	Ciphertext<DCRTPoly> EvalMult(const Ciphertext<DCRTPoly>& ct1, double scalar);
 	Ciphertext<DCRTPoly> EvalMult(double scalar, const Ciphertext<DCRTPoly>& ct1);
 	void EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Plaintext& pt);

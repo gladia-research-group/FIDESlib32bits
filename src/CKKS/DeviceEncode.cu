@@ -1,5 +1,6 @@
 // CKKS packed encoding on the GPU (see DeviceEncode.cuh).
 #include <cmath>
+#include <cstring>
 #include <complex>
 #include <map>
 #include <mutex>
@@ -79,6 +80,23 @@ __global__ void scatter_(const double* c, int N, const unsigned long long* cmax,
     }
 }
 
+// row r of the staged raw rows -> double2 slot values (zero past `width`)
+__global__ void widen_(const void* raw, int dtype, size_t width, size_t row, double2* v, int half) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= half) return;
+    double2 x = make_double2(0.0, 0.0);
+    if ((size_t)j < width) {
+        const size_t i = row * width + j;
+        switch (dtype) {
+            case 0: x.x = ((const float*)raw)[i]; break;
+            case 1: x.x = ((const double*)raw)[i]; break;
+            case 2: x.x = ((const float*)raw)[2 * i]; x.y = ((const float*)raw)[2 * i + 1]; break;
+            default: x.x = ((const double*)raw)[2 * i]; x.y = ((const double*)raw)[2 * i + 1]; break;
+        }
+    }
+    v[j] = x;
+}
+
 uint32_t powmod(uint64_t b, uint64_t e, uint64_t p) {
     uint64_t r = 1 % p;
     b %= p;
@@ -91,6 +109,10 @@ uint32_t powmod(uint64_t b, uint64_t e, uint64_t p) {
 }
 
 struct Scratch {
+    void* pinned = nullptr;           // the raw rows' staging, grown on demand
+    size_t pinnedBytes = 0;
+    void* raw = nullptr;              // their device copy
+    size_t rawBytes = 0;
     int N = 0;
     int* uPos = nullptr;
     int* uNeg = nullptr;
@@ -139,13 +161,11 @@ void ensure(Scratch& s, ContextData& C) {
 
 }  // namespace
 
-cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double>>& values, int limbs, double scale,
-                            int deg, double* cmaxPinned) {
+namespace {
+// the encode of whatever sits in s.v (on stream E): the FFT, the coefficients, the limb scatter and the NTT
+cudaStream_t encodeFromScratch(Scratch& s, Plaintext& pt, int limbs, double scale, int deg) {
     ContextData& C = pt.cc;
     const int N = C.N;
-    std::lock_guard<std::mutex> g(g_mutex);
-    Scratch& s = g_s;
-    ensure(s, C);
     const cudaStream_t E = s.stream;
     // round(scale)^(deg-1) mod each prime, cached per (deg, scale bits): deg 1 is all ones
     const uint64_t powP = (uint64_t)std::llround(scale);
@@ -159,8 +179,6 @@ cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double
         cudaMemcpy(d, f.data(), sizeof(uint32_t) * f.size(), cudaMemcpyHostToDevice);
         it = s.degFactor.emplace(key, d).first;
     }
-    cudaMemsetAsync(s.v, 0, sizeof(double2) * N / 2, E);
-    cudaMemcpyAsync(s.v, values.data(), sizeof(double2) * values.size(), cudaMemcpyHostToDevice, E);
     place_<<<(N / 2 + 255) / 256, 256, 0, E>>>(s.v, s.uPos, s.uNeg, s.a, N / 2);
     double2* in = s.a;
     double2* out = s.b;
@@ -170,8 +188,6 @@ cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double
     }
     cudaMemsetAsync(s.cmax, 0, sizeof(unsigned long long), E);
     coeffs_<<<(N + 255) / 256, 256, 0, E>>>(in, N, scale, s.c, s.cmax);
-    if (cmaxPinned)   // the bit pattern of a non-negative double, read back as one
-        cudaMemcpyAsync(cmaxPinned, s.cmax, sizeof(double), cudaMemcpyDeviceToHost, E);
     pt.c0.grow(limbs - 1);   // with the NTT's aux buffers (constant limbs have none), as Spru.cu
     const cudaStream_t ps = pt.c0.GPU.at(0).s.ptr();
     cudaEventRecord(s.limbsReady, ps);
@@ -184,6 +200,58 @@ cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double
     pt.NoiseLevel = deg;
     pt.slots = N / 2;
     return ps;
+}
+}  // namespace
+
+cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double>>& values, int limbs, double scale,
+                            int deg, double* cmaxPinned) {
+    ContextData& C = pt.cc;
+    const int N = C.N;
+    std::lock_guard<std::mutex> g(g_mutex);
+    Scratch& s = g_s;
+    ensure(s, C);
+    const cudaStream_t E = s.stream;
+    cudaMemsetAsync(s.v, 0, sizeof(double2) * N / 2, E);
+    cudaMemcpyAsync(s.v, values.data(), sizeof(double2) * values.size(), cudaMemcpyHostToDevice, E);
+    // the coefficients' max is read back before the scatter overwrites nothing it needs: same stream E
+    const cudaStream_t ps = encodeFromScratch(s, pt, limbs, scale, deg);
+    if (cmaxPinned)   // the bit pattern of a non-negative double, read back as one
+        cudaMemcpyAsync(cmaxPinned, s.cmax, sizeof(double), cudaMemcpyDeviceToHost, E);
+    return ps;
+}
+
+std::vector<cudaStream_t> encodeRowsOnDevice(const std::vector<Plaintext*>& pts, const void* rows, int dtype, size_t n,
+                                             size_t width, int limbs, double scale, int deg) {
+    std::vector<cudaStream_t> ready;
+    if (pts.empty()) return ready;
+    ContextData& C = pts[0]->cc;
+    const int N = C.N;
+    std::lock_guard<std::mutex> g(g_mutex);
+    Scratch& s = g_s;
+    ensure(s, C);
+    const cudaStream_t E = s.stream;
+    const size_t elem = (dtype == 0 ? 4 : dtype == 1 || dtype == 2 ? 8 : 16);
+    const size_t bytes = n * width * elem;
+    // the previous call's upload has to be done before the staging is overwritten
+    cudaStreamSynchronize(E);
+    if (s.pinnedBytes < bytes) {
+        if (s.pinned) cudaFreeHost(s.pinned);
+        cudaMallocHost(&s.pinned, bytes);
+        s.pinnedBytes = bytes;
+    }
+    if (s.rawBytes < bytes) {
+        if (s.raw) cudaFree(s.raw);
+        cudaMalloc(&s.raw, bytes);
+        s.rawBytes = bytes;
+    }
+    std::memcpy(s.pinned, rows, bytes);
+    cudaMemcpyAsync(s.raw, s.pinned, bytes, cudaMemcpyHostToDevice, E);
+    ready.reserve(n);
+    for (size_t r = 0; r < n; ++r) {
+        widen_<<<(N / 2 + 255) / 256, 256, 0, E>>>(s.raw, dtype, width, r, s.v, N / 2);
+        ready.push_back(encodeFromScratch(s, *pts[r], limbs, scale, deg));
+    }
+    return ready;
 }
 
 }  // namespace FIDESlib::CKKS
