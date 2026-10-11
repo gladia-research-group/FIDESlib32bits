@@ -1224,8 +1224,18 @@ static int sparseBEnv() {
     const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B");
     return e ? std::atoi(e) : 0;
 }
+// FIDESLIB_BTS_ROUTE_K24 (default on): multi-stage sparse routes run SparseB's K = 24 EvalMod series
+static bool routeTakesK24(int N, int slots) {
+    if (const char* e = std::getenv("FIDESLIB_BTS_ROUTE_K24"); e && e[0] == '0') return false;
+    int n, r, s, b;
+    return slots > 1 && slots < N / 2 && !sparseBGeometry(N, slots, n, r, s, b);
+}
+
 static bool sparseBGeometry(int N, int slots, int& n, int& r, int& s, int& b) {
     if (sparseBEnv() <= 0 || slots == N / 2 || slots < 1)
+        return false;
+    // FIDESLIB_BTS_SPARSE_B_MAX=m: SparseB only up to m slots (its n^2 / N diagonals do not compact)
+    if (const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_MAX"); e && *e && std::atoi(e) > 0 && slots > std::atoi(e))
         return false;
     n = 2 * slots;
     r = N / n;
@@ -1699,7 +1709,13 @@ void FIDESlib::CKKS::AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DC
                 for (int j = 0; j < GPUcc.compositeDegree(); ++j)
                     qDouble *= (double)GPUcc.prime[j].p;
                 const double pre = GPUcc.sfAtLimb(GPUcc.L - GPUcc.compositeDegree() * raiseDropFor(slots)) / qDouble;  // composite chain (Bootstrap.cu)
-                const double c = pre * (1.0 / (GPUcc.GetBootK() * GPUcc.N)) * GPUcc.getBtsPreScale();
+                if (routeTakesK24(GPUcc.N, slots)) {
+                    result.bootK = 24.0;
+                    result.evalModCheb = FIDESlib::CKKS::sparseBChebyshevK24();
+                    result.evalModDaIts = 5;
+                }
+                const double routeK = result.bootK > 0 ? result.bootK : (double)GPUcc.GetBootK();
+                const double c = pre * (1.0 / (routeK * GPUcc.N)) * GPUcc.getBtsPreScale();
                 int n = 0;
                 if (const char* e = std::getenv("FIDESLIB_RELEVEL_SELFTEST"); e && std::atoi(e)) {
                     relevelSelfTest(GPUcc_, GPUcc, result.CtS.at(0).A.at(0), "CtS0[0]");
@@ -2050,6 +2066,9 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     }
     var->accumulate_bStep = base.accumulate_bStep;
     var->correctionFactor = base.correctionFactor;
+    var->bootK = base.bootK;
+    var->evalModCheb = base.evalModCheb;
+    var->evalModDaIts = base.evalModDaIts;
     var->sparse_encaps = base.sparse_encaps;
     var->sparse_context = base.sparse_context;
     var->sparse_atob = base.sparse_atob;
@@ -2065,7 +2084,8 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
         for (int j = 0; j < d; ++j)
             qDouble *= (double)GPUcc.prime[j].p;
         const double pre = sfVar / qDouble;
-        var->cts0_const = pre * (1.0 / (GPUcc.GetBootK() * GPUcc.N)) * GPUcc.getBtsPreScale();
+        var->cts0_const = pre * (1.0 / ((base.bootK > 0 ? base.bootK : (double)GPUcc.GetBootK()) * GPUcc.N)) *
+                          GPUcc.getBtsPreScale();
     }
     cudaDeviceSynchronize();
     std::cerr << "[bts_raise] slots=" << slots << " variant drop=" << drop << " (base " << base.raise_drop

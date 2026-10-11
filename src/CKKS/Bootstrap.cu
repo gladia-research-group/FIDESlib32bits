@@ -133,7 +133,7 @@ void FIDESlib::CKKS::BootstrapCPUraise(
         //------------------------------------------------------------------------------
 
         // Coefficients of the Chebyshev series interpolating 1/(2 Pi) Sin(2 Pi K x)
-        double k = cc.GetBootK();
+        double k = cc.GetBootPrecomputation(slots).bootK > 0 ? cc.GetBootPrecomputation(slots).bootK : cc.GetBootK();
 
         double constantEvalMult = pre * (1.0 / (k * cc.N));
         // Free per-call input pre-scale (Context.cuh btsPreScale): rides the arbitrary
@@ -190,7 +190,10 @@ void FIDESlib::CKKS::BootstrapCPUraise(
         ctxt.add(aux);
         if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
             ctxt.rescale();
-        approxModReductionSparse(ctxt, scalar);
+        if (auto& rp = cc.GetBootPrecomputation(slots); !rp.evalModCheb.empty())
+            approxModReductionSparse(ctxt, scalar, rp.evalModCheb, rp.evalModDaIts);
+        else
+            approxModReductionSparse(ctxt, scalar);
     }
 
     if (ctxt.NoiseLevel == 2) {
@@ -461,7 +464,7 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
 
     {
         // Coefficients of the Chebyshev series interpolating 1/(2 Pi) Sin(2 Pi K x)
-        double k = cc.GetBootK();
+        double k = cc.GetBootPrecomputation(slots).bootK > 0 ? cc.GetBootPrecomputation(slots).bootK : cc.GetBootK();
         double constantEvalMult = pre * (1.0 / (k * cc.N));
         constantEvalMult *= cc.getBtsPreScale();
         // FIDESLIB_BTS_SHIFT: apply it exactly inside the raise (level kept) when the precomputation was built for it
@@ -1227,7 +1230,7 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
                  [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
     st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst;
     st.stcFolded = pre.stc_first_mode == 2;
-    const double k = cc.GetBootK();
+    const double k = pre.bootK > 0 ? pre.bootK : cc.GetBootK();
     st.constantEvalMult = preF * (1.0 / (k * cc.N)) * cc.getBtsPreScale();
     st.baked = pre.cts0_const;
     st.exactOnly = [] { const char* e = std::getenv("FIDESLIB_BTS_EXACT_ONLY"); return e && std::atoi(e) > 0; }();
@@ -1446,7 +1449,10 @@ void btsEvalMod(Ciphertext& ctxt, const BtsState& st) {
         ctxt.add(aux);
         if (cc.rescaleTechnique == CKKS::FIXEDMANUAL)
             ctxt.rescale();
-        approxModReductionSparse(ctxt, st.scalar);
+        if (auto& rp = cc.GetBootPrecomputation(st.slots); !rp.evalModCheb.empty())
+            approxModReductionSparse(ctxt, st.scalar, rp.evalModCheb, rp.evalModDaIts);
+        else
+            approxModReductionSparse(ctxt, st.scalar);
     }
     if (ctxt.NoiseLevel == 2 && !(st.stcFirst && cc.N / 2 == st.slots))
         ctxt.rescale();
