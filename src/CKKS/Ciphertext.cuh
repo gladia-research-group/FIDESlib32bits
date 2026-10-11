@@ -424,6 +424,8 @@ class Ciphertext {
      * @param index Number of slots to rotate.
      */
     void rotate(const Ciphertext& c, const int index);
+    /// rotate(index) of `c` into this (c != this) without first copying c: the hoisted path reads c.c0 in place.
+    void rotateFrom(const Ciphertext& c, const int index);
 
     /**
      * @brief Computes the complex conjugate of ciphertext `c` and stores it in *this*.

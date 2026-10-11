@@ -8,6 +8,9 @@
 
 namespace fideslib {
 
+thread_local bool g_no_device_copy = false;
+
+
 CiphertextImpl<DCRTPoly>::~CiphertextImpl() {
 	if (this->loaded && this->gpu != 0 && this->parent_context) {
 		this->parent_context->EvictDeviceCiphertext(this->gpu);
@@ -38,7 +41,8 @@ CiphertextImpl<DCRTPoly>::CiphertextImpl(const CiphertextImpl<DCRTPoly>& other, 
 	// Copy underlying GPU Ciphertext if loaded.
 	this->loaded = other.loaded;
 	if (this->loaded) {
-		this->gpu = other.parent_context->CopyDeviceCiphertext(other);
+		this->gpu = g_no_device_copy ? other.parent_context->NewDeviceCiphertextLike(other)
+									 : other.parent_context->CopyDeviceCiphertext(other);
 	} else {
 		this->gpu = 0;
 	}

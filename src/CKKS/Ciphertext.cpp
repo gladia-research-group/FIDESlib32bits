@@ -1158,6 +1158,32 @@ void Ciphertext::rotate(const Ciphertext& c, const int index) {
 	this->rotate(index, true);
 }
 
+void Ciphertext::rotateFrom(const Ciphertext& c, const int index_) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(this != &c);
+	op_count[OPS::ROTATE]++;
+	c0.dropToLevel(c.c0.getLevel());
+	c1.dropToLevel(c.c1.getLevel());
+	c0.grow(c.c0.getLevel());
+	c1.grow(c.c1.getLevel());
+	this->copyMetadata(c);
+	const int index = normalyzeIndex(index_);
+	assert(index != 0);
+	// rotate(index, true)'s live branch with in0 = c.c0 read in place (the copy only existed because c0 is overwritten)
+	auto& in1 = cc.getKeySwitchAux();
+	in1.copy(c.c1);
+	in1.modup();
+	std::vector<int> index_v{ index };
+	std::vector<RNSPoly*> c0_out{ &c0 };
+	std::vector<RNSPoly*> c1_out{ &c1 };
+	auto& ksk = cc.GetRotationKey(index, c.keyID, slots);
+	std::vector<RNSPoly*> ksk_a{ &ksk.a };
+	std::vector<RNSPoly*> ksk_b{ &ksk.b };
+	in1.hoistedRotationFused(index_v, c0_out, c1_out, ksk_a, ksk_b, c.c0, in1);
+	modDown(false);
+}
+
 void Ciphertext::conjugate(const Ciphertext& c) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
