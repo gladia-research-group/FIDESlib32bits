@@ -6,6 +6,7 @@
 #define FIDESLIB_CKKS_LIMBPARTITION_CUH
 
 #include <atomic>
+#include "ConstantsGPU.cuh"
 #include "Limb.cuh"
 #include "LimbUtils.cuh"
 #include "NTT.cuh"
@@ -21,6 +22,12 @@ extern bool GRAPH_CAPTURE;
  * One definition: the key-loading path and the launch gates must agree, since at >=2 nothing reads the
  * `a` rows and releasing them (adoptKskASeed) is only legal then. */
 int kskRegenLevel();
+
+/** Per-prime scalars passed by value to a limb kernel (indexed by prime id, as the in-place scalar ops index their
+ *  device vector). */
+struct LimbScalars {
+    uint64_t v[MAXP];
+};
 
 class LimbPartition {
    public:
@@ -161,6 +168,10 @@ class LimbPartition {
     void add(const LimbPartition& a, const LimbPartition& b, const bool ext_a, const bool ext_b);
 
     void sub(const LimbPartition& p);
+    /// FIDESLIB_NOCLONE=3 write-once ops (NoClone3.cu): this <- a - b, src * scalars, src + scalars.
+    void subFrom(const LimbPartition& a, const LimbPartition& b);
+    void multScalarFrom(const LimbPartition& src, const LimbScalars& sc);
+    void addScalarFrom(const LimbPartition& src, const LimbScalars& sc);
 
     void multElement(const LimbPartition& p);
 

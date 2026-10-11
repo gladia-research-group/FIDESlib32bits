@@ -133,7 +133,9 @@ static int noCloneLevel() {
 	return g_noCloneLevel.load(std::memory_order_relaxed);
 }
 // level 1: rotate / conjugate / batch products / EvalAddMany; level 2 adds write-once EvalAdd(ct, ct), EvalMult(ct, ct),
-// EvalMult(ct, pt) and EvalSquare (Ciphertext::addInto / multInto / multPtInto, each falling back to clone + in-place)
+// EvalMult(ct, pt) and EvalSquare (Ciphertext::addInto / multInto / multPtInto, each falling back to clone + in-place);
+// level 3 adds EvalSub(ct, ct), EvalMult / EvalAdd / EvalSub with a scalar (subInto / multScalarInto / addScalarInto) and
+// the fast rotations' empty results
 static bool noClone() {
 	return noCloneLevel() > 0;
 }
@@ -2417,6 +2419,16 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAdd(const Ciphertext<DCRTP
 	// GPU path.
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 
+	if (noCloneLevel() >= 3 && scalar != 0.0) {	 // FIDESLIB_NOCLONE=3: c0 + scalar written once, c1 copied
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct_gpu	 = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
+		if (!res_gpu->addScalarInto(*ct_gpu, scalar)) {
+			res_gpu->copy(*ct_gpu);
+			res_gpu->addScalar(scalar);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	res_gpu->addScalar(scalar);
@@ -2616,6 +2628,17 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(const Ciphertext<DCRTP
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct1));
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct2));
 
+	if (noCloneLevel() >= 3) {	// FIDESLIB_NOCLONE=3: write ct1 - ct2 once instead of clone + sub
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct1);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct1_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct1->gpu));
+		auto ct2_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct2->gpu));
+		if (!res_gpu->subInto(*ct1_gpu, *ct2_gpu)) {
+			res_gpu->copy(*ct1_gpu);
+			res_gpu->sub(*ct2_gpu);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto ct2_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct2->gpu));
@@ -2696,6 +2719,16 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSub(const Ciphertext<DCRTP
 	// GPU path.
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 
+	if (noCloneLevel() >= 3 && scalar != 0.0) {	 // FIDESLIB_NOCLONE=3: c0 - scalar written once, c1 copied
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct_gpu	 = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
+		if (!res_gpu->addScalarInto(*ct_gpu, -scalar)) {
+			res_gpu->copy(*ct_gpu);
+			res_gpu->addScalar(-scalar);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	res_gpu->addScalar(-scalar);
@@ -3101,6 +3134,16 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRT
 	// GPU path.
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct1));
 
+	if (noCloneLevel() >= 3) {	// FIDESLIB_NOCLONE=3: ct1 * scalar written once instead of clone + multScalar
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct1);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct1_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct1->gpu));
+		if (!res_gpu->multScalarInto(*ct1_gpu, scalar)) {
+			res_gpu->copy(*ct1_gpu);
+			res_gpu->multScalar(scalar);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	res_gpu->multScalar(scalar);
@@ -3389,7 +3432,8 @@ CryptoContextImpl<DCRTPoly>::EvalFastRotation(const Ciphertext<DCRTPoly>& ct, co
 
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 
-	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
+	// FIDESLIB_NOCLONE=3: rotate_hoisted grows and writes the whole result (index 0 copies the input itself)
+	Ciphertext<DCRTPoly> result = noCloneLevel() >= 3 ? this->MakeGpuResultEmptyLike(ct) : this->MakeGpuResultLike(ct);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto ct_gpu					= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
 	ct_gpu->rotate_hoisted({ (int)index }, { res_gpu.get() }, false);
@@ -3414,7 +3458,8 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalFastRotationExt(const Ciph
 
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 
-	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
+	// FIDESLIB_NOCLONE=3: rotate_hoisted grows and writes the whole result (index 0 copies the input itself)
+	Ciphertext<DCRTPoly> result = noCloneLevel() >= 3 ? this->MakeGpuResultEmptyLike(ct) : this->MakeGpuResultLike(ct);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto ct_gpu					= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
 	ct_gpu->rotate_hoisted({ (int)index }, { res_gpu.get() }, true);
@@ -3450,7 +3495,9 @@ CryptoContextImpl<DCRTPoly>::EvalFastRotation(const Ciphertext<DCRTPoly>& ct, co
 	std::vector<FIDESlib::CKKS::Ciphertext*> results_gpu;
 	std::vector<int32_t> indices_real;
 	for (int indice : indices) {
-		Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
+		// FIDESLIB_NOCLONE=3: a nonzero index's result is fully written by rotate_hoisted; index 0 stays a clone
+		Ciphertext<DCRTPoly> result =
+		  (noCloneLevel() >= 3 && indice != 0) ? this->MakeGpuResultEmptyLike(ct) : this->MakeGpuResultLike(ct);
 
 		if (indice != 0) {
 			indices_real.push_back(indice);
@@ -3491,7 +3538,9 @@ CryptoContextImpl<DCRTPoly>::EvalFastRotationExt(const Ciphertext<DCRTPoly>& ct,
 	std::vector<FIDESlib::CKKS::Ciphertext*> results_gpu;
 	std::vector<int32_t> indices_real;
 	for (int indice : indices) {
-		Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
+		// FIDESLIB_NOCLONE=3: a nonzero index's result is fully written by rotate_hoisted; index 0 stays a clone
+		Ciphertext<DCRTPoly> result =
+		  (noCloneLevel() >= 3 && indice != 0) ? this->MakeGpuResultEmptyLike(ct) : this->MakeGpuResultLike(ct);
 
 		if (indice != 0) {
 			indices_real.push_back(indice);
