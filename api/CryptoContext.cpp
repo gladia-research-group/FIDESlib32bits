@@ -456,9 +456,35 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 				while (std::getline(ss, tok, ','))
 					if (!tok.empty() && std::atoi(tok.c_str()) > 0) drops.insert(std::atoi(tok.c_str()));
 			}
-			for (const auto& [slots, _] : precom)
+			// built on first use unless FIDESLIB_BTS_RAISE_EAGER=1: a plan uses few (often no) raise drops, and
+			// every variant is a full copy of a route's tables
+			const char* eager_e = std::getenv("FIDESLIB_BTS_RAISE_EAGER");
+			if (eager_e && eager_e[0] == '1') {
+				for (const auto& [slots, _] : precom)
+					for (int k : drops)
+						FIDESlib::CKKS::AddBootstrapRaiseVariant(context, static_cast<int32_t>(slots), c, k);
+			} else if (!drops.empty()) {
+				c->raiseDropsAllowed = drops;
+				std::weak_ptr<FIDESlib::CKKS::ContextData> wc = c;
+				c->raiseVariantBuilder = [wc, context](int slots, int drop) {
+					auto cc = wc.lock();
+					if (!cc)
+						return;
+					FIDESlib::CKKS::AddBootstrapRaiseVariant(context, slots, cc, drop);
+					auto& base = cc->GetBootPrecomputationBase(slots);
+					auto it = base.raise_variants.find(drop);
+					if (it != base.raise_variants.end() && it->second)
+						cc->ReleaseScratchOf(*it->second);
+				};
+				std::cerr << "[bts_raise] variants for drops";
 				for (int k : drops)
-					FIDESlib::CKKS::AddBootstrapRaiseVariant(context, static_cast<int32_t>(slots), c, k);
+					std::cerr << " " << k;
+				std::cerr << " are built on first use\n";
+			}
+			// the tables are only read from here on: drop their NTT scratch
+			const size_t released = c->BootReleaseScratch();
+			if (released)
+				std::cerr << "[pt_scratch] bootstrap tables: scratch released on " << released << " plaintexts\n";
 		}
 	}
 
@@ -948,6 +974,26 @@ void CryptoContextImpl<DCRTPoly>::ForgetPrefetchedRaw(const void* key) {
 	}
 }
 
+// A device plaintext is only read once loaded: its limbs' NTT scratch (aux, as large as the data) is released, ordered
+// after the load / encode on `after` (FIDESLIB_PT_SCRATCH=0 keeps it).
+static void release_pt_scratch(FIDESlib::CKKS::Plaintext& p, cudaStream_t after) {
+	static const bool on = [] {
+		const char* e = std::getenv("FIDESLIB_PT_SCRATCH");
+		return !(e && e[0] == '0');
+	}();
+	if (!on)
+		return;
+	if (after != nullptr) {
+		cudaEvent_t ev;
+		cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+		cudaEventRecord(ev, after);
+		for (auto& part : p.c0.GPU)
+			cudaStreamWaitEvent(part.s.ptr(), ev, 0);
+		cudaEventDestroy(ev);
+	}
+	p.c0.releaseAux();
+}
+
 void CryptoContextImpl<DCRTPoly>::PrewarmKvArena() {
 	// Allocate the 12GB pinned KV-offload arena on a background thread ONCE, at decode init, so the
 	// ~3.5s cudaMallocHost overlaps token-0's block compute instead of stalling the first offload
@@ -1202,6 +1248,7 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 			                                       static_cast<int>(cpu_pt->GetNoiseScaleDeg()), cmax);
 			if (!plaintext_streams_enabled)
 				cudaStreamSynchronize(ready);
+			release_pt_scratch(*gpu_pt, ready);
 		}
 		uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
 		pt->gpu			= handle;
@@ -1247,6 +1294,7 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 		} else {
 			gpu_pt->load(e->meta);
 		}
+		release_pt_scratch(*gpu_pt, load_stream);
 		uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
 		pt->gpu			= handle;
 		pt->loaded		= true;
@@ -1310,6 +1358,7 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 			gpu_pt->load(*src);
 		}
 	}
+	release_pt_scratch(*gpu_pt, load_stream);
 	uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
 	pt->gpu			= handle;
 	pt->loaded		= true;

@@ -165,6 +165,25 @@ void run_in_graph(cudaGraphExec_t& exec, Stream& s, std::function<void()> run);
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache = false);
 void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache = false);
 
+/* The pooled allocator's slabs on device `id`: reserved bytes, the idle part of them, and the part in slabs that are
+ * idle as a whole (what GPUpoolTrim would release). */
+struct GPUpoolStats {
+    size_t reserved = 0, idle = 0, trimmable = 0, slabs = 0;
+};
+GPUpoolStats GPUpoolStatsOf(int id);
+/* Hand the idle slabs of device `id` back to the CUDA stream-ordered pool (shared by every allocation). Returns the
+ * bytes released. Also done automatically before an allocation gives up. */
+size_t GPUpoolTrim(int id);
+/* A callback that frees idle cached device objects of device `id` (their blocks go back to the pool's free lists);
+ * run before an allocation gives up. Returns the objects freed. An empty function unregisters. */
+void GPUpoolSetReclaimHook(int id, std::function<size_t()> hook);
+/* Per pooled block size: {block bytes, reserved bytes, in-use bytes, slabs}. */
+std::vector<std::array<size_t, 4>> GPUpoolBySize(int id);
+/* FIDESLIB_POOL_TRACE=1 only: live pooled bytes per allocation call chain (`depth` frames above GPUmalloc), largest
+ * first. */
+std::vector<std::pair<std::string, size_t>> GPUpoolTrace(int id, int depth);
+
+
 
 }  // namespace FIDESlib
 #endif  //FIDESLIB_CUDAUTILS_CUH

@@ -1,3 +1,5 @@
+#include <functional>
+#include <set>
 //
 // Created by carlos on 6/03/24.
 //
@@ -207,6 +209,20 @@ class ContextData {
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
     bool HasBootPrecomputation(int slots);
     BootstrapPrecomputation& GetBootPrecomputation(int slots);
+    /** Lazy raise variants: the drops a planted bootstrap may ask for (FIDESLIB_BTS_RAISE_DROPS) and the builder
+     *  that makes one from the route's base tables on first use (installed by LoadContext). Each variant is a full
+     *  re-levelled copy of the route's CtS/StC tables, so building them all up front holds memory a plan without
+     *  raise drops never touches. */
+    std::set<int> raiseDropsAllowed;
+    std::function<void(int slots, int drop)> raiseVariantBuilder;
+    /** Entries of the bootstrap last-stage caches (stc_first_last / lt_first_last, every route and raise variant);
+     *  `clear`: drop them too (device plaintexts freed; rebuilt on the next bootstrap that needs them). */
+    size_t BootCacheEntries(bool clear);
+    /** Release the NTT scratch of every bootstrap plaintext table (they are only read once built; see
+     *  Limb::releaseAux). Returns the plaintexts released. */
+    size_t BootReleaseScratch();
+    /** BootReleaseScratch for one precomputation (a lazily built raise variant). */
+    size_t ReleaseScratchOf(BootstrapPrecomputation& p);
     void AddRotationKey(int index, KeySwitchingKey&& ksk);
     KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID, int slots = -1);
     bool HasRotationKey(int index, const KeyHash& keyID);
@@ -226,6 +242,11 @@ class ContextData {
     void returnAuxilarPoly(RNSPoly&& c);
     void trimAuxilarPoly(size_t size);
     void clearAuxilarPoly();
+    /** Free the recycled polynomials (precom.auxPoly) and their limbs; the pool's reclaim hook calls it when the
+     *  device is full. Returns the polynomials freed. */
+    size_t releaseAuxilarPolys();
+    /** (recycled polynomials, limb bytes they hold). */
+    std::pair<size_t, size_t> auxilarPolyStats();
     void clearAutomorphismKeys(const KeyHash& KeyID = {});
     void clearEvalMultKeys(const KeyHash& KeyID = {});
     void clearBootPrecomputation(int slots = -1);

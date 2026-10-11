@@ -1,3 +1,11 @@
+#include <functional>
+#include <vector>
+#include <map>
+#include <unordered_map>
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <array>
 //
 // Created by carlosad on 25/03/24.
 //
@@ -255,6 +263,201 @@ std::mutex* const mempool_lock = new std::mutex[8];
 std::map<int, std::vector<void*>>* const size_to_memory = new std::map<int, std::vector<void*>>[8];
 
 FIDESlib::Stream* const s = new FIDESlib::Stream[8];
+
+/* Slab bookkeeping for the pooled path: a pooled size class is served from slabs (cudaMallocAsync'd chunks carved
+ * into equal blocks), and a block freed goes back to its class's free list. Without this a slab was never released,
+ * so a class that stopped being used (a phase of the computation, a bootstrap route, a cache length) kept its memory
+ * for the life of the process. A slab whose blocks are all on the free list can be handed back to the CUDA
+ * stream-ordered pool, which every allocation draws from (GPUpoolTrim; also done before giving up on an allocation).
+ * Guarded by mempool_lock[id], like size_to_memory. */
+struct PoolSlab {
+    int block;
+    int nblocks;
+    int nfree;
+};
+std::map<char*, PoolSlab>* const slabs = new std::map<char*, PoolSlab>[8];
+
+static PoolSlab* slab_of(int id, void* ptr) {
+    auto& m = slabs[id];
+    auto it = m.upper_bound((char*)ptr);
+    if (it == m.begin())
+        return nullptr;
+    --it;
+    if ((char*)ptr >= it->first + (size_t)it->second.block * it->second.nblocks)
+        return nullptr;
+    return &it->second;
+}
+
+/* Release the idle slabs of device `id` (mempool_lock[id] held). Returns the bytes released. */
+static size_t pool_trim_locked(int id) {
+    size_t freed = 0;
+    auto& m = slabs[id];
+    for (auto it = m.begin(); it != m.end();) {
+        PoolSlab& sl = it->second;
+        if (sl.nfree != sl.nblocks) {
+            ++it;
+            continue;
+        }
+        char* lo = it->first;
+        char* hi = lo + (size_t)sl.block * sl.nblocks;
+        auto& fl = size_to_memory[id][sl.block];
+        fl.erase(std::remove_if(fl.begin(), fl.end(), [&](void* p) { return (char*)p >= lo && (char*)p < hi; }),
+                 fl.end());
+        // ordered after every free of its blocks: GPUfree makes the pool stream wait on the freeing stream
+        cudaFreeAsync(lo, s[id].ptr());
+        freed += (size_t)sl.block * sl.nblocks;
+        it = m.erase(it);
+    }
+    return freed;
+}
+
+static size_t run_reclaim_hook(int id);
+
+/* cudaMallocAsync on `stream`; on out-of-memory, release the idle slabs of device `id` and retry once
+ * (`locked`: mempool_lock[id] is already held). */
+static cudaError_t malloc_or_trim(int id, void** ptr, size_t bytes, cudaStream_t stream, bool locked) {
+    cudaError_t e = cudaMallocAsync(ptr, bytes, stream);
+    if (e != cudaErrorMemoryAllocation)
+        return e;
+    cudaGetLastError();
+    size_t freed;
+    if (locked) {
+        freed = pool_trim_locked(id);
+    } else {
+        // idle cached objects (the context's polynomial recycler) give their blocks back first, so their slabs can go
+        if (size_t n = run_reclaim_hook(id))
+            std::cerr << "[gpu_pool] out of memory for " << bytes << " B: reclaimed " << n << " cached polynomials"
+                      << std::endl;
+        std::lock_guard<std::mutex> guard(mempool_lock[id]);
+        freed = pool_trim_locked(id);
+    }
+    if (freed == 0)
+        return cudaMallocAsync(ptr, bytes, stream);
+    // the released slabs become reusable by other streams once their frees have run
+    cudaStreamSynchronize(s[id].ptr());
+    std::cerr << "[gpu_pool] out of memory for " << bytes << " B: released " << (freed >> 20) << " MiB of idle slabs"
+              << std::endl;
+    return cudaMallocAsync(ptr, bytes, stream);
+}
+
+static std::function<size_t()>* const reclaim_hook = new std::function<size_t()>[8];
+
+void GPUpoolSetReclaimHook(int id, std::function<size_t()> hook) {
+    std::lock_guard<std::mutex> guard(mempool_lock[id]);
+    reclaim_hook[id] = std::move(hook);
+}
+
+/* Run device `id`'s reclaim hook (mempool_lock[id] NOT held: the hook frees blocks through GPUfree). */
+static size_t run_reclaim_hook(int id) {
+    std::function<size_t()> h;
+    {
+        std::lock_guard<std::mutex> guard(mempool_lock[id]);
+        h = reclaim_hook[id];
+    }
+    return h ? h() : 0;
+}
+
+size_t GPUpoolTrim(int id) {
+    std::lock_guard<std::mutex> guard(mempool_lock[id]);
+    if (s[id].ptr() == nullptr)
+        return 0;
+    size_t freed = pool_trim_locked(id);
+    cudaStreamSynchronize(s[id].ptr());
+    return freed;
+}
+
+std::vector<std::array<size_t, 4>> GPUpoolBySize(int id) {
+    std::lock_guard<std::mutex> guard(mempool_lock[id]);
+    std::map<int, std::array<size_t, 4>> by;
+    for (auto& [base, sl] : slabs[id]) {
+        auto& r = by[sl.block];
+        r[0] = sl.block;
+        r[1] += (size_t)sl.block * sl.nblocks;
+        r[2] += (size_t)sl.block * (sl.nblocks - sl.nfree);
+        r[3] += 1;
+    }
+    std::vector<std::array<size_t, 4>> out;
+    for (auto& [b, r] : by)
+        out.push_back(r);
+    return out;
+}
+
+/* FIDESLIB_POOL_TRACE=1: every live pooled block keeps the backtrace of its allocation, so the live bytes can be
+ * attributed to call sites (GPUpoolTrace). A diagnostic: a backtrace per allocation is not free. */
+static bool pool_trace_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("FIDESLIB_POOL_TRACE");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+struct PoolTraceRec {
+    int bytes;
+    int n;
+    void* fr[40];
+};
+std::unordered_map<void*, PoolTraceRec>* const pool_live = new std::unordered_map<void*, PoolTraceRec>[8];
+
+static std::string frame_name(void* a) {
+    Dl_info info{};
+    if (dladdr(a, &info) && info.dli_sname) {
+        int st = 0;
+        char* dm = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &st);
+        std::string r = (st == 0 && dm) ? dm : info.dli_sname;
+        std::free(dm);
+        auto paren = r.find('(');
+        if (paren != std::string::npos)
+            r = r.substr(0, paren);
+        return r;
+    }
+    char buf[512];
+    if (info.dli_fname && info.dli_fbase) {
+        const char* base = strrchr(info.dli_fname, '/');
+        snprintf(buf, sizeof buf, "%s+0x%lx", base ? base + 1 : info.dli_fname,
+                 (unsigned long)((char*)a - (char*)info.dli_fbase));
+    } else {
+        snprintf(buf, sizeof buf, "%p", a);
+    }
+    return buf;
+}
+
+std::vector<std::pair<std::string, size_t>> GPUpoolTrace(int id, int depth) {
+    std::map<std::vector<void*>, size_t> by;
+    {
+        std::lock_guard<std::mutex> guard(mempool_lock[id]);
+        for (auto& [p, r] : pool_live[id]) {
+            std::vector<void*> key(r.fr + 2, r.fr + std::min(r.n, 2 + depth));
+            by[key] += r.bytes;
+        }
+    }
+    std::map<std::string, size_t> named;
+    for (auto& [fr, b] : by) {
+        std::string k;
+        for (void* a : fr) {
+            if (!k.empty())
+                k += " < ";
+            k += frame_name(a);
+        }
+        named[k] += b;
+    }
+    std::vector<std::pair<std::string, size_t>> out(named.begin(), named.end());
+    std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    return out;
+}
+
+GPUpoolStats GPUpoolStatsOf(int id) {
+    std::lock_guard<std::mutex> guard(mempool_lock[id]);
+    GPUpoolStats st{};
+    for (auto& [base, sl] : slabs[id]) {
+        size_t total = (size_t)sl.block * sl.nblocks;
+        st.reserved += total;
+        st.idle += (size_t)sl.block * sl.nfree;
+        if (sl.nfree == sl.nblocks)
+            st.trimmable += total;
+        st.slabs++;
+    }
+    return st;
+}
 //void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     void* ptr = nullptr;
@@ -274,7 +477,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     if (cache && (bytes & (bytes - 1)) == 0) {
         // The whole pooled path holds the lock: the map insert, the refill/pop sequence and the
         // shared per-id event are all racy under concurrent host threads.
-        std::lock_guard<std::mutex> guard(mempool_lock[id]);
+        std::unique_lock<std::mutex> guard(mempool_lock[id]);
         std::vector<void*>& free_limb = size_to_memory[id][bytes];
 
         if (s[id].ptr() == nullptr) {
@@ -282,11 +485,30 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
         }
         CudaCheckErrorModNoSync;
         if (free_limb.empty()) {
-            uint64_t* base;
-            cudaMallocAsync(&base, MBs * 1024 * 1024, s[id].ptr());
+            uint64_t* base = nullptr;
+            const size_t slab = MBs * 1024 * 1024;
+            cudaError_t e = cudaMallocAsync((void**)&base, slab, s[id].ptr());
+            if (e == cudaErrorMemoryAllocation) {
+                cudaGetLastError();
+                base = nullptr;
+                // the device is full: idle cached objects give their blocks back (often of this very size), then
+                // idle slabs of other sizes go
+                guard.unlock();
+                const size_t n = run_reclaim_hook(id);
+                guard.lock();
+                if (n)
+                    std::cerr << "[gpu_pool] out of memory for a " << bytes << " B block: reclaimed " << n
+                              << " cached polynomials" << std::endl;
+                if (free_limb.empty())
+                    malloc_or_trim(id, (void**)&base, slab, s[id].ptr(), true);
+            }
+            CudaCheckErrorModNoSync;
 
-            for (int i = 0; i < MBs * 1024 * 1024; i += bytes) {
-                free_limb.emplace_back(((char*)base) + i);
+            if (base != nullptr) {
+                for (size_t i = 0; i < slab; i += bytes) {
+                    free_limb.emplace_back(((char*)base) + i);
+                }
+                slabs[id][(char*)base] = PoolSlab{bytes, (int)(slab / bytes), (int)(slab / bytes)};
             }
         }
         CudaCheckErrorModNoSync;
@@ -300,6 +522,14 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
         CudaCheckErrorModNoSync;
         ptr = free_limb.back();
         free_limb.pop_back();
+        if (PoolSlab* sl = slab_of(id, ptr))
+            sl->nfree--;
+        if (pool_trace_on()) {
+            PoolTraceRec r;
+            r.bytes = bytes;
+            r.n = backtrace(r.fr, 40);
+            pool_live[id][ptr] = r;
+        }
         //ptr = free_limb.front();
         //free_limb.pop_front();
         //std::cout << "get " << ptr << std::endl;
@@ -310,7 +540,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     if (0) {
         cudaMalloc(&ptr, bytes);
     } else if (1) {
-        cudaMallocAsync(&ptr, bytes, 0);
+        malloc_or_trim(id, &ptr, bytes, 0, false);
     } else {
         if (size_to_memory[id][bytes].empty()) {
             cudaSetDevice(id);
@@ -376,6 +606,10 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
         }
         CudaCheckErrorModNoSync;
         free_limb.emplace_back(ptr);
+        if (PoolSlab* sl = slab_of(id, ptr))
+            sl->nfree++;
+        if (pool_trace_on())
+            pool_live[id].erase(ptr);
         //std::cout << "free " << ptr << std::endl;
         return;
     }
