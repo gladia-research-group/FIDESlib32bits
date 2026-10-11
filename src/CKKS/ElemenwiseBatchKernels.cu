@@ -2296,7 +2296,8 @@ __device__ __forceinline__ void dotProductLtBatchedPt3BodyG(void*** c0_out, void
                                                             void*** c1_in, void*** pts, const int bStep, const int n,
                                                             const int idx, const int primeid,
                                                             const uint32_t ptMask = 0xFFFFFFFFu) {
-    const int pidx = (int)((uint32_t)idx & ptMask);  // FIDESLIB_LT_COMPACT: periodic / block-constant diagonals
+    // FIDESLIB_LT_COMPACT: periodic / block-constant diagonals; 0x7F0000ss = stored compact (PtCompact.cuh)
+    const int pidx = ((ptMask >> 24) == 0x7Fu) ? (idx >> (ptMask & 0xFFu)) : (int)((uint32_t)idx & ptMask);
     // compact diagonals must STAY in L2 (cached load); full ones keep the shipped evict-first streaming load
     const bool compact = ptMask != 0xFFFFFFFFu;
     auto ptld = [compact](const T* p) -> T { return compact ? __ldg(p) : FIDESLIB_STREAM_LD(p); };

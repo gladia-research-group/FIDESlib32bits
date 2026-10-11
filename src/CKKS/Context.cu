@@ -1,3 +1,4 @@
+#include "CKKS/PtCompact.cuh"
 #include <functional>
 //
 // Created by carlosad on 2/05/24.
@@ -708,6 +709,10 @@ size_t ContextData::ReleaseScratchOf(BootstrapPrecomputation& top) {
     };
     visit(top);
     cudaDeviceSynchronize();
+    // after releaseAux (live data in `v`): stage tables stored compact (FIDESLIB_PT_COMPACT=0: full)
+    const auto [nc, freed] = compactStages(top);
+    if (nc)
+        std::cerr << "[pt_compact] " << nc << " stage plaintexts stored compact, " << (freed >> 20) << " MiB freed\n";
     return n;
 }
 

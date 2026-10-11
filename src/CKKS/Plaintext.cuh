@@ -30,6 +30,8 @@ namespace FIDESlib::CKKS {
     double NoiseFactor = 0;
     int NoiseLevel = 1;
     int slots = 0;
+    /** 0xFFFFFFFF: full limbs; else compact (PtCompact.cuh, read through ptCompactIdx). */
+    uint32_t compactMask = 0xFFFFFFFFu;
 
     /**
      * @brief Defaulted move constructor.
