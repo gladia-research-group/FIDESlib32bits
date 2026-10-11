@@ -179,6 +179,14 @@ void Stream::wait(cudaStream_t s) {
 
 int low = -1;
 int high = -1;
+bool errcheckOn() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_ERRCHECK"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+bool ompRegionsOn() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_OMP_REGIONS"); return e && std::atoi(e) > 0; }();
+    return v;
+}
 void Stream::init(int priority) {
     if (ptr_) {
         //free[ptr]++;
@@ -197,8 +205,7 @@ void Stream::init(int priority) {
     cudaStreamCreateWithPriority(&ptr_, 0 /*cudaStreamNonBlocking*/, prio);
     //cudaStreamCreateWithFlags(&ptr, cudaStreamNonBlocking);
 
-    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-    cudaEventCreate(&ev, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);   // (was created twice: one event per stream leaked)
 #else
     ptr = nullptr;
     ev = nullptr;

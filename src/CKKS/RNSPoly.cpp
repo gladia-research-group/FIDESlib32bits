@@ -44,7 +44,7 @@ void RNSPoly::grow(int new_level, bool single_malloc, bool constant) {
         //    GPU.at(cc.limbGPUid.at(i).x).generateLimb();
         //}
     } else {
-        //#pragma omp parallel for num_threads(GPU.size())
+        //#pragma omp parallel for num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
             //          OMP_ASSERT(omp_get_num_threads() == (int)GPU.size());
             if (!constant) {
@@ -102,7 +102,7 @@ int RNSPoly::getLevel() const {
 }
 
 void RNSPoly::freeSpecialLimbs() {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).freeSpecialLimbs();
@@ -111,7 +111,7 @@ void RNSPoly::freeSpecialLimbs() {
 }
 
 void RNSPoly::generateSpecialLimbs(const bool zero_out, const bool for_communication) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[i].generateSpecialLimb(zero_out, for_communication);
@@ -119,7 +119,7 @@ void RNSPoly::generateSpecialLimbs(const bool zero_out, const bool for_communica
 }
 
 void RNSPoly::generateDecompAndDigit(bool iskey, int q_band) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[i].generateAllDecompAndDigit(iskey, q_band);
@@ -128,7 +128,7 @@ void RNSPoly::generateDecompAndDigit(bool iskey, int q_band) {
 
 void RNSPoly::loadDecompDigit(const std::vector<std::vector<std::vector<uint64_t>>>& data,
                               const std::vector<std::vector<uint64_t>>& moduli) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).loadDecompDigit(data, moduli);
@@ -151,7 +151,7 @@ void RNSPoly::SetModUp(bool newValue) {
     modUp = newValue;
 }
 void RNSPoly::scaleByP() {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).scaleByP();
@@ -162,7 +162,7 @@ void RNSPoly::multNoModdownEnd(RNSPoly& c0, const RNSPoly& bc0, const RNSPoly& b
                                const RNSPoly& aux) {
     assert(in.isModUp());
     assert(aux.isModUp());
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).multNoModdownEnd(c0.GPU.at(i), bc0.GPU.at(i), bc1.GPU.at(i), in.GPU.at(i), aux.GPU.at(i));
@@ -180,7 +180,7 @@ void RNSPoly::binomialMult(RNSPoly& c1, RNSPoly& in, const RNSPoly& d0, const RN
         c1.generateSpecialLimbs(true, false);
     }
 
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).binomialMult(c1.GPU.at(i), in.GPU.at(i), d0.GPU.at(i), d1.GPU.at(i), !moddown, square);
@@ -197,7 +197,7 @@ void RNSPoly::binomialMultFrom(RNSPoly& c1, RNSPoly& in, const RNSPoly& a0, cons
     this->grow(a0.level);
     c1.dropToLevel(a0.level);
     c1.grow(a0.level);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).binomialMultFrom(c1.GPU.at(i), in.GPU.at(i), a0.GPU.at(i), a1.GPU.at(i), d0.GPU.at(i), d1.GPU.at(i),
@@ -213,7 +213,7 @@ void RNSPoly::copyScaledByP(const RNSPoly& src) {
     this->dropToLevel(src.level);
     this->grow(src.level);
     this->generateSpecialLimbs(true, false);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).copyScaledByP(src.GPU.at(i));
@@ -239,7 +239,7 @@ void RNSPoly::add(const RNSPoly& p) {
     }
     assert(p.isModUp() == this->isModUp());
     assert(level <= p.level);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).add(p.GPU.at(i), this->isModUp() || p.isModUp());
@@ -249,7 +249,7 @@ void RNSPoly::add(const RNSPoly& p) {
 
 void RNSPoly::sub(const RNSPoly& p) {
     assert(level <= p.level);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).sub(p.GPU.at(i));
@@ -281,7 +281,7 @@ void RNSPoly::modup() {
             GPU.at(i).modupMGPU(aux.GPU.at(i), buffergather, thread_stop, external_s);
         }
     } else {
-#pragma omp parallel num_threads(GPU.size())
+#pragma omp parallel num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
         {
             int i = omp_get_thread_num();
 
@@ -339,7 +339,7 @@ void RNSPoly::rescale() {
                     i.rescale();
             }
         } else {
-#pragma omp parallel num_threads(GPU.size())
+#pragma omp parallel num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
             {
 #pragma omp for
                 for (size_t i = 0; i < GPU.size(); ++i) {
@@ -417,7 +417,7 @@ void RNSPoly::rescaleDouble(RNSPoly& poly) {
                         GPU[i].doubleRescaleMGPU(poly.GPU[i]);
                 }
             } else {
-#pragma omp parallel num_threads(GPU.size())
+#pragma omp parallel num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
                 {
                     int i = omp_get_thread_num();
 
@@ -444,7 +444,7 @@ void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
             }
             --level;
         } else {
-#pragma omp parallel for num_threads(GPU.size())
+#pragma omp parallel for num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
             for (size_t i = 0; i < GPU.size(); ++i) {
                 assert(omp_get_num_threads() == (int)GPU.size());
                 GPU.at(i).multElement(p.GPU.at(i));
@@ -460,7 +460,7 @@ void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
                 for (auto& i : GPU)
                     i.rescale();
             } else {
-#pragma omp parallel for num_threads(GPU.size())
+#pragma omp parallel for num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
                 for (size_t i = 0; i < GPU.size(); ++i) {
                     assert(omp_get_num_threads() == (int)GPU.size());
                     GPU.at(i).rescaleMGPU();
@@ -469,7 +469,7 @@ void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
             --level;
         }
     } else {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
             assert(omp_get_num_threads() == (int)cc.GPUid.size());
             GPU.at(i).multElement(p.GPU.at(i));
@@ -479,7 +479,7 @@ void RNSPoly::multPt(const RNSPoly& p, bool rescale) {
 
 template <ALGO algo>
 void RNSPoly::NTT(int batch, bool sync) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).NTT<algo>(batch, sync);
@@ -494,7 +494,7 @@ void RNSPoly::NTT(int batch, bool sync) {
 
 template <ALGO algo>
 void RNSPoly::INTT(int batch, bool sync) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).INTT<algo>(batch, sync);
@@ -541,7 +541,7 @@ std::array<RNSPoly, 2> RNSPoly::dotKSK(const KeySwitchingKey& ksk) {
 */
 
 void RNSPoly::multElement(const RNSPoly& poly) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).multElement(poly.GPU.at(i));
@@ -549,7 +549,7 @@ void RNSPoly::multElement(const RNSPoly& poly) {
 }
 
 void RNSPoly::multElement(const RNSPoly& poly1, const RNSPoly& poly2) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).multElement(poly1.GPU.at(i), poly2.GPU.at(i));
@@ -559,7 +559,7 @@ void RNSPoly::multElement(const RNSPoly& poly1, const RNSPoly& poly2) {
 void RNSPoly::mult1AddMult23Add4(const RNSPoly& poly1, const RNSPoly& poly2, const RNSPoly& poly3,
                                  const RNSPoly& poly4) {
 
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).mult1AddMult23Add4(poly1.GPU.at(i), poly2.GPU.at(i), poly3.GPU.at(i), poly4.GPU.at(i));
@@ -567,7 +567,7 @@ void RNSPoly::mult1AddMult23Add4(const RNSPoly& poly1, const RNSPoly& poly2, con
 }
 
 void RNSPoly::mult1Add2(const RNSPoly& poly1, const RNSPoly& poly2) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).mult1Add2(poly1.GPU.at(i), poly2.GPU.at(i));
@@ -575,7 +575,7 @@ void RNSPoly::mult1Add2(const RNSPoly& poly1, const RNSPoly& poly2) {
 }
 
 void RNSPoly::dotKSKinto(RNSPoly& acc, const RNSPoly& ksk, const RNSPoly* limbsrc) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         acc.GPU.at(i).dotKSK(GPU.at(i), ksk.GPU.at(i), false, limbsrc ? &limbsrc->GPU.at(i) : nullptr);
@@ -641,7 +641,7 @@ void RNSPoly::moddown(bool ntt, bool free, int aux_num, bool rescale2) {
             bufferSpecial.push_back(aux.GPU[i].bufferSPECIAL);
         }
 
-#pragma omp parallel num_threads(GPU.size())
+#pragma omp parallel num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
         {
             int i = omp_get_thread_num();
 
@@ -679,7 +679,7 @@ void RNSPoly::automorph(const int idx, const int br, RNSPoly* src) {
     if (src && src->isModUp() && !this->isModUp()) {
         generateSpecialLimbs(false, false);
     }
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).automorph(k, br, src ? &src->GPU.at(i) : nullptr, src ? src->isModUp() : this->isModUp());
@@ -735,7 +735,7 @@ RNSPoly& RNSPoly::dotKSKInPlace(const KeySwitchingKey& ksk, RNSPoly* limb_src) {
 
 /*
 void RNSPoly::dotKSKInPlace(const RNSPoly& ksk_b, int level) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).dotKSK(GPU.at(i), ksk_b.GPU.at(i), level, true);
@@ -756,7 +756,7 @@ void RNSPoly::modupInto(RNSPoly& poly) {
         poly.copy(*this);
         poly.modup();
     } else {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
             assert(omp_get_num_threads() == (int)cc.GPUid.size());
             GPU.at(i).modupInto(poly.GPU.at(i), aux.GPU.at(i));
@@ -795,7 +795,7 @@ RNSPoly& RNSPoly::dotKSKInPlaceFrom(RNSPoly& poly, const KeySwitchingKey& ksk, c
     return cc.getKeySwitchAux2();
 }
 void RNSPoly::multScalar(std::vector<uint64_t>& vector1) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[i].multScalar(vector1);
@@ -813,7 +813,7 @@ void RNSPoly::add(const RNSPoly& a, const RNSPoly& b) {
 #endif
     assert(level <= a.level);
     assert(level <= b.level);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).add(a.GPU.at(i), b.GPU.at(i), a.isModUp(), b.isModUp());
@@ -822,28 +822,28 @@ void RNSPoly::add(const RNSPoly& a, const RNSPoly& b) {
     this->SetModUp(a.isModUp() || b.isModUp());
 }
 void RNSPoly::squareElement(const RNSPoly& poly) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).squareElement(poly.GPU.at(i));
     }
 }
 void RNSPoly::binomialSquareFold(RNSPoly& c0_res, const RNSPoly& c2_key_switched_0, const RNSPoly& c2_key_switched_1) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).binomialSquareFold(c0_res.GPU.at(i), c2_key_switched_0.GPU.at(i), c2_key_switched_1.GPU.at(i));
     }
 }
 void RNSPoly::addScalar(std::vector<uint64_t>& vector1) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[i].addScalar(vector1);
     }
 }
 void RNSPoly::subScalar(std::vector<uint64_t>& vector1) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[i].subScalar(vector1);
@@ -928,7 +928,7 @@ void RNSPoly::copy(const RNSPoly& poly) {
     //std::cout << "Copy level: " << poly.level << std::endl;
     this->dropToLevel(poly.level);
     this->grow(poly.level);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).copyLimb(poly.GPU.at(i));
@@ -941,7 +941,7 @@ void RNSPoly::copy(const RNSPoly& poly) {
 /** Copy contents without extra checks or resizing */
 void RNSPoly::copyShallow(const RNSPoly& poly) {
     this->level = poly.level;
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).copyLimb(poly.GPU.at(i));
@@ -964,7 +964,7 @@ void RNSPoly::dropToLevel(int level) {
 }
 void RNSPoly::addMult(const RNSPoly& poly, const RNSPoly& poly1) {
     assert(level <= poly1.level && level <= poly.level);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).addMult(poly.GPU.at(i), poly1.GPU.at(i));
@@ -1253,7 +1253,7 @@ void RNSPoly::broadcastLimb0() {
             GPU.at(i).broadcastLimb0();
         }
     } else {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
             assert(omp_get_num_threads() == (int)cc.GPUid.size());
             GPU.at(i).broadcastLimb0_mgpu();
@@ -1329,7 +1329,7 @@ void RNSPoly::coeffLiftCentered() {
         GPU.at(i).coeffLiftCentered(q0, q1, q0inv, Qhalf, Q0_mod_qi);
 }
 void RNSPoly::evalLinearWSum(uint32_t n, std::vector<const RNSPoly*>& vec, std::vector<uint64_t>& elem) {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         std::vector<const LimbPartition*> ps(n);
@@ -1345,7 +1345,7 @@ void RNSPoly::squareModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey&
     generateDecompAndDigit(false);
     c0.generateSpecialLimbs(false, false);
     c1.generateSpecialLimbs(false, false);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU.at(i).squareModupDotKSK(c1.GPU.at(i), c0.GPU.at(i), key.a.GPU.at(i), key.b.GPU.at(i));
@@ -1355,7 +1355,7 @@ void RNSPoly::squareModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey&
 }
 
 void RNSPoly::generatePartialSpecialLimbs() {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t i = 0; i < cc.GPUid.size(); ++i) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[i].generatePartialSpecialLimb();
@@ -1370,7 +1370,7 @@ void RNSPoly::dotKSKfused(RNSPoly& out2, const RNSPoly& digitSrc, const RNSPoly&
             out1.GPU[i].dotKSKfusedMGPU(out2.GPU[i], digitSrc.GPU[i], ksk_a.GPU[i], ksk_b.GPU[i], src.GPU[i]);
         }
     } else {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
         for (size_t i = 0; i < cc.GPUid.size(); ++i) {
             assert(omp_get_num_threads() == (int)cc.GPUid.size());
             out1.GPU[i].dotKSKfusedMGPU(out2.GPU[i], digitSrc.GPU[i], ksk_a.GPU[i], ksk_b.GPU[i], src.GPU[i]);
@@ -1386,7 +1386,7 @@ void RNSPoly::dotProductPt(RNSPoly& c1_, const std::vector<const RNSPoly*>& c0s_
         c1_.generateSpecialLimbs(false, false);
     }
     int n = pts_.size();
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t j = 0; j < cc.GPUid.size(); ++j) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         std::vector<const LimbPartition*> c0s(n, nullptr), c1s(n, nullptr), pts(n, nullptr);
@@ -1414,7 +1414,7 @@ void RNSPoly::dotProduct(RNSPoly& c1, const RNSPoly& kskb, const RNSPoly& kska, 
     c2.setLevel(c1.getLevel());
 
     int n = c0in.size();
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t j = 0; j < cc.GPUid.size(); ++j) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         std::vector<const LimbPartition*> c0s(n, nullptr), c1s(n, nullptr), d0s(n, nullptr), d1s(n, nullptr);
@@ -1460,7 +1460,7 @@ void RNSPoly::hoistedRotationFused(std::vector<int> indexes, std::vector<RNSPoly
     }
     //    assert(src_c0.isModUp() == false);
 
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t j = 0; j < cc.GPUid.size(); ++j) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         std::vector<LimbPartition*> c0s(n, nullptr), c1s(n, nullptr), ksk_as(n, nullptr), ksk_bs(n, nullptr);
@@ -1482,7 +1482,7 @@ void RNSPoly::hoistedRotationFused(std::vector<int> indexes, std::vector<RNSPoly
 
 /*
 void RNSPoly::generateGatherLimbs() {
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
     for (size_t j = 0; j < cc.GPUid.size(); ++j) {
         assert(omp_get_num_threads() == (int)cc.GPUid.size());
         GPU[j].generateGatherLimb(false);
@@ -1553,7 +1553,7 @@ RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool 
         }
 
         if (!MEMCPY_PEER || !GRAPH_CAPTURE) {
-#pragma omp parallel num_threads(GPU.size())
+#pragma omp parallel num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
             {
                 int j = omp_get_thread_num();
 
@@ -1567,7 +1567,7 @@ RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool 
             }
         } else {
 
-            //#pragma omp parallel num_threads(GPU.size())
+            //#pragma omp parallel num_threads(GPU.size()) if((FIDESlib::ompRegionsOn() || GPU.size() > 1))
             //{
             parallel_for(0, cc.GPUid.size(), 1, [&](int j) {
                 //for (int j = 0; j < cc.GPUid.size(); ++j) {
