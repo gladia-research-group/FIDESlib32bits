@@ -1,5 +1,5 @@
 //
-// FIDESLIB_BCONV2=1 (default off): a faster kernel for the key-switch ModUp base conversion (DecompAndModUpConv), same
+// FIDESLIB_BCONV2 (default 2; 0 restores the original kernels): a faster kernel for the key-switch ModUp base conversion (DecompAndModUpConv), same
 // tables and the same exact result (lazy reductions give the canonical residue in any order). One thread per
 // coefficient and 16 targets per block, 4 accumulated together; the block's matrix tile and the pre-scaled digit limbs
 // sit in shared memory instead of a per-MAC global matrix load and a serial chain over 2 threads per coefficient.
@@ -13,7 +13,7 @@
 
 namespace FIDESlib::CKKS {
 
-/** FIDESLIB_BCONV2 (default 0): 1 = the ModUp conversion, 2 = ModUp and ModDown (ModDown2) conversions. Settable at
+/** FIDESLIB_BCONV2 (default 2): 1 = the ModUp conversion, 2 = ModUp and ModDown (ModDown2) conversions, 0 = neither. Settable at
  *  run time for the bit-exactness gate. */
 bool modUpConv2On();
 int modUpConv2Level();
