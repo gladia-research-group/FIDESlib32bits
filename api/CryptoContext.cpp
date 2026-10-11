@@ -1118,6 +1118,14 @@ void CryptoContextImpl<DCRTPoly>::ForgetPrefetchedRaw(const void* key) {
 
 // A device plaintext is only read once loaded: its limbs' NTT scratch (aux, as large as the data) is released, ordered
 // after the load / encode on `after` (FIDESLIB_PT_SCRATCH=0 keeps it).
+static bool encode_nosync_on() {
+	static const bool v = [] {
+		const char* e = std::getenv("FIDESLIB_ENCODE_NOSYNC");
+		return e && std::atoi(e) > 0;
+	}();
+	return v;
+}
+
 static void release_pt_scratch(FIDESlib::CKKS::Plaintext& p, cudaStream_t after) {
 	static const bool on = [] {
 		const char* e = std::getenv("FIDESLIB_PT_SCRATCH");
@@ -1388,7 +1396,10 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 			                                       static_cast<int>(total_q_limbs(this->cpu) - cpu_pt->GetLevel()),
 			                                       cpu_pt->GetScalingFactor(),
 			                                       static_cast<int>(cpu_pt->GetNoiseScaleDeg()), cmax);
-			if (!plaintext_streams_enabled)
+			// FIDESLIB_ENCODE_NOSYNC=1: no host wait here. The encode's completion is already ordered on the
+			// plaintext's own stream (`ready`), which every consumer op waits on, and the scratch release below is
+			// event-ordered after it; the host only stalled until the GPU reached this encode.
+			if (!plaintext_streams_enabled && !encode_nosync_on())
 				cudaStreamSynchronize(ready);
 			release_pt_scratch(*gpu_pt, ready);
 		}
