@@ -78,6 +78,64 @@ __device__ __forceinline__ void modUpConv2Body(void** __restrict__ a, const int 
     }
 }
 
+// ModDown conversion P -> Q (the ModDown2 contract): K special limbs b[i] (prime ids L + i), targets a[j] with prime id
+// primeid_flattened[primeid_init + j]; every target is written.
+template <int CH>
+__global__ void __launch_bounds__(MU_BX, 8) modDownConv2_(void** __restrict__ a, const int __grid_constant__ n,
+                                                           void** __restrict__ b, const int __grid_constant__ primeid_init,
+                                                           const Global::Globals* Globals) {
+    const int m = C_.K;
+    const int k0 = blockIdx.y * MU_TG;
+    if (k0 >= n)
+        return;
+    const int kn = min(MU_TG, n - k0);
+    extern __shared__ uint32_t mu_smem[];
+    uint32_t* sy = mu_smem;
+    uint32_t* smat = mu_smem + m * MU_BX;
+    int* sdst = (int*)(smat + m * MU_TG);
+    const int tid = threadIdx.x;
+    for (int x = tid; x < m * MU_TG; x += MU_BX) {
+        const int i = x / MU_TG, k = x - i * MU_TG;
+        smat[x] = k < kn ? G_->ModDown_matrix32[MODDOWN_MATRIX(i, C_.primeid_flattened[primeid_init + k0 + k])] : 0u;
+    }
+    if (tid < MU_TG)
+        sdst[tid] = C_.primeid_flattened[primeid_init + k0 + (tid < kn ? tid : 0)];
+    const int idx = blockIdx.x * MU_BX + tid;
+    for (int i = 0; i < m; ++i) {
+        const int pi = C_.L + i;
+        sy[i * MU_BX + tid] =
+            modreduce_lazy((uint64_t)((const uint32_t*)b[i])[idx] * (uint32_t)G_->ModDown_pre_scale[pi], pi);
+    }
+    __syncthreads();
+    for (int k = 0; k < kn; k += 4) {
+        const int t0 = sdst[k], t1 = sdst[k + 1], t2 = sdst[k + 2], t3 = sdst[k + 3];
+        uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        for (int i0 = 0; i0 < m; i0 += CH) {
+#pragma unroll
+            for (int c = 0; c < CH; ++c) {
+                const int i = i0 + c;
+                if (i < m) {
+                    const uint64_t yi = sy[i * MU_BX + tid];
+                    const uint4 r = *(const uint4*)(smat + i * MU_TG + k);
+                    a0 += yi * r.x;
+                    a1 += yi * r.y;
+                    a2 += yi * r.z;
+                    a3 += yi * r.w;
+                }
+            }
+            a0 = modreduce_lazy(a0, t0);
+            a1 = modreduce_lazy(a1, t1);
+            a2 = modreduce_lazy(a2, t2);
+            a3 = modreduce_lazy(a3, t3);
+        }
+        const uint64_t acc[4] = {a0, a1, a2, a3};
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            if (k + q < kn)
+                ((uint32_t*)a[k0 + k + q])[idx] = (uint32_t)acc[q];
+    }
+}
+
 template <int CH>
 __global__ void __launch_bounds__(MU_BX, 8) modUpConv2_(void** __restrict__ a, const int __grid_constant__ n,
                                                          void** __restrict__ b, const int __grid_constant__ d,
@@ -117,6 +175,10 @@ bool modUpConv2On() {
     return g_on.load(std::memory_order_relaxed) > 0;
 }
 
+int modUpConv2Level() {
+    return g_on.load(std::memory_order_relaxed);
+}
+
 void setModUpConv2(int on) {
     g_on.store(on, std::memory_order_relaxed);
 }
@@ -146,6 +208,18 @@ void launchModUpConv2Multi(void*** atabs, int n, void*** btabs, const int* dids,
         case 4: modUpConv2Multi_<4><<<grid, MU_BX, smem, s>>>(atabs, n, btabs, dids, G); break;
         case 2: modUpConv2Multi_<2><<<grid, MU_BX, smem, s>>>(atabs, n, btabs, dids, G); break;
         default: modUpConv2Multi_<1><<<grid, MU_BX, smem, s>>>(atabs, n, btabs, dids, G); break;
+    }
+}
+
+void launchModDownConv2(void** a, int n, void** b, int primeid_init, const Global::Globals* G, const Constants& hc,
+                        cudaStream_t s) {
+    const dim3 grid{(uint32_t)hc.N / MU_BX, (uint32_t)std::max(1, (n + MU_TG - 1) / MU_TG)};
+    const size_t smem = smemFor(hc.K);
+    switch (chunkOf(hc)) {
+        case 8: modDownConv2_<8><<<grid, MU_BX, smem, s>>>(a, n, b, primeid_init, G); break;
+        case 4: modDownConv2_<4><<<grid, MU_BX, smem, s>>>(a, n, b, primeid_init, G); break;
+        case 2: modDownConv2_<2><<<grid, MU_BX, smem, s>>>(a, n, b, primeid_init, G); break;
+        default: modDownConv2_<1><<<grid, MU_BX, smem, s>>>(a, n, b, primeid_init, G); break;
     }
 }
 

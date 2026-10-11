@@ -1708,7 +1708,10 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 dim3 gridSize{(uint32_t)cc.N / blockSize.x};
                 int shared_bytes = sizeof(uint64_t) * (SPECIALlimb.size()) * blockSize.x;
                 if (limb_size > 0)
-                    ModDown2<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream.ptr()>>>(
+                    if (modUpConv2Level() >= 2 && cc.precom.constants[id].type == 0)
+                        launchModDownConv2(auxLimbs.limbptr.data, limb_size, auxLimbs.SPECIALlimbptr.data, PARTITION(id, 0), getGlobals(), cc.precom.constants[id], stream.ptr());
+                    else
+                        ModDown2<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream.ptr()>>>(
                         auxLimbs.limbptr.data, limb_size, auxLimbs.SPECIALlimbptr.data, PARTITION(id, 0), getGlobals());
             }
         }
@@ -2908,7 +2911,10 @@ void LimbPartition::moddownMGPU(LimbPartition& auxLimbs, bool ntt, bool free_spe
 
             dim3 gridSize{(uint32_t)cc.N / blockSize.x};
             int shared_bytes = sizeof(uint64_t) * (SPECIALlimb.size()) * blockSize.x;
-            ModDown2<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream.ptr()>>>(
+            if (modUpConv2Level() >= 2 && cc.precom.constants[id].type == 0)
+                launchModDownConv2(auxLimbs.limbptr.data, limb_size, auxLimbs.SPECIALlimbptr.data, PARTITION(id, 0), getGlobals(), cc.precom.constants[id], stream.ptr());
+            else
+                ModDown2<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream.ptr()>>>(
                 auxLimbs.limbptr.data, limb_size, auxLimbs.SPECIALlimbptr.data, PARTITION(id, 0), getGlobals());
             CudaCheckErrorModNoSync;
         }

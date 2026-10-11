@@ -13,8 +13,10 @@
 
 namespace FIDESlib::CKKS {
 
-/** FIDESLIB_BCONV2 (default 0), settable at run time for the bit-exactness gate. */
+/** FIDESLIB_BCONV2 (default 0): 1 = the ModUp conversion, 2 = ModUp and ModDown (ModDown2) conversions. Settable at
+ *  run time for the bit-exactness gate. */
 bool modUpConv2On();
+int modUpConv2Level();
 void setModUpConv2(int on);
 
 /** Drop-in for DecompAndModUpConv<<<N/64, {64,2}, 8*maxSize*64>>>(a, n, b, d, G): hc = this GPU's host constants. */
@@ -24,6 +26,11 @@ void launchModUpConv2(void** a, int n, void** b, int d, const Global::Globals* G
 /** Drop-in for DecompAndModUpConvMulti (digit = blockIdx.z here): dids_host mirrors the device digit-id table. */
 void launchModUpConv2Multi(void*** atabs, int n, void*** btabs, const int* dids, const int* dids_host, int ndig,
                            const Global::Globals* G, const Constants& hc, int maxSize, cudaStream_t s);
+
+/** Drop-in for ModDown2<<<N/64, {64,2}, 8*K*64>>>(a, n, b, primeid_init, G): the K special limbs b (coefficient form) ->
+ *  the n limbs a whose prime ids sit at primeid_flattened[primeid_init ...]. */
+void launchModDownConv2(void** a, int n, void** b, int primeid_init, const Global::Globals* G, const Constants& hc,
+                        cudaStream_t s);
 
 }  // namespace FIDESlib::CKKS
 

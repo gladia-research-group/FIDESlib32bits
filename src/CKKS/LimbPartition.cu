@@ -2507,7 +2507,10 @@ void LimbPartition::moddown(LimbPartition& auxLimbs, bool ntt, bool free_special
                     auxLimbs.limbptr.data, limbsize - 2, SPECIALlimbptr.data, limbptr.data + limbsize - 2,
                     PRIMEID(limb[limbsize - 1]), PARTITION(id, 0), getGlobals());
             } else {
-            ModDown2<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
+            if (modUpConv2Level() >= 2 && cc.precom.constants[id].type == 0)
+                launchModDownConv2(auxLimbs.limbptr.data, limbsize, SPECIALlimbptr.data, PARTITION(id, 0), getGlobals(), cc.precom.constants[id], s.ptr());
+            else
+                ModDown2<algo><<<gridSize, blockSize, shared_bytes, s.ptr()>>>(
                 auxLimbs.limbptr.data, limbsize, SPECIALlimbptr.data, PARTITION(id, 0), getGlobals());
             }
             if (discardD2Flag())
