@@ -68,12 +68,74 @@ std::map<std::string, std::shared_ptr<std::map<usint, lbcrypto::EvalKey<lbcrypto
 
 // FIDESLIB_NOCLONE=1: out-of-place wrappers whose result is fully overwritten (rotate, conjugate, the batch plaintext
 // products) get an empty level-matched result instead of a deep copy of the input; EvalAddMany drops its unused clone.
-static bool noClone() {
-	static const bool v = [] {
-		const char* e = std::getenv("FIDESLIB_NOCLONE");
+// FIDESLIB_CLONE_CENSUS=1 (diagnostic): every device clone (CopyDeviceCiphertext) counted per call stack (8 return
+// addresses, printed at exit as offsets in the containing module for addr2line) with its live limbs.
+#include <execinfo.h>
+#include <dlfcn.h>
+namespace {
+struct CloneCensus {
+	std::mutex mu;
+	std::map<std::vector<size_t>, std::pair<long, long>> sites;  // offsets -> (count, limbs)
+	std::string module;
+	~CloneCensus() {
+		std::lock_guard<std::mutex> g(mu);
+		long n = 0, l = 0;
+		for (auto& kv : sites) {
+			n += kv.second.first;
+			l += kv.second.second;
+		}
+		std::fprintf(stderr, "[clonecensus] module %s: %ld clones, %ld limb-copies x2 polys, %zu stacks\n", module.c_str(), n, l,
+					 sites.size());
+		for (auto& kv : sites) {
+			std::fprintf(stderr, "[clonecensus] %ld %ld", kv.second.first, kv.second.second);
+			for (size_t o : kv.first)
+				std::fprintf(stderr, " 0x%zx", o);
+			std::fprintf(stderr, "\n");
+		}
+	}
+};
+CloneCensus* cloneCensus() {
+	static const bool on = [] {
+		const char* e = std::getenv("FIDESLIB_CLONE_CENSUS");
 		return e && std::atoi(e) > 0;
 	}();
-	return v;
+	static CloneCensus c;
+	return on ? &c : nullptr;
+}
+void cloneCensusRecord(long limbs) {
+	CloneCensus* c = cloneCensus();
+	if (!c)
+		return;
+	void* bt[9];
+	const int k = backtrace(bt, 9);
+	std::vector<size_t> key;
+	for (int f = 1; f < k; ++f) {
+		Dl_info info{};
+		if (dladdr(bt[f], &info) && info.dli_fbase) {
+			key.push_back((size_t)((char*)bt[f] - (char*)info.dli_fbase));
+			if (f == 1 && c->module.empty() && info.dli_fname)
+				c->module = info.dli_fname;
+		} else
+			key.push_back(0);
+	}
+	std::lock_guard<std::mutex> g(c->mu);
+	auto& e = c->sites[key];
+	e.first++;
+	e.second += limbs;
+}
+}  // namespace
+
+static std::atomic<int> g_noCloneLevel{ [] {
+	const char* e = std::getenv("FIDESLIB_NOCLONE");
+	return e ? std::atoi(e) : 0;
+}() };
+static int noCloneLevel() {
+	return g_noCloneLevel.load(std::memory_order_relaxed);
+}
+// level 1: rotate / conjugate / batch products / EvalAddMany; level 2 adds write-once EvalAdd(ct, ct), EvalMult(ct, ct),
+// EvalMult(ct, pt) and EvalSquare (Ciphertext::addInto / multInto / multPtInto, each falling back to clone + in-place)
+static bool noClone() {
+	return noCloneLevel() > 0;
 }
 
 namespace fideslib {
@@ -2289,6 +2351,17 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalAdd(const Ciphertext<DCRTP
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct1));
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct2));
 
+	if (noCloneLevel() >= 2) {	 // FIDESLIB_NOCLONE=2: write ct1 + ct2 once instead of clone + add
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct1);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct1_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct1->gpu));
+		auto ct2_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct2->gpu));
+		if (!res_gpu->addInto(*ct1_gpu, *ct2_gpu)) {
+			res_gpu->copy(*ct1_gpu);
+			res_gpu->add(*ct2_gpu);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto ct2_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct2->gpu));
@@ -2748,6 +2821,17 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRT
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct1));
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct2));
 
+	if (noCloneLevel() >= 2) {	 // FIDESLIB_NOCLONE=2: ct1 * ct2 from both sources, no clone of ct1
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct1);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct1_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct1->gpu));
+		auto ct2_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct2->gpu));
+		if (!res_gpu->multInto(*ct1_gpu, *ct2_gpu)) {
+			res_gpu->copy(*ct1_gpu);
+			res_gpu->mult(*ct2_gpu);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto ct2_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct2->gpu));
@@ -2775,6 +2859,17 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMult(const Ciphertext<DCRT
 	this->LoadPlaintext(pt);
 	this->WaitPlaintextReady(pt->gpu);
 
+	if (noCloneLevel() >= 2) {	 // FIDESLIB_NOCLONE=2: write ct1 * pt once instead of clone + multPt
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct1);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto ct1_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct1->gpu));
+		auto pt_gpu  = std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(this->GetDevicePlaintext(pt->gpu));
+		if (!res_gpu->multPtInto(*ct1_gpu, *pt_gpu)) {
+			res_gpu->copy(*ct1_gpu);
+			res_gpu->multPt(*pt_gpu);
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct1);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	auto pt_gpu					= std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(this->GetDevicePlaintext(pt->gpu));
@@ -3147,6 +3242,16 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSquare(const Ciphertext<DC
 	// GPU path.
 	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
 
+	if (noCloneLevel() >= 2) {	 // FIDESLIB_NOCLONE=2: ct^2 from the source, no clone
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(ct);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		auto src_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu));
+		if (!res_gpu->multInto(*src_gpu, *src_gpu)) {
+			res_gpu->copy(*src_gpu);
+			res_gpu->square();
+		}
+		return result;
+	}
 	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ct);
 	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
 	res_gpu->square();
@@ -3706,6 +3811,7 @@ uint32_t CryptoContextImpl<DCRTPoly>::CopyDeviceCiphertext(const CiphertextImpl<
 
 	auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
 	auto ct_gpu		  = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct.gpu));
+	cloneCensusRecord(ct_gpu->getLevel() + 1);
 	auto new_ct		  = std::make_shared<FIDESlib::CKKS::Ciphertext>(context_gpu);
 	new_ct->copy(*ct_gpu);
 	uint32_t handle = this->RegisterDeviceCiphertext(std::move(new_ct));
@@ -3881,3 +3987,8 @@ std::vector<int> CryptoContextImpl<DCRTPoly>::GetConvolutionTransformRotationInd
 }
 
 } // namespace fideslib
+
+// test hook: switch FIDESLIB_NOCLONE at run time (bit-exactness gates compare both levels in one process)
+void fideslib::SetNoCloneLevelForTest(int level) {
+	g_noCloneLevel.store(level, std::memory_order_relaxed);
+}

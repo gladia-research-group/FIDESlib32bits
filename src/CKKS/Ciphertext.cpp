@@ -1553,22 +1553,65 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 	}
 }
 
+bool Ciphertext::multInto(const Ciphertext& b, const Ciphertext& c) {
+	if (this == &b || this == &c || b.NoiseLevel != 1 || c.NoiseLevel != 1 || b.getLevel() != c.getLevel() ||
+	    b.keyID != c.keyID || cc.GPUid.size() != 1 || fusedRescaleFlag())
+		return false;
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULT]++;
+	KeySwitchingKey& kskEval = cc.GetEvalKey(b.keyID);
+	RNSPoly& in = cc.getKeySwitchAux();
+	in.setLevel(b.c1.getLevel());
+	c0.binomialMultFrom(c1, in, b.c0, b.c1, c.c0, c.c1, &b == &c);
+	RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, true);
+	c0.add(aux);
+	c1.add(in);
+	this->multMetadata(b, c);
+	return true;
+}
+
+bool Ciphertext::addInto(const Ciphertext& a, const Ciphertext& b) {
+	if (this == &a || this == &b || a.keyID != b.keyID || a.getLevel() != b.getLevel() || a.NoiseLevel != b.NoiseLevel ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::ADD]++;
+	c0.dropToLevel(a.getLevel());
+	c1.dropToLevel(a.getLevel());
+	c0.grow(a.getLevel());
+	c1.grow(a.getLevel());
+	c0.add(a.c0, b.c0);
+	c1.add(a.c1, b.c1);
+	this->copyMetadata(a);
+	this->addMetadata(*this, b);
+	return true;
+}
+
+bool Ciphertext::multPtInto(const Ciphertext& c, const Plaintext& pt) {
+	if (this == &c || c.NoiseLevel != 1 || pt.NoiseLevel != 1 || pt.c0.getLevel() != c.getLevel() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULTPT]++;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	c0.multElement(c.c0, pt.c0);
+	c1.multElement(c.c1, pt.c0);
+	this->copyMetadata(c);
+	this->multMetadata(*this, pt);
+	return true;
+}
+
 void Ciphertext::mult(const Ciphertext& b, const Ciphertext& c, bool rescale) {
 	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	// Lever E1: out-of-place relinearised product, no copy of an operand into *this first.
-	if (pwFuseFlag() && this != &b && this != &c && b.NoiseLevel == 1 && c.NoiseLevel == 1 &&
-	    b.getLevel() == c.getLevel() && b.keyID == c.keyID && cc.GPUid.size() == 1 && !fusedRescaleFlag()) {
-		CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
-		CKKS::SetCurrentContext(cc_);
-		op_count[OPS::MULT]++;
-		KeySwitchingKey& kskEval = cc.GetEvalKey(b.keyID);
-		RNSPoly& in = cc.getKeySwitchAux();
-		in.setLevel(b.c1.getLevel());
-		c0.binomialMultFrom(c1, in, b.c0, b.c1, c.c0, c.c1, &b == &c);
-		RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, true);
-		c0.add(aux);
-		c1.add(in);
-		this->multMetadata(b, c);
+	if (pwFuseFlag() && multInto(b, c)) {
 		if (rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL)
 			this->rescale();
 		return;
