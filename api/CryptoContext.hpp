@@ -21,6 +21,9 @@
 #include "Serialize.hpp"
 
 namespace fideslib {
+/// Test hook: set FIDESLIB_NOCLONE (0, 1, 2) at run time.
+void SetNoCloneLevelForTest(int level);
+
 
 /// @brief Specialization of CryptoContext for the DCRTPoly representation.
 template <> class CryptoContextImpl<DCRTPoly> {

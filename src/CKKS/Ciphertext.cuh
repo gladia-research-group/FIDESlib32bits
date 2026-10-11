@@ -426,6 +426,12 @@ class Ciphertext {
     void rotate(const Ciphertext& c, const int index);
     /// rotate(index) of `c` into this (c != this) without first copying c: the hoisted path reads c.c0 in place.
     void rotateFrom(const Ciphertext& c, const int index);
+    /// Write-once out-of-place ops for the API wrappers (FIDESLIB_NOCLONE=2): this <- b * c, a + b, c * pt without first
+    /// cloning an operand. Each runs only when the in-place op would make no level / scale adjustment (same level, both
+    /// at noise level 1 for products, equal noise levels for the sum) and returns false otherwise, writing nothing.
+    bool multInto(const Ciphertext& b, const Ciphertext& c);
+    bool addInto(const Ciphertext& a, const Ciphertext& b);
+    bool multPtInto(const Ciphertext& c, const Plaintext& pt);
 
     /**
      * @brief Computes the complex conjugate of ciphertext `c` and stores it in *this*.
