@@ -143,6 +143,10 @@ static bool noClone() {
 	return noCloneLevel() > 0;
 }
 
+namespace FIDESlib {
+void ForgetDevicePlaintextDump(uint32_t handle);   // api/CryptoContext.cpp (bottom): drop a pending device dump
+}
+
 namespace fideslib {
 
 static std::vector<FIDESlib::PrimeRecord> p64{ { .p = 2305843009218281473 },
@@ -4196,4 +4200,16 @@ std::vector<int> CryptoContextImpl<DCRTPoly>::GetConvolutionTransformRotationInd
 // test hook: switch FIDESLIB_NOCLONE at run time (bit-exactness gates compare both levels in one process)
 void fideslib::SetNoCloneLevelForTest(int level) {
 	g_noCloneLevel.store(level, std::memory_order_relaxed);
+}
+
+// A device encode that is about to be erased (a per-step mask) needs no host dump: drop it from the undumped set so
+// the eviction frees the device copy without the 2 x D2H + stream syncs of dump_device_plaintext_locked.
+void FIDESlib::ForgetDevicePlaintextDump(uint32_t handle) {
+	std::lock_guard<std::mutex> g(fideslib::g_dump_mutex);
+	auto u = fideslib::g_undumped.find(handle);
+	if (u == fideslib::g_undumped.end())
+		return;
+	if (u->second.second)
+		fideslib::g_cmax_free.push_back(u->second.second);
+	fideslib::g_undumped.erase(u);
 }
