@@ -12,6 +12,7 @@
 #include "CKKS/SmallInt.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/DeviceEncode.cuh"
+#include "CKKS/GpuEncrypt.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/LinearTransform.cuh"
 #include "CKKS/Parameters.cuh"
@@ -28,6 +29,8 @@
 #include "lattice/hal/lat-backend.h"
 
 #include <any>
+#include <tuple>
+#include <map>
 #include <atomic>
 #include <optional>
 #include <cmath>
@@ -2032,10 +2035,109 @@ CryptoContextImpl<DCRTPoly>::MakeCKKSPackedPlaintext(const std::vector<double>& 
 
 // ---- Encryption ----
 
+namespace {
+// FIDESLIB_GPU_ENCRYPT: the device public key (rebuilt when the key changes) and, per plaintext shape, the device
+// ciphertext and metadata-only host shell of its first (host) encryption, which later encryptions copy the
+// metadata of. The sampler key comes from the OS entropy pool; the nonce counts encryptions.
+struct GpuEncryptState {
+	std::mutex mu;
+	const void* pk_id = nullptr;
+	std::shared_ptr<FIDESlib::CKKS::Ciphertext> pk;
+	std::map<std::tuple<uint32_t, size_t, double, uint32_t>,
+			 std::pair<std::shared_ptr<FIDESlib::CKKS::Ciphertext>, lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>>
+	  shapes;
+	uint32_t key[8];
+	uint64_t nonce = 0;
+	double sigma   = 0;
+	bool off	   = false;   // a public key over fewer towers than the ciphertexts' basis: host path
+};
+}  // namespace
+
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Encrypt(Plaintext& pt, const PublicKey<DCRTPoly>& pk) {
 
 	auto& context	   = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
 	const auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(pk->pimpl);
+
+	// Device path: the same encryption as the host's (EncryptZeroCore), the plaintext encoded on the device.
+	const bool genc = !this->devices.empty() && this->devices.size() == 1 && this->loaded &&
+					  this->auto_load_ciphertexts && FIDESlib::CKKS::gpuEncryptOn();
+	GpuEncryptState* st = nullptr;
+	std::tuple<uint32_t, size_t, double, uint32_t> shape;
+	if (genc) {
+		if (!gpu_encrypt_state)
+			gpu_encrypt_state = std::make_shared<GpuEncryptState>();
+		st				   = static_cast<GpuEncryptState*>(gpu_encrypt_state.get());
+		const auto& ptHost = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
+		shape = { (uint32_t)ptHost->GetLevel(), ptHost->GetNoiseScaleDeg(), ptHost->GetScalingFactor(),
+				  (uint32_t)ptHost->GetSlots() };
+		std::lock_guard<std::mutex> lk(st->mu);
+		auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+		if (st->pk_id != pkImpl.get()) {
+			st->pk_id = pkImpl.get();
+			st->shapes.clear();
+			st->pk.reset();
+			st->off = pkImpl->GetPublicElements()[0].GetNumOfElements() <
+					  context->GetCryptoParameters()->GetElementParams()->GetParams().size();
+		}
+		if (!st->off && !st->pk) {
+			// (pk0, pk1) as a level-0 ciphertext: the same import as any host ciphertext. A key over a wider basis
+			// (Q P) keeps its first |Q| towers, as EncryptZeroCore does.
+			auto shell = std::make_shared<lbcrypto::CiphertextImpl<lbcrypto::DCRTPoly>>(pkImpl);
+			auto p0 = pkImpl->GetPublicElements()[0].Clone(), p1 = pkImpl->GetPublicElements()[1].Clone();
+			const size_t sizeQ = context->GetCryptoParameters()->GetElementParams()->GetParams().size();
+			if (p0.GetNumOfElements() > sizeQ) {
+				p0.DropLastElements(p0.GetNumOfElements() - sizeQ);
+				p1.DropLastElements(p1.GetNumOfElements() - sizeQ);
+			}
+			shell->SetElements({ std::move(p0), std::move(p1) });
+			shell->SetLevel(0);
+			shell->SetNoiseScaleDeg(1);
+			shell->SetSlots(context->GetRingDimension() / 2);
+			auto raw = FIDESlib::CKKS::GetRawCipherText(context, shell);
+			st->pk	 = std::make_shared<FIDESlib::CKKS::Ciphertext>(context_gpu, raw);
+			std::random_device rd;
+			for (auto& w : st->key)
+				w = rd();
+			const auto cp = std::dynamic_pointer_cast<lbcrypto::CryptoParametersRLWE<lbcrypto::DCRTPoly>>(
+			  context->GetCryptoParameters());
+			st->sigma = cp->GetDistributionParameter();
+		}
+		auto it = st->off ? st->shapes.end() : st->shapes.find(shape);
+		static const bool dbg = std::getenv("FIDESLIB_GPU_ENCRYPT_DEBUG") != nullptr;
+		if (dbg)
+			std::fprintf(stderr, "[genc] shape level %u nsd %zu scale %g slots %u: %s (off %d, %zu shapes)\n",
+						 std::get<0>(shape), std::get<1>(shape), std::get<2>(shape), std::get<3>(shape),
+						 it != st->shapes.end() ? "device" : "host", (int)st->off, st->shapes.size());
+		if (it != st->shapes.end()) {
+			auto t0	 = std::chrono::steady_clock::now();
+			auto lap = [&](const char* what) {
+				if (!dbg)
+					return;
+				cudaDeviceSynchronize();
+				auto t1 = std::chrono::steady_clock::now();
+				std::fprintf(stderr, "[genc]   %s %.3f ms\n", what, std::chrono::duration<double, std::milli>(t1 - t0).count());
+				t0 = t1;
+			};
+			auto gct = std::make_shared<FIDESlib::CKKS::Ciphertext>(context_gpu);
+			gct->copy(*it->second.first);
+			lap("copy");
+			FIDESlib::CKKS::encryptZeroDevice(*gct, *st->pk, st->key, st->nonce++, st->sigma);
+			lap("enc0");
+			this->LoadPlaintext(pt);
+			this->WaitPlaintextReady(pt->gpu);
+			lap("load pt");
+			auto pt_gpu = std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(this->GetDevicePlaintext(pt->gpu));
+			gct->addPt(*pt_gpu);
+			lap("add pt");
+			Ciphertext<DCRTPoly> ciphertext = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+			ciphertext->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(it->second.second->CloneEmpty());
+			ciphertext->gpu	= this->RegisterDeviceCiphertext(std::move(gct));
+			ciphertext->loaded		   = true;
+			ciphertext->original_level = this->multiplicative_depth - ciphertext->GetLevel();
+			return ciphertext;
+		}
+	}
+
 	host_encode(pt);
 	const auto& ptImpl = std::any_cast<lbcrypto::Plaintext&>(pt->cpu);
 
@@ -2048,6 +2150,14 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Encrypt(Plaintext& pt, const P
 	}
 
 	this->LoadCiphertext(ciphertext);
+
+	if (genc && !st->off) {
+		auto& context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+		auto tmpl		  = std::make_shared<FIDESlib::CKKS::Ciphertext>(context_gpu);
+		tmpl->copy(*std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu)));
+		std::lock_guard<std::mutex> lk(st->mu);
+		st->shapes[shape] = { std::move(tmpl), ct->CloneEmpty() };
+	}
 
 	return ciphertext;
 }

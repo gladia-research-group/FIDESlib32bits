@@ -450,6 +450,10 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void Synchronize() const;
 
 	static std::vector<int> GetConvolutionTransformRotationIndices(int rowSize, int bStep, int stride, uint32_t gStep);
+
+	/// @brief FIDESLIB_GPU_ENCRYPT state (device public key, per-plaintext-shape metadata, sampler key); opaque.
+	/// Declared last so it is destroyed before the device context it holds memory of.
+	std::shared_ptr<void> gpu_encrypt_state;
 };
 
 /// @brief Kick off the pinned stage-arena allocations (2 × FHE_STAGE_ARENA_GB) on a background
