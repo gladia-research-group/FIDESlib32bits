@@ -69,6 +69,10 @@ class BootstrapPrecomputation {
     std::vector<LTstep> CtS;
     int accumulate_bStep = 4;
     uint32_t correctionFactor;
+    /// Per-route EvalMod K and series (0 / empty: the context's)
+    double bootK = 0;
+    std::vector<double> evalModCheb;
+    int evalModDaIts = 0;
     bool sparse_encaps{false};
     std::weak_ptr<ContextData> sparse_context;
     // COMPOSITESCALING (d>1): the sparse-encapsulation raise cannot run in the single-tower
