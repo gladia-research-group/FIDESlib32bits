@@ -492,6 +492,50 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
 	this->loaded = true;
 }
 
+void CryptoContextImpl<DCRTPoly>::AddBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots) {
+	if (!this->loaded || this->devices.empty())
+		return;
+	auto& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	if (c->HasBootPrecomputation(slots))
+		return;
+	auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
+	// the route needs full keys: drop any it shares with the (possibly banded) model keys, so they reload full
+	{
+		const std::string keyID = pkImpl->GetKeyTag();
+		cudaDeviceSynchronize();
+		for (int i : FIDESlib::CKKS::GetBootstrapIndexes(pkImpl->GetCryptoContext(), slots, nullptr))
+			if (c->HasRotationKey(i, keyID))
+				c->RemoveRotationKey(i, keyID);
+	}
+	FIDESlib::CKKS::AddBootstrapPrecomputation(pkImpl, slots, c);
+	c->ReleaseScratchOf(c->GetBootPrecomputationBase(slots));
+}
+
+size_t CryptoContextImpl<DCRTPoly>::DropBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots) {
+	if (!this->loaded || this->devices.empty())
+		return 0;
+	auto& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	if (!c->HasBootPrecomputation(slots))
+		return 0;
+	auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
+	auto cpu_cc	 = pkImpl->GetCryptoContext();
+	auto fhe	 = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cpu_cc->GetScheme()->m_FHE);
+	std::vector<int> idx = FIDESlib::CKKS::GetBootstrapIndexes(cpu_cc, slots, nullptr);
+	c->RemoveBootPrecomputation(slots);
+	if (fhe)
+		fhe->m_bootPrecomMap.erase(static_cast<uint32_t>(slots));
+	const int half = c->N / 2;
+	auto norm = [half](int i) { i %= half; if (i < 0) i += half; return i; };
+	std::set<int> model;
+	for (int r : this->rotation_indexes)
+		model.insert(norm(r));
+	std::vector<int> steps;
+	for (int i : idx)
+		if (!model.count(norm(i)))
+			steps.push_back(i);
+	return FreeRotationKeys(steps, publicKey);
+}
+
 size_t CryptoContextImpl<DCRTPoly>::FreeRotationKeys(const std::vector<int>& steps,
                                                      const PublicKey<DCRTPoly>& publicKey) {
 	if (!this->loaded || this->devices.empty())
@@ -1611,12 +1655,13 @@ void CryptoContextImpl<DCRTPoly>::EvalRotateKeyGen(const PrivateKey<DCRTPoly>& s
 
 void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>& levelBudget, std::vector<uint32_t> dim1, uint32_t slots, uint32_t correctionFactor) {
 
-	// Only before loading one must compute the bootstrapping auxiliary data.
-	if (!this->devices.empty() && this->loaded) {
-		OPENFHE_THROW("EvalBootstrapSetup must be called before LoadContext");
-	}
-
 	auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+	// after loading: only a new route (AddBootstrapRoute)
+	if (!this->devices.empty() && this->loaded) {
+		auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
+		if (!fhe || fhe->m_bootPrecomMap.count(slots))
+			OPENFHE_THROW("EvalBootstrapSetup must be called before LoadContext (after it: only a new route)");
+	}
 
 	std::vector<double> coeffchebyshev;
 	int doubleAngleIts = 3;
@@ -1662,8 +1707,10 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
 
 void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>& sk, uint32_t slots) {
 
-	if (!this->devices.empty() && this->loaded) {
-		OPENFHE_THROW("EvalBootstrapKeyGen must be called before LoadContext");
+	// after loading: only a new route's keys (AddBootstrapRoute)
+	if (!this->devices.empty() && this->loaded &&
+	    std::any_cast<FIDESlib::CKKS::Context&>(this->gpu)->HasBootPrecomputation(static_cast<int>(slots))) {
+		OPENFHE_THROW("EvalBootstrapKeyGen must be called before LoadContext (after it: only a new route)");
 	}
 
 	auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);

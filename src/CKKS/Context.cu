@@ -642,6 +642,11 @@ int ContextData::GetBootK() {
     return param.raw ? param.raw->bootK : 1;
 }
 
+void ContextData::RemoveBootPrecomputation(int slots) {
+    cudaDeviceSynchronize();
+    precom.boot.erase(slots);
+}
+
 bool ContextData::HasBootPrecomputation(int slots) {
 
     return precom.boot.contains(slots);
