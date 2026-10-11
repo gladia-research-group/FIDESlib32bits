@@ -19,7 +19,7 @@ constexpr int kCdt = 48;                       // |x| <= 47 for sigma ~3.2: the 
 
 std::atomic<int> g_on{[] {
     const char* e = std::getenv("FIDESLIB_GPU_ENCRYPT");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 1;
 }()};
 
 // cdt[k] = 2^64 * P(|x| <= k) for P(x) ~ exp(-x^2 / (2 sigma^2)), saturated; |x| = first k with u < cdt[k].

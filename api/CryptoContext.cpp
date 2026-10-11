@@ -130,12 +130,12 @@ void cloneCensusRecord(long limbs) {
 
 static std::atomic<int> g_noCloneLevel{ [] {
 	const char* e = std::getenv("FIDESLIB_NOCLONE");
-	return e ? std::atoi(e) : 0;
+	return e ? std::atoi(e) : 2;
 }() };
 static int noCloneLevel() {
 	return g_noCloneLevel.load(std::memory_order_relaxed);
 }
-// level 1: rotate / conjugate / batch products / EvalAddMany; level 2 adds write-once EvalAdd(ct, ct), EvalMult(ct, ct),
+// Default 2 (0 restores the clone-first wrappers). level 1: rotate / conjugate / batch products / EvalAddMany; level 2 adds write-once EvalAdd(ct, ct), EvalMult(ct, ct),
 // EvalMult(ct, pt) and EvalSquare (Ciphertext::addInto / multInto / multPtInto, each falling back to clone + in-place);
 // level 3 adds EvalSub(ct, ct), EvalMult / EvalAdd / EvalSub with a scalar (subInto / multScalarInto / addScalarInto) and
 // the fast rotations' empty results
