@@ -14,7 +14,7 @@ constexpr int MU_BX = 128;   // coefficients per block
 
 std::atomic<int> g_on{[] {
     const char* e = std::getenv("FIDESLIB_BCONV2");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 2;
 }()};
 
 // Body for digit d at n live limbs; writes target j only where the original does (primeid_j < n or a special prime).
