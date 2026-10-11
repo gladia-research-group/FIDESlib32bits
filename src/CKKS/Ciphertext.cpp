@@ -846,6 +846,76 @@ void Ciphertext::multAccumulateBatch(const std::vector<const Ciphertext*>& a, co
 	// same-scale products leaves it unchanged (exactly as the serial inplace_add chain).
 }
 
+bool Ciphertext::multAccumulateChecked(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b) {
+	LockstepGuard lockstepGuard_;  // one relinearizing op, like mult
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(a.size() == b.size());
+	assert(!a.empty());
+	if (NoiseLevel != 2)
+		return false;
+
+	// Mirror serial Ciphertext::mult's head EXACTLY, per lane, on COPIES (the persistent
+	// cache lanes must not change level — graph names embed it): adjustForMult carries the
+	// FLEXIBLEAUTO scalar scale-corrections a plain rescale/drop would miss.
+	std::vector<std::unique_ptr<Ciphertext>> adjusted;
+	std::vector<const Ciphertext*> aa(a), bb(b);
+	for (size_t j = 0; j < aa.size(); ++j) {
+		const Ciphertext* pa = aa[j];
+		const Ciphertext* pb = bb[j];
+		if (pa->NoiseLevel == 1 && pb->NoiseLevel == 1 && pa->getLevel() == getLevel() &&
+		    pb->getLevel() == getLevel())
+			continue;
+		auto ta = std::make_unique<Ciphertext>(cc_);
+		ta->copy(*pa);
+		if (!ta->adjustForMult(*pb)) {
+			auto tb = std::make_unique<Ciphertext>(cc_);
+			tb->copy(*pb);
+			tb->adjustForMult(*ta);
+			ta->adjustForMult(*tb);   // serial mult re-enters and adjusts once more
+			bb[j] = tb.get();
+			adjusted.push_back(std::move(tb));
+		}
+		aa[j] = ta.get();
+		adjusted.push_back(std::move(ta));
+	}
+
+	for (size_t j = 0; j < aa.size(); ++j) {
+		const double nf = aa[j]->NoiseFactor * bb[j]->NoiseFactor;
+		if (aa[j]->NoiseLevel != 1 || bb[j]->NoiseLevel != 1 || aa[j]->getLevel() != getLevel() ||
+		    bb[j]->getLevel() != getLevel() || keyID != aa[j]->keyID || keyID != bb[j]->keyID ||
+		    !(nf > NoiseFactor * (1 - 1e-9) && nf < NoiseFactor * (1 + 1e-9)))
+			return false;
+	}
+	op_count[OPS::MULT] += static_cast<int>(aa.size());
+
+	KeySwitchingKey& kskEval = cc.GetEvalKey(keyID);
+
+	RNSPoly& in = cc.getKeySwitchAux();
+	in.setLevel(c1.getLevel());
+
+	std::vector<const RNSPoly*> a0, a1, b0, b1;
+	a0.reserve(aa.size());
+	a1.reserve(aa.size());
+	b0.reserve(aa.size());
+	b1.reserve(aa.size());
+	for (size_t j = 0; j < aa.size(); ++j) {
+		a0.push_back(&aa[j]->c0);
+		a1.push_back(&aa[j]->c1);
+		b0.push_back(&bb[j]->c0);
+		b1.push_back(&bb[j]->c1);
+	}
+
+	RNSPoly::binomialMultAccumBatch(c0, c1, in, a0, a1, b0, b1);
+
+	RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, /*moddown=*/true);
+	c0.add(aux);
+	c1.add(in);
+	// Metadata: the seed already carries the product NoiseFactor/NoiseLevel/slots; adding
+	// same-scale products leaves it unchanged (exactly as the serial inplace_add chain).
+	return true;
+}
+
 void Ciphertext::square(bool rescale) {
 	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
