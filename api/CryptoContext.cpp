@@ -7,6 +7,7 @@
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Bootstrap.cuh"
 #include "CKKS/Ciphertext.cuh"
+#include "CKKS/CoeffRows.cuh"
 #include "CKKS/AksKeys.cuh"
 #include "CKKS/SmallInt.cuh"
 #include "CKKS/Context.cuh"
@@ -2862,6 +2863,33 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultPtSumEncode(
 			          << " ms (n=" << vals.size() << ", limbs=" << limbs << ")\n";
 	}
 	return out;
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultCoeffRowsSum(const std::vector<Ciphertext<DCRTPoly>>& cts,
+                                                                     const float* rows, size_t rowStride) {
+	if (this->devices.empty())
+		OPENFHE_THROW("EvalMultCoeffRowsSum: GPU-only");
+	if (cts.empty() || !rows)
+		OPENFHE_THROW("EvalMultCoeffRowsSum: empty input");
+	for (auto& ct : cts)
+		this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+	const uint32_t lvl = static_cast<uint32_t>(cts[0]->GetLevel());
+	const double scale = ScalingFactorReal(lvl);
+	std::vector<const FIDESlib::CKKS::Ciphertext*> in;
+	in.reserve(cts.size());
+	for (auto& ct : cts) {
+		if (static_cast<uint32_t>(ct->GetLevel()) != lvl)
+			OPENFHE_THROW("EvalMultCoeffRowsSum: ciphertexts at different levels");
+		in.push_back(std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ct->gpu)).get());
+	}
+	Ciphertext<DCRTPoly> out = this->MakeGpuResultLike(cts[0]);
+	auto out_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(out->gpu));
+	FIDESlib::CKKS::multCoeffRowsSum(*out_gpu, in, rows, rowStride, scale);
+	return out;
+}
+
+unsigned long long CryptoContextImpl<DCRTPoly>::CoeffRowsOverflows() const {
+	return FIDESlib::CKKS::coeffRowsOverflows();
 }
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultPtSumEncodeRaw(const std::vector<Ciphertext<DCRTPoly>>& cts,

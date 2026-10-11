@@ -30,7 +30,7 @@ namespace ntc {
 template <bool INVERSE>
 __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
     ntt_cluster_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
-                 void** __restrict__ res) {
+                 void** __restrict__ res, const int __grid_constant__ period) {
     __shared__ __align__(16) T region[REG_I2 * 2];  // 4 tiles x 2048 u32 = 32 KB: pass-1 output / working tiles
     __shared__ T psi[BD], psi_sh[BD];
 
@@ -45,7 +45,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
     const T* in = (const T*)dat[limb];
     T* out = (T*)res[limb];
     const bool hole = (in == nullptr);  // whole cluster sees the same row: uniform
-    const int primeid = hole ? 0 : C_.primeid_flattened[primeid_init + limb];
+    const int primeid = hole ? 0 : C_.primeid_flattened[primeid_init + (period > 0 ? limb % period : limb)];
 
     if (!hole) {
         if (threadIdx.x < BD) {
@@ -172,14 +172,14 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
 }  // namespace ntc
 
 void launchNTTcluster(const Global::Globals* Globals, bool inverse, void** dat, int primeid_init, void** res, int nlimbs,
-                      cudaStream_t s) {
+                      cudaStream_t s, int period) {
     if (nlimbs <= 0)
         return;
     const dim3 grid((unsigned)(ntc::CL * nlimbs)), block((unsigned)(ntc::GROUPS * ntc::BD));
     if (inverse)
-        ntc::ntt_cluster_<true><<<grid, block, 0, s>>>(Globals, dat, primeid_init, res);
+        ntc::ntt_cluster_<true><<<grid, block, 0, s>>>(Globals, dat, primeid_init, res, period);
     else
-        ntc::ntt_cluster_<false><<<grid, block, 0, s>>>(Globals, dat, primeid_init, res);
+        ntc::ntt_cluster_<false><<<grid, block, 0, s>>>(Globals, dat, primeid_init, res, period);
 }
 
 }  // namespace FIDESlib

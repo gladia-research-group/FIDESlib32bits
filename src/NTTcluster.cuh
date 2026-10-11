@@ -17,7 +17,8 @@ namespace FIDESlib {
 int nttClusterFlag();
 void setNttCluster(int v);
 /// One launch for `nlimbs` limbs: dat[l] -> res[l] (pointer tables, nullptr rows are skipped),
-/// primeid_flattened[primeid_init + l] is limb l's prime. inverse = INTT (negacyclic, scaled by 1/N).
+/// primeid_flattened[primeid_init + l] is limb l's prime (with `period` > 0: primeid_flattened[primeid_init + l % period],
+/// rows of several polynomials of `period` limbs each). inverse = INTT (negacyclic, scaled by 1/N).
 void launchNTTcluster(const Global::Globals* Globals, bool inverse, void** dat, int primeid_init, void** res, int nlimbs,
-                      cudaStream_t s);
+                      cudaStream_t s, int period = 0);
 }  // namespace FIDESlib
