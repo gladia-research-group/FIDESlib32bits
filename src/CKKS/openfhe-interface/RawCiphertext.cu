@@ -14,6 +14,7 @@
 #include "CKKS/AksKeys.cuh"
 #include "CKKS/SmallInt.cuh"
 #include "CKKS/SparseB.cuh"
+#include "CKKS/PtCompact.cuh"
 
 static int sparseBEnv();
 static bool sparseBGeometry(int N, int slots, int& n, int& r, int& s, int& b);
@@ -2012,7 +2013,7 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
             o.gStep = src[si].gStep;
             o.rotIn = src[si].rotIn;
             o.rotOut = src[si].rotOut;
-            o.ptMask = src[si].ptMask;
+            o.ptMask = ptCompactFullMask(src[si].ptMask);   // stored full, compacted later
             const double f = (isStC && si + 1 == src.size()) ? fdrop : 1.0;
             // single-prime stages: to the variant's limb at its own prime, the grid re-entry factor recomputed
             const int sLo = isStC ? 0 : base.cts_single_lo;
@@ -2096,6 +2097,23 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
         }
 
         GPUcc.AddBootPrecomputation(slots, std::move(result));
+        // a SparseB route never reads its CtS / StC stage tables (unless FIDESLIB_BTS_SPARSE_B_RUN=0)
+        auto& pre = GPUcc.GetBootPrecomputationBase(slots);
+        const char* run = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN");
+        if (pre.sparseB && !(run && std::atoi(run) == 0)) {
+            size_t n = 0;
+            for (auto* v : {&pre.CtS, &pre.StC, &pre.CtS_orig, &pre.StC_orig, &pre.StC_first})
+                for (auto& st : *v)
+                    n += st.A.size();
+            cudaDeviceSynchronize();
+            pre.CtS_orig.clear();
+            pre.StC_orig.clear();
+            pre.StC_first.clear();
+            for (auto* v : {&pre.CtS, &pre.StC})
+                for (auto& st : *v)
+                    std::vector<Plaintext>().swap(st.A);   // the stage shapes stay
+            std::cerr << "[sparse_b] slots=" << slots << ": " << n << " CtS/StC stage plaintexts freed (unused)\n";
+        }
     }
 
     AddBootstrapKeys(publicKey, slots, GPUcc_);

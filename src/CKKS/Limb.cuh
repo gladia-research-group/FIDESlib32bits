@@ -39,6 +39,8 @@ class Limb {
      *  RNSPoly::auxReleased and throw). */
     void releaseAux(Stream& s);
     bool auxReleased = false;
+    /** Replace the data buffer (the old one freed on `s`); the caller re-points the limb pointer table. */
+    void replaceStorage(VectorGPU<T>&& nv, Stream& s);
 
     Limb(Limb<T>&& l) noexcept;
 

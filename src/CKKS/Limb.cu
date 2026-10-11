@@ -1,3 +1,4 @@
+#include <new>
 //
 // Created by carlosad on 25/03/24.
 //
@@ -23,6 +24,13 @@ template <typename T>
 void Limb<T>::releaseAux(Stream& s) {
     if (!auxReleased && aux.release(s))
         auxReleased = true;
+}
+
+template <typename T>
+void Limb<T>::replaceStorage(VectorGPU<T>&& nv, Stream& s) {
+    v.free(s);
+    v.~VectorGPU<T>();
+    new (&v) VectorGPU<T>(std::move(nv));
 }
 
 template <typename T>

@@ -1,4 +1,5 @@
 #include "CKKS/SmallInt.cuh"
+#include "CKKS/PtCompact.cuh"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -370,6 +371,10 @@ void smallIntDivideFromTo(ContextData& cc, const RNSPoly& src, RNSPoly& dst, int
 }
 
 Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor) {
+    if (pt.compactMask != 0xFFFFFFFFu) {
+        Plaintext full = expandCompact(pt);
+        return relevelPlaintext(cc_, cc, full, shift, factor);
+    }
     const int d = cc.compositeDegree();
     const int oldL = pt.c0.getLevel();
     const int newL = oldL + d * shift;
@@ -386,6 +391,10 @@ Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, i
 }
 
 Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt, int newL, double newNF) {
+    if (pt.compactMask != 0xFFFFFFFFu) {
+        Plaintext full = expandCompact(pt);
+        return relevelPlaintextNF(cc_, cc, full, newL, newNF);
+    }
     if (newL > cc.L)
         throw std::runtime_error("relevelPlaintextNF: beyond the top level");
     const long double D = (long double)pt.NoiseFactor / (long double)newNF;
