@@ -2814,6 +2814,106 @@ std::vector<Ciphertext<DCRTPoly>> CryptoContextImpl<DCRTPoly>::EvalMultPtBatch(c
 	return results;
 }
 
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultPtSumEncode(
+	const std::vector<Ciphertext<DCRTPoly>>& cts, const std::vector<std::vector<std::complex<double>>>& vals) {
+	if (this->devices.empty())
+		OPENFHE_THROW("EvalMultPtSumEncode: GPU-only (serial fallback lives in the caller)");
+	if (cts.empty() || cts.size() != vals.size())
+		OPENFHE_THROW("EvalMultPtSumEncode: need one value row per ciphertext");
+	for (auto& ct : cts)
+		this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+	auto& context_gpu  = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	const uint32_t lvl = static_cast<uint32_t>(cts[0]->GetLevel());
+	const int limbs	   = static_cast<int>(total_q_limbs(this->cpu)) - static_cast<int>(lvl);
+	const double scale = ScalingFactorReal(lvl);
+	static const bool timing = std::getenv("PT_SUM_TIMING") != nullptr;
+	static double t_enc = 0, t_sync = 0, t_mul = 0, t_fin = 0;
+	static long calls = 0;
+	auto now = [] { return std::chrono::steady_clock::now(); };
+	auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+	auto t0 = now();
+	std::vector<std::unique_ptr<FIDESlib::CKKS::Plaintext>> pts;
+	pts.reserve(vals.size());
+	std::vector<cudaStream_t> ready;
+	ready.reserve(vals.size());
+	for (const auto& v : vals) {
+		pts.push_back(std::make_unique<FIDESlib::CKKS::Plaintext>(context_gpu));
+		ready.push_back(FIDESlib::CKKS::encodeOnDevice(*pts.back(), v, limbs, scale, 1));
+	}
+	auto t1 = now();
+	for (cudaStream_t s : ready)   // v1: the products read the encodes from the ciphertexts' streams
+		cudaStreamSynchronize(s);
+	auto t2 = now();
+	Ciphertext<DCRTPoly> out = this->MakeGpuResultLike(cts[0]);
+	auto out_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(out->gpu));
+	out_gpu->multPt(*pts[0]);
+	for (size_t i = 1; i < cts.size(); ++i) {
+		auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(cts[i]->gpu));
+		out_gpu->addMultPt(*ct_gpu, *pts[i]);
+	}
+	auto t3 = now();
+	cudaDeviceSynchronize();   // v1: the plaintexts die with this scope
+	auto t4 = now();
+	if (timing) {
+		t_enc += ms(t0, t1); t_sync += ms(t1, t2); t_mul += ms(t2, t3); t_fin += ms(t3, t4);
+		if (++calls % 50 == 0)
+			std::cerr << "[pt_sum_timing] per call over " << calls << ": encode-issue " << t_enc / calls << " ms, encode-sync "
+			          << t_sync / calls << " ms, mac-issue " << t_mul / calls << " ms, mac-sync " << t_fin / calls
+			          << " ms (n=" << vals.size() << ", limbs=" << limbs << ")\n";
+	}
+	return out;
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultPtSumEncodeRaw(const std::vector<Ciphertext<DCRTPoly>>& cts,
+                                                                       const void* rows, int dtype, size_t width) {
+	if (this->devices.empty())
+		OPENFHE_THROW("EvalMultPtSumEncodeRaw: GPU-only (serial fallback lives in the caller)");
+	if (cts.empty() || !rows)
+		OPENFHE_THROW("EvalMultPtSumEncodeRaw: empty input");
+	for (auto& ct : cts)
+		this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ct));
+	auto& context_gpu  = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	const uint32_t lvl = static_cast<uint32_t>(cts[0]->GetLevel());
+	const int limbs	   = static_cast<int>(total_q_limbs(this->cpu)) - static_cast<int>(lvl);
+	const double scale = ScalingFactorReal(lvl);
+	static const bool timing = std::getenv("PT_SUM_TIMING") != nullptr;
+	static double t_enc = 0, t_sync = 0, t_mul = 0, t_fin = 0;
+	static long calls = 0;
+	auto now = [] { return std::chrono::steady_clock::now(); };
+	auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+	auto t0 = now();
+	std::vector<std::unique_ptr<FIDESlib::CKKS::Plaintext>> pts;
+	std::vector<FIDESlib::CKKS::Plaintext*> raw;
+	pts.reserve(cts.size());
+	for (size_t i = 0; i < cts.size(); ++i) {
+		pts.push_back(std::make_unique<FIDESlib::CKKS::Plaintext>(context_gpu));
+		raw.push_back(pts.back().get());
+	}
+	auto ready = FIDESlib::CKKS::encodeRowsOnDevice(raw, rows, dtype, cts.size(), width, limbs, scale, 1);
+	auto t1 = now();
+	for (cudaStream_t s : ready)
+		cudaStreamSynchronize(s);
+	auto t2 = now();
+	Ciphertext<DCRTPoly> out = this->MakeGpuResultLike(cts[0]);
+	auto out_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(out->gpu));
+	out_gpu->multPt(*pts[0]);
+	for (size_t i = 1; i < cts.size(); ++i) {
+		auto ct_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(cts[i]->gpu));
+		out_gpu->addMultPt(*ct_gpu, *pts[i]);
+	}
+	auto t3 = now();
+	cudaDeviceSynchronize();   // the plaintexts die with this scope
+	auto t4 = now();
+	if (timing) {
+		t_enc += ms(t0, t1); t_sync += ms(t1, t2); t_mul += ms(t2, t3); t_fin += ms(t3, t4);
+		if (++calls % 50 == 0)
+			std::cerr << "[pt_sum_timing raw] per call over " << calls << ": encode-issue " << t_enc / calls
+			          << " ms, encode-sync " << t_sync / calls << " ms, mac-issue " << t_mul / calls << " ms, mac-sync "
+			          << t_fin / calls << " ms (n=" << cts.size() << ", limbs=" << limbs << ")\n";
+	}
+	return out;
+}
+
 void CryptoContextImpl<DCRTPoly>::EvalMultCtAccumBatch(Ciphertext<DCRTPoly>& acc,
                                                        const std::vector<Ciphertext<DCRTPoly>>& as,
                                                        const std::vector<Ciphertext<DCRTPoly>>& bs) {
