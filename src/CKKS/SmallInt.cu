@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "CKKS/SmallInt.cuh"
 #include "CKKS/PtCompact.cuh"
 #include <cassert>
@@ -151,6 +152,12 @@ void joinLimbs(LimbPartition& P) {
     for (auto& l : P.SPECIALlimb)
         P.s.wait(STREAM(l));
 }
+// limb copy through the device pointer tables (u32 limbs): dst[l][i] = src[l][i]
+__global__ void siCopyLimbs_(void** dst, void* const* src, int N) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    ((uint32_t*)dst[blockIdx.y])[i] = ((const uint32_t*)src[blockIdx.y])[i];
+}
 void forkLimbs(LimbPartition& P) {
     const int n = P.getLimbSize(*P.level);
     for (int i = 0; i < n; ++i)
@@ -171,12 +178,20 @@ struct SrcCopy {
         T.s.wait(P.s);
         // Source pointers from the authoritative device table: after an INTT/NTT pair the current data may sit
         // in the swapped `aux` buffer (limbptr follows the swap, the Limb's v.data does not).
+        // One kernel dereferences both device pointer tables itself: no stream sync and no synchronous D2H readback
+        // (two full-device drains per call, 110 calls per token). FIDESLIB_SMALLINT_NOSYNC=0: the old host readback.
+        static const bool kNoSync = [] { const char* e = std::getenv("FIDESLIB_SMALLINT_NOSYNC"); return !(e && std::atoi(e) == 0); }();
+        if (kNoSync) {
+            siCopyLimbs_<<<dim3((unsigned)(cc.N / 256), (unsigned)k), 256, 0, T.s.ptr()>>>(
+                (void**)T.limbptr.data, (void* const*)P.limbptr.data, (int)cc.N);
+        } else {
         std::vector<void*> src(k), dst(k);
         cudaStreamSynchronize(P.s.ptr());
         cudaMemcpy(src.data(), P.limbptr.data, (size_t)k * sizeof(void*), cudaMemcpyDeviceToHost);
         cudaMemcpy(dst.data(), T.limbptr.data, (size_t)k * sizeof(void*), cudaMemcpyDeviceToHost);
         for (int i = 0; i < k; ++i)
             cudaMemcpyAsync(dst[i], src[i], (size_t)cc.N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, T.s.ptr());
+        }
         forkLimbs(T);
         if (!srcCoeff)
             tmp.INTT(cc.batch, false);
