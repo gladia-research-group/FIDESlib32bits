@@ -78,6 +78,10 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// auxiliary rotation keys that are no longer needed after a phase (e.g. prefill
 	/// filling-packing keys before decode). Returns the number of keys actually freed.
 	size_t FreeRotationKeys(const std::vector<int>& steps, const PublicKey<DCRTPoly>& publicKey);
+	/// Build a sparse route after LoadContext (needs EvalBootstrapSetup / EvalBootstrapKeyGen for `slots`).
+	void AddBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots);
+	/// Drop a sparse route and the rotation keys only it uses; returns the keys freed.
+	size_t DropBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots);
 	/// @brief GPU-load a set of rotation keys that were deferred at LoadContext time
 	/// (their OpenFHE eval keys already exist; this is the device transfer only).
 	/// Dedups against already-resident keys. Used to lazily bring in the decode

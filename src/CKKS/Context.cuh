@@ -208,6 +208,8 @@ class ContextData {
     int GetDoubleAngleIts();
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
     bool HasBootPrecomputation(int slots);
+    /** Drop a route's device tables (and its raise variants). */
+    void RemoveBootPrecomputation(int slots);
     BootstrapPrecomputation& GetBootPrecomputation(int slots);
     /** Lazy raise variants: the drops a planted bootstrap may ask for (FIDESLIB_BTS_RAISE_DROPS) and the builder
      *  that makes one from the route's base tables on first use (installed by LoadContext). Each variant is a full
