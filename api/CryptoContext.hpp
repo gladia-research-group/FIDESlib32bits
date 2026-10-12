@@ -270,6 +270,10 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// no rescale, NoiseLevel-2 products. Requires every pt at ct1's level.
 	std::vector<Ciphertext<DCRTPoly>> EvalMultPtBatch(const Ciphertext<DCRTPoly>& ct1,
 	                                                  std::vector<Plaintext>& pts);
+	// Named-weight inner sum (LIN_PT_DOT): Σ_i cts[i] * pts[i] over already-encoded plaintexts, written once by one
+	// fused kernel (Ciphertext::multPtSumInto). Same result as EvalMult(cts[0], pts[0]) followed by EvalAddInPlace of
+	// EvalMult(cts[i], pts[i]) for each further term, which it runs instead where the fused form does not apply.
+	Ciphertext<DCRTPoly> EvalMultPtSum(const std::vector<Ciphertext<DCRTPoly>>& cts, std::vector<Plaintext>& pts);
 	// Batched ct×ct accumulate: acc += Σ_j as[j]*bs[j] with ONE relinearization (acc must be
 	// the NoiseLevel-2 lane-0 product; all as/bs NoiseLevel-1 at acc's level). GPU-only.
 	void EvalMultCtAccumBatch(Ciphertext<DCRTPoly>& acc, const std::vector<Ciphertext<DCRTPoly>>& as,

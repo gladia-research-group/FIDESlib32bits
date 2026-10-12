@@ -440,6 +440,11 @@ class Ciphertext {
     bool subInto(const Ciphertext& a, const Ciphertext& b);
     bool multScalarInto(const Ciphertext& c, double scalar);
     bool addScalarInto(const Ciphertext& c, double scalar);
+    /// LIN_PT_DOT: this <- sum_i cs[i] * pts[i] (a BSGS baby-step inner sum) written once by one kernel; the same
+    /// result and metadata as multPtInto(cs[0], pts[0]) followed by add(cs[i] * pts[i]) for each further term. Runs
+    /// under multPtInto's conditions for every term (all at one level, noise level 1) and returns false otherwise,
+    /// writing nothing.
+    bool multPtSumInto(const std::vector<const Ciphertext*>& cs, const std::vector<const Plaintext*>& pts);
 
     /**
      * @brief Computes the complex conjugate of ciphertext `c` and stores it in *this*.

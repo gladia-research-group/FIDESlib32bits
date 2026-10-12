@@ -1696,6 +1696,42 @@ bool Ciphertext::multPtInto(const Ciphertext& c, const Plaintext& pt) {
 	return true;
 }
 
+bool Ciphertext::multPtSumInto(const std::vector<const Ciphertext*>& cs, const std::vector<const Plaintext*>& pts) {
+	const size_t n = cs.size();
+	if (n == 0 || n != pts.size() || n > (size_t)PTDOT_MAX ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	const Ciphertext& c = *cs[0];
+	for (size_t i = 0; i < n; ++i) {
+		const Ciphertext& ci = *cs[i];
+		const Plaintext& pi	 = *pts[i];
+		if (&ci == this || ci.NoiseLevel != 1 || pi.NoiseLevel != 1 || ci.getLevel() != c.getLevel() ||
+		    pi.c0.getLevel() != c.getLevel() || ci.keyID != c.keyID || ci.c0.isModUp() || ci.c1.isModUp())
+			return false;
+	}
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULTPT] += n;
+	op_count[OPS::ADD] += n - 1;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	std::vector<const RNSPoly*> x0(n), x1(n), p(n);
+	for (size_t i = 0; i < n; ++i) {
+		x0[i] = &cs[i]->c0;
+		x1[i] = &cs[i]->c1;
+		p[i]  = &pts[i]->c0;
+	}
+	c0.ptDotFrom(c1, x0, x1, p);
+	// the loop's metadata: the first product's, then each add keeps it and widens the slot count
+	this->copyMetadata(c);
+	this->multMetadata(*this, *pts[0]);
+	for (size_t i = 1; i < n; ++i)
+		this->slots = std::max(this->slots, std::max(cs[i]->slots, pts[i]->slots));
+	return true;
+}
+
 bool Ciphertext::subInto(const Ciphertext& a, const Ciphertext& b) {
 	if (this == &a || this == &b || a.keyID != b.keyID || a.getLevel() != b.getLevel() || a.NoiseLevel != b.NoiseLevel ||
 	    a.c0.isModUp() || a.c1.isModUp() || b.c0.isModUp() || b.c1.isModUp() ||

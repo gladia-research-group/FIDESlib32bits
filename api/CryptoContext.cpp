@@ -3131,6 +3131,69 @@ std::vector<Ciphertext<DCRTPoly>> CryptoContextImpl<DCRTPoly>::EvalMultPtBatch(c
 	return results;
 }
 
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultPtSum(const std::vector<Ciphertext<DCRTPoly>>& cts,
+                                                              std::vector<Plaintext>& pts) {
+	if (cts.empty() || cts.size() != pts.size())
+		OPENFHE_THROW("EvalMultPtSum: need one plaintext per ciphertext");
+	if (!this->devices.empty()) {
+		std::vector<std::shared_ptr<FIDESlib::CKKS::Ciphertext>> cs;
+		std::vector<std::shared_ptr<FIDESlib::CKKS::Plaintext>> ps;
+		cs.reserve(cts.size());
+		ps.reserve(pts.size());
+		for (size_t i = 0; i < cts.size(); ++i) {
+			this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(cts[i]));
+			this->LoadPlaintext(pts[i]);
+			this->WaitPlaintextReady(pts[i]->gpu);
+			cs.push_back(std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(cts[i]->gpu)));
+			ps.push_back(std::static_pointer_cast<FIDESlib::CKKS::Plaintext>(this->GetDevicePlaintext(pts[i]->gpu)));
+		}
+		std::vector<const FIDESlib::CKKS::Ciphertext*> c(cs.size());
+		std::vector<const FIDESlib::CKKS::Plaintext*> p(ps.size());
+		for (size_t i = 0; i < cs.size(); ++i) {
+			c[i] = cs[i].get();
+			p[i] = ps[i].get();
+		}
+		Ciphertext<DCRTPoly> result = this->MakeGpuResultEmptyLike(cts[0]);
+		auto res_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+		if (res_gpu->multPtSumInto(c, p)) {
+			// FIDESLIB_PTDOT_VERIFY=1 (checking only): the loop's result next to the fused one, residues and metadata
+			static const bool verify = [] { const char* e = std::getenv("FIDESLIB_PTDOT_VERIFY"); return e && std::atoi(e) > 0; }();
+			if (verify) {
+				static long calls = 0, bad = 0;
+				Ciphertext<DCRTPoly> ref = EvalMult(cts[0], pts[0]);
+				for (size_t i = 1; i < cts.size(); ++i)
+					EvalAddInPlace(ref, EvalMult(cts[i], pts[i]));
+				auto ref_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ref->gpu));
+				cudaDeviceSynchronize();
+				std::vector<std::vector<uint64_t>> a0, a1, b0, b1;
+				res_gpu->c0.store(a0);
+				res_gpu->c1.store(a1);
+				ref_gpu->c0.store(b0);
+				ref_gpu->c1.store(b1);
+				const bool same = a0 == b0 && a1 == b1 && res_gpu->getLevel() == ref_gpu->getLevel() &&
+				                  res_gpu->NoiseLevel == ref_gpu->NoiseLevel && res_gpu->NoiseFactor == ref_gpu->NoiseFactor &&
+				                  res_gpu->slots == ref_gpu->slots;
+				++calls;
+				if (!same) {
+					++bad;
+					std::cerr << "[ptdot_verify] MISMATCH n=" << cts.size() << " level " << res_gpu->getLevel() << "/"
+					          << ref_gpu->getLevel() << " noise " << res_gpu->NoiseLevel << "/" << ref_gpu->NoiseLevel
+					          << " factor " << res_gpu->NoiseFactor << "/" << ref_gpu->NoiseFactor << " slots "
+					          << res_gpu->slots << "/" << ref_gpu->slots << " limbs " << a0.size() << "/" << b0.size()
+					          << "\n";
+				}
+				if (calls % 200 == 0 || !same)
+					std::cerr << "[ptdot_verify] " << calls << " sums checked, " << bad << " mismatched\n";
+			}
+			return result;
+		}
+	}
+	Ciphertext<DCRTPoly> acc = EvalMult(cts[0], pts[0]);
+	for (size_t i = 1; i < cts.size(); ++i)
+		EvalAddInPlace(acc, EvalMult(cts[i], pts[i]));
+	return acc;
+}
+
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalMultPtSumEncode(
 	const std::vector<Ciphertext<DCRTPoly>>& cts, const std::vector<std::vector<std::complex<double>>>& vals) {
 	if (this->devices.empty())

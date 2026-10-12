@@ -57,6 +57,9 @@ class RNSPoly {
     void subFrom(const RNSPoly& a, const RNSPoly& b);
     void multScalarFrom(const RNSPoly& src, const std::vector<uint64_t>& elem);
     void addScalarFrom(const RNSPoly& src, const std::vector<uint64_t>& elem);
+    /// LIN_PT_DOT (PtDot.cu): this <- sum_i x0[i] * pts[i], out1 <- sum_i x1[i] * pts[i], one launch per partition.
+    void ptDotFrom(RNSPoly& out1, const std::vector<const RNSPoly*>& x0, const std::vector<const RNSPoly*>& x1,
+                   const std::vector<const RNSPoly*>& pts);
 
     void multPt(const RNSPoly& p, bool rescale);
 
