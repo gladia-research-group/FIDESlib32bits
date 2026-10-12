@@ -59,8 +59,9 @@ Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, i
 Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt, int newL, double newNF);
 /// ct := round(c * ct) exactly (both polynomials; k = 3 source limbs: the raised ciphertext has |coef| < q0).
 /// The message is scaled by c, the scale/level bookkeeping is untouched (what multScalar + rescale achieve, one
-/// composite level cheaper); rounding adds <= 0.5 per coefficient (noise ~ (h+1)/2).
-void smallIntScalarMultiply(ContextData& cc, Ciphertext& ct, double c);
+/// composite level cheaper); rounding adds <= 0.5 per coefficient (noise ~ (h+1)/2). `srcCoeff`: both polynomials are
+/// still in coefficient form (a raise whose NTT was skipped, FIDESLIB_MODRAISE_COEFF); the result is in NTT form either way.
+void smallIntScalarMultiply(ContextData& cc, Ciphertext& ct, double c, bool srcCoeff = false);
 /// Self-test of the exact division against a host reference on synthetic signed integers |x| < q0 (the raised
 /// ciphertext's range) placed on the first 3 limbs; returns the number of mismatching residues (0 = exact).
 /// `any` only supplies the context (tests cannot read ContextData fields across TUs).

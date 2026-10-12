@@ -999,6 +999,14 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         std::cout << std::endl;
     }
 
+    // The exact post-raise scaling below (smallIntScalarMultiply) reads only the first 3 limbs back in coefficient form
+    // and rewrites every limb before its own NTT, so the NTT of all raised limbs is dead work: the raised polynomials stay
+    // in coefficient form and are handed over as such (bit-exact). FIDESLIB_MODRAISE_COEFF=0 restores the NTT.
+    static const bool kModRaiseCoeff = [] { const char* e = std::getenv("FIDESLIB_MODRAISE_COEFF"); return !(e && *e && std::atoi(e) == 0); }();
+    const bool shiftFused = sparse_encaps && cc.compositeDegree() > 1 && cc.GetBootPrecomputation(slots).ghs_btoa &&
+                            [] { const char* e = std::getenv("FIDESLIB_BTS_SHIFT_FUSED"); return e && std::atoi(e) > 0; }();
+    const bool raiseCoeff = kModRaiseCoeff && !PRINT && exactScale > 0 && !aksStage0 && !shiftFused &&
+                            !g_btsStageStash && cc.compositeDegree() > 1;
     ctxt.c0.INTT(cc.batch, true);
 
     if constexpr (PRINT) {
@@ -1042,7 +1050,8 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         }
         std::cout << std::endl;
     }
-    ctxt.c0.NTT(cc.batch, true);
+    if (!raiseCoeff)
+        ctxt.c0.NTT(cc.batch, true);
     // std::cout << cc.batch << std::endl;
     if constexpr (PRINT) {
         std::cout << "ModRaise ";
@@ -1093,7 +1102,8 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
         }
         std::cout << std::endl;
     }
-    ctxt.c1.NTT(cc.batch, true);
+    if (!raiseCoeff)
+        ctxt.c1.NTT(cc.batch, true);
     if constexpr (PRINT) {
         std::cout << "Adjustment c1";
         for (auto& j : ctxt.c1.GPU) {
@@ -1157,7 +1167,7 @@ void FIDESlib::CKKS::ModRaise(Ciphertext& ctxt, const int slots, const uint32_t 
             ctxt.NoiseFactor *= tf;
             ghsSwitchExt(ctxt, *cc.GetBootPrecomputation(slots).ghs_btoa);
         } else {
-            smallIntScalarMultiply(cc, ctxt, exactScaleT);
+            smallIntScalarMultiply(cc, ctxt, exactScaleT, raiseCoeff);
             ctxt.NoiseFactor *= tf;
         }
         fusedSwitched = fused;
