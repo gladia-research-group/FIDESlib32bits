@@ -1242,9 +1242,10 @@ static bool sparseBGeometry(int N, int slots, int& n, int& r, int& s, int& b) {
     if (!(n > r / 2))
         return false;
     s = 2 * n / r;
-    // baby-step size: default = all s diagonals hoisted (one ModUp shared by s-1 rotations, no un-hoisted giant steps —
-    // the shipped stages hoist 16); FIDESLIB_BTS_SPARSE_B_BSTEP overrides (sqrt(s) is the paper's un-hoisted optimum)
-    b = s;
+    // baby-step size: 16 hoisted rotations and giant steps for the rest (on the 512-slot route, s = 32: one giant step,
+    // half the Q+P rotation temporaries of hoisting all s, -3.3 ms per call); FIDESLIB_BTS_SPARSE_B_BSTEP overrides
+    // (= s hoists every diagonal, the former default; sqrt(s) is the paper's un-hoisted optimum)
+    b = std::min(s, 16);
     if (const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_BSTEP"); e && std::atoi(e) > 0)
         b = std::min(s, std::atoi(e));
     return true;
