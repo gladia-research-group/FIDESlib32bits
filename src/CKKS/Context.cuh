@@ -183,6 +183,11 @@ class ContextData {
     bool btsRealPayload = false;
     void setBtsRealPayload(bool on);
     bool getBtsRealPayload() const;
+    // A planned site that must bootstrap in the shipped order although FIDESLIB_BTS_STC_FIRST is on (a payload whose
+    // slot magnitude the StC-first order cannot hold at the planned precision): set around that one call.
+    bool stcFirstForbid = false;
+    void setStcFirstForbid(bool on);   // out-of-line: the wrapper must not touch the field (NCCL offsets, see below)
+    bool getStcFirstForbid() const;
 
     /** Bootstrap input pre-scale (armed per call by the wrapper, same discipline as the
      *  correction-factor override): the next Bootstrap multiplies its input by this
