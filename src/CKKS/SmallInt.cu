@@ -422,13 +422,13 @@ Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt,
     return np;
 }
 
-void smallIntScalarMultiply(ContextData& cc, Ciphertext& ct, double c) {
+void smallIntScalarMultiply(ContextData& cc, Ciphertext& ct, double c, bool srcCoeff) {
     assert(c > 0);
     // k = 3: compositeModRaise centres each Garner term on its own prime, so the raised coefficients lie in
     // (-q0, q0) rather than (-q0/2, q0/2); Q_2 = q0 would be ambiguous, Q_3 ~ 2^83 is not.
     const long double D = 1.0L / (long double)c;
-    smallIntDivideKeepLevel(cc, ct.c0, 3, D, false);
-    smallIntDivideKeepLevel(cc, ct.c1, 3, D, false);
+    smallIntDivideKeepLevel(cc, ct.c0, 3, D, false, srcCoeff);
+    smallIntDivideKeepLevel(cc, ct.c1, 3, D, false, srcCoeff);
 }
 
 long smallIntSelfTest(Ciphertext& any, double c) {
