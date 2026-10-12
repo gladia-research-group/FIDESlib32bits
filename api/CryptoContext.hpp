@@ -326,6 +326,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	std::vector<Ciphertext<DCRTPoly>> EvalFastRotation(const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices, uint32_t m, const std::shared_ptr<void>& precomp);
 	std::vector<Ciphertext<DCRTPoly>>
 	EvalFastRotationExt(const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices, const std::shared_ptr<void>& digits, bool addFirst);
+	/// ct + sum_i rot(ct, indices[i]) from one hoisted decomposition, summed in the extended basis with one ModDown
+	/// (a radix group of a rotate-and-sum ladder).
+	Ciphertext<DCRTPoly> EvalRotateSumHoisted(const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices);
 
 	Ciphertext<DCRTPoly> EvalChebyshevSeries(const Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b);
 	void EvalChebyshevSeriesInPlace(Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b);
