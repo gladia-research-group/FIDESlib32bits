@@ -352,6 +352,7 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
                          [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
     // an input without room for the StC levels takes the shipped order (as btsBegin)
     const bool stcFirst = cc.GetBootPrecomputation(slots).stc_first_mode > 0 && !sparseB && allowStcFirst && !cc.stcFirstForbid &&
+                          !stcFirstStagedOnly() &&
                           (int)ctxt.getLevel() - (ctxt.NoiseLevel == 2 ? cc.compositeDegree() : 0) >=
                               cc.GetBootPrecomputation(slots).stc_first_entry;
     static int abCount = 0;
@@ -1220,6 +1221,16 @@ int FIDESlib::CKKS::BootstrapPrecapture(FIDESlib::CKKS::Context& /*cc*/) {
 // ======================================================================================================================
 namespace FIDESlib::CKKS {
 
+bool stcFirstStagedOnly() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_BTS_STC_FIRST_STAGED_ONLY"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+
+int btsStcFirstEntry(Ciphertext& ctxt, int slots) {
+    auto& pre = ctxt.cc.GetBootPrecomputation(slots);
+    return pre.stc_first_mode > 0 ? pre.stc_first_entry : -1;
+}
+
 BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirst) {
     ContextData& cc = ctxt.cc;
     BtsState st;
@@ -1294,7 +1305,7 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     return st;
 }
 
-void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st) {
+void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
     CudaNvtxRange r(std::string{"bts::stc_first_input"});
     if (!st.stcFirst)
         return;
@@ -1327,7 +1338,8 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st) {
     // The last stage is built at a reference correction factor and keyed by the input scale alone: a smaller CF is the
     // exact integer 2^(cfStage - cf) put on the ciphertext first (level-free, before the raise), so one entry per input
     // scale serves every site.
-    const int cfStage = std::max(cf, kStcFirstCfRef);
+    // ownCf (the PCMM): the stage at the route's CF, whose plaintexts keep the precision its integer products need
+    const int cfStage = ownCf ? cf : std::max(cf, kStcFirstCfRef);
     if (cfStage > cf)
         multIntScalar(ctxt, uint64_t{1} << (cfStage - cf));
     const double factor = std::ldexp(1.0, -cfStage) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
