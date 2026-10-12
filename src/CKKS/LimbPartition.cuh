@@ -29,6 +29,9 @@ struct LimbScalars {
     uint64_t v[MAXP];
 };
 
+/// Most terms one fused plaintext inner sum (LimbPartition::ptDotFrom) takes.
+constexpr int PTDOT_MAX = 32;
+
 class LimbPartition {
    public:
     ContextData& cc;
@@ -172,6 +175,10 @@ class LimbPartition {
     void subFrom(const LimbPartition& a, const LimbPartition& b);
     void multScalarFrom(const LimbPartition& src, const LimbScalars& sc);
     void addScalarFrom(const LimbPartition& src, const LimbScalars& sc);
+    /// LIN_PT_DOT (PtDot.cu): this <- sum_i x0[i] * pts[i] and out1 <- sum_i x1[i] * pts[i] in one launch (this and
+    /// out1 are the two polynomials of one ciphertext; at most PTDOT_MAX terms).
+    void ptDotFrom(LimbPartition& out1, const std::vector<const LimbPartition*>& x0,
+                   const std::vector<const LimbPartition*>& x1, const std::vector<const LimbPartition*>& pts);
 
     void multElement(const LimbPartition& p);
 
