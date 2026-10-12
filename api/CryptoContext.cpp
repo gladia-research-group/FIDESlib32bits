@@ -384,7 +384,22 @@ static void extractEvalLimbs(const lbcrypto::DCRTPoly& el, std::vector<std::vect
 	}
 }
 
+// DEPRECATED (2026-10-12): AKS measured slower end to end on the n32 GPT-2 decode (+0.03..+0.06 s/token: the stage-0
+// keys stream from DRAM every dense bootstrap and cost more than the key switch they replace), and GenerateAksStage0
+// draws the key error from a fixed-seed std::mt19937_64 (predictable error: the keys would leak the secret). Refused
+// unless FIDESLIB_AKS_ALLOW_INSECURE=1 (timing experiments only).
+static void aks_deprecated_guard() {
+	const char* e = std::getenv("FIDESLIB_AKS_ALLOW_INSECURE");
+	if (e && std::atoi(e) > 0) {
+		std::fprintf(stderr, "[aks] WARNING: deprecated, insecure keygen (FIDESLIB_AKS_ALLOW_INSECURE=1): timing only\n");
+		return;
+	}
+	throw std::runtime_error("FIDESLIB_AKS is deprecated: slower on this workload and its keygen uses a predictable "
+							 "error term; set FIDESLIB_AKS_ALLOW_INSECURE=1 only for timing experiments");
+}
+
 void CryptoContextImpl<DCRTPoly>::RegenerateEncapsulationKeys(const PrivateKey<DCRTPoly>& secretKey) {
+	aks_deprecated_guard();   // only the AKS path regenerates them
 	if (this->loaded)
 		throw std::runtime_error("RegenerateEncapsulationKeys: call before LoadContext");
 	auto& cpu_cc = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
@@ -409,6 +424,7 @@ void CryptoContextImpl<DCRTPoly>::RegenerateEncapsulationKeys(const PrivateKey<D
 }
 
 void CryptoContextImpl<DCRTPoly>::LoadAksKeys(const PrivateKey<DCRTPoly>& secretKey) {
+	aks_deprecated_guard();
 	if (!this->loaded)
 		throw std::runtime_error("LoadAksKeys: LoadContext first");
 	auto& c		 = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);

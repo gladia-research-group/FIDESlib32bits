@@ -1,4 +1,7 @@
 #pragma once
+// DEPRECATED 2026-10-12 (see LoadAksKeys): slower end to end on the n32 decode, and GenerateAksStage0's key error comes
+// from a fixed-seed std::mt19937_64 (insecure). Kept for reference; LoadAksKeys refuses it without
+// FIDESLIB_AKS_ALLOW_INSECURE=1.
 // Aggregated key switching for the first CoeffsToSlots stage (eprint 2025/1403, built here on top of
 // FIDESLIB_BTS_SHIFT, 2026-10-04).
 //
