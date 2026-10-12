@@ -342,7 +342,7 @@ void FIDESlib::CKKS::multIntScalar(Ciphertext& ctxt, uint64_t op) {
 	ctxt.c1.multScalar(op_);
 }
 
-// FIDESLIB_LAZY_PS=1 (lazy-BSGS Paterson-Stockmeyer, Lee et al. EUROCRYPT 2022): the top-level product cu*qu and the
+// FIDESLIB_LAZY_PS (default on; 0 = eager relinearization) (lazy-BSGS Paterson-Stockmeyer, Lee et al. EUROCRYPT 2022): the top-level product cu*qu and the
 // last product of T_{k(2^m-1)} only feed the final sum, so both are accumulated as tensors and relinearized ONCE (one
 // key switch less per series). Taken only when both products land at the seed's level and scale; otherwise eager.
 struct LazyTop {
@@ -351,7 +351,7 @@ struct LazyTop {
 	Ciphertext* su = nullptr;
 };
 static bool lazyPsOn() {
-	static const bool v = [] { const char* e = std::getenv("FIDESLIB_LAZY_PS"); return e && std::atoi(e) > 0; }();
+	static const bool v = [] { const char* e = std::getenv("FIDESLIB_LAZY_PS"); return !e || std::atoi(e) > 0; }();   // default on
 	return v;
 }
 
