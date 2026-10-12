@@ -351,7 +351,7 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
     const bool sparseB = cc.GetBootPrecomputation(slots).sparseB != nullptr &&
                          [] { const char* e = std::getenv("FIDESLIB_BTS_SPARSE_B_RUN"); return !(e && std::atoi(e) == 0); }();
     // an input without room for the StC levels takes the shipped order (as btsBegin)
-    const bool stcFirst = cc.GetBootPrecomputation(slots).stc_first_mode > 0 && !sparseB && allowStcFirst &&
+    const bool stcFirst = cc.GetBootPrecomputation(slots).stc_first_mode > 0 && !sparseB && allowStcFirst && !cc.stcFirstForbid &&
                           (int)ctxt.getLevel() - (ctxt.NoiseLevel == 2 ? cc.compositeDegree() : 0) >=
                               cc.GetBootPrecomputation(slots).stc_first_entry;
     static int abCount = 0;
@@ -488,7 +488,7 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
             std::cerr << "[bts_shift] WARNING: baked constant " << baked << " != runtime " << constantEvalMult
                       << " (or sparse slots): falling back to multScalar, the level gain is lost\n";
         const bool aksOn = exactConst && baked != 0 && cc.GetBootPrecomputation(slots).aks0 != nullptr;
-        ModRaise(ctxt, slots, correction, prescaled || stcFolded, sparse_encaps, exactConst ? constantEvalMult : 0.0, aksOn);
+        ModRaise(ctxt, slots, correction, prescaled || (stcFirst && stcFolded), sparse_encaps, exactConst ? constantEvalMult : 0.0, aksOn);
         shiftedFlow = exactConst && baked != 0 && !aksOn;
         if (exactOnly && baked == 0 && exactConst)
             ctxt.dropToLevel(ctxt.getLevel() - cc.compositeDegree());  // standard plaintexts expect L - d
@@ -1252,8 +1252,13 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     // StC-first pays its StC levels on the input: a deeper input (a site the runtime routes dense although the plan
     // priced it sparse) takes the shipped order instead, which lands where the sparse route would have.
     const int inLimb = (int)ctxt.getLevel() - (ctxt.NoiseLevel == 2 ? cc.compositeDegree() : 0);
-    st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst && inLimb >= pre.stc_first_entry;
+    st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst && !cc.stcFirstForbid && inLimb >= pre.stc_first_entry;
     st.stcFolded = pre.stc_first_mode == 2;
+    if (static const bool dbg = [] { const char* e = std::getenv("FIDESLIB_BTS_DEBUG_STC"); return e && std::atoi(e) > 0; }(); dbg && pre.stc_first_mode > 0)
+        std::cerr << "[stc_dbg] begin slots=" << slots << " inLimb=" << inLimb << " entry=" << pre.stc_first_entry
+                  << " allow=" << allowStcFirst << " forbid=" << cc.stcFirstForbid << " cc=" << (void*)&cc
+                  << " real=" << cc.getBtsRealPayload() << " cf=" << effCorrectionFactor(cc, slots)
+                  << " -> stcFirst=" << st.stcFirst << "\n";
     const double k = pre.bootK > 0 ? pre.bootK : cc.GetBootK();
     st.constantEvalMult = preF * (1.0 / (k * cc.N)) * cc.getBtsPreScale();
     st.baked = pre.cts0_const;
