@@ -104,6 +104,30 @@ std::vector<VectorGPU<void*>> LimbPartition::generateDecompLimbptr(
 }
 
 
+// FIDESLIB_SCRATCH_RETIRE (default 1): a slot starts at a floor that covers its usual requests and grows
+// geometrically, and an outgrown buffer is retired until the partition dies instead of freed behind a stream sync
+// plus a device-synchronizing cudaFree (17 such drains per decode token, inside GPU-bound bootstraps). 0 restores
+// exact-size slots with the synchronous swap.
+static const bool kScratchRetire = [] {
+    const char* e = std::getenv("FIDESLIB_SCRATCH_RETIRE");
+    return !(e && *e && std::atoi(e) == 0);
+}();
+
+static size_t scratchFloor(const int slot) {
+    switch (slot) {
+    case LimbPartition::SC_SCALAR_MULT:
+    case LimbPartition::SC_SCALAR_ADD:
+    case LimbPartition::SC_SCALAR_SUB:
+        return MAXP * sizeof(uint64_t);          // one operand per prime: never grows
+    case LimbPartition::SC_LINWSUM_W:
+        return 64 * 1024;                        // n weights x primes
+    case LimbPartition::SC_LINWSUM_PS:
+        return 16 * 1024;                        // n pointer tables
+    default:
+        return 0;
+    }
+}
+
 void* LimbPartition::scratchGet(const int slot, const size_t bytes) {
     if (bytes == 0)
         return nullptr;
@@ -112,18 +136,25 @@ void* LimbPartition::scratchGet(const int slot, const size_t bytes) {
     if (sc.p != nullptr && sc.bytes >= bytes)
         return sc.p;
     cudaSetDevice(device);
+    size_t want = bytes;
+    if (kScratchRetire)
+        want = std::max({bytes, scratchFloor(slot), 2 * sc.bytes});
     void* p = nullptr;
-    if (cudaMalloc(&p, bytes) != cudaSuccess || p == nullptr) {
+    if (cudaMalloc(&p, want) != cudaSuccess || p == nullptr) {
         cudaGetLastError();   // never fail the op over a scratch buffer
         return nullptr;
     }
     if (sc.p != nullptr) {
-        // The old buffer may still be read by work already enqueued on this partition's stream.
-        cudaStreamSynchronize(s.ptr());
-        cudaFree(sc.p);
+        if (kScratchRetire) {
+            scratchRetired_.push_back(sc.p);   // freed with the partition (scratchFreeAll)
+        } else {
+            // The old buffer may still be read by work already enqueued on this partition's stream.
+            cudaStreamSynchronize(s.ptr());
+            cudaFree(sc.p);
+        }
     }
     sc.p = p;
-    sc.bytes = bytes;
+    sc.bytes = want;
     return sc.p;
 }
 
@@ -135,6 +166,9 @@ void LimbPartition::scratchFreeAll() {
             sc.bytes = 0;
         }
     }
+    for (void* p : scratchRetired_)
+        cudaFree(p);
+    scratchRetired_.clear();
 }
 
 void** CudaMallocAuxBuffer(Stream& stream, unsigned long size, int device) {
