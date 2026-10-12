@@ -1610,6 +1610,39 @@ RNSPoly& RNSPoly::modup_ksk_moddown_mgpu(const KeySwitchingKey& key, const bool 
 }  // namespace FIDESlib::CKKS
 namespace FIDESlib::CKKS {
 void RNSPoly::releaseAux() {
+    // FIDESLIB_AUX_NOSYNC (default 1): normalize the live buffers on the device (auxNormalizeAsync) instead of reading
+    // the pointer tables back behind a stream sync; the aux release is stream-ordered after it. 0 keeps the host read.
+    static const bool noSync = [] {
+        const char* e = std::getenv("FIDESLIB_AUX_NOSYNC");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    if (noSync) {
+        for (auto& part : GPU) {
+            cudaSetDevice(part.device);
+            auto normalize_and_release = [&](std::vector<LimbImpl>& limbs, VectorGPU<void*>& table) {
+                const int n = (int)limbs.size();
+                if (n == 0)
+                    return;
+                std::vector<void*> v(n, nullptr), aux(n, nullptr);
+                std::vector<size_t> bytes(n, 0);
+                for (int i = 0; i < n; ++i)
+                    std::visit(
+                        [&](auto& x) {
+                            v[i] = (void*)x.v.data;
+                            aux[i] = x.auxReleased ? nullptr : (void*)x.aux.data;
+                            bytes[i] = (size_t)x.v.size * sizeof(*x.v.data);
+                        },
+                        limbs[i]);
+                if (table.data != nullptr && table.size >= n && n <= MAXP)
+                    auxNormalizeAsync((void**)table.data, v.data(), aux.data(), bytes.data(), n, part.s.ptr());
+                for (int i = 0; i < n; ++i)
+                    std::visit([&](auto& x) { x.releaseAux(part.s); }, limbs[i]);
+            };
+            normalize_and_release(part.limb, part.limbptr);
+            normalize_and_release(part.SPECIALlimb, part.SPECIALlimbptr);
+        }
+        return;
+    }
     for (auto& part : GPU) {
         cudaSetDevice(part.device);
         cudaStreamSynchronize(part.s.ptr());

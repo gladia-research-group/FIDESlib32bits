@@ -1052,3 +1052,42 @@ void Limb<T>::automorph(const int index, const int br) {
 #undef X
 
 }  // namespace FIDESlib::CKKS
+
+namespace FIDESlib::CKKS {
+namespace {
+struct AuxFix {
+    void* v[MAXP];
+    void* aux[MAXP];
+    uint32_t words[MAXP];
+    int n;
+};
+__global__ void auxNormalizeCopy_(void* const* table, AuxFix f) {
+    const int i = blockIdx.y;
+    if (i >= f.n || f.aux[i] == nullptr || table[i] != f.aux[i])
+        return;
+    uint32_t* dst = static_cast<uint32_t*>(f.v[i]);
+    const uint32_t* src = static_cast<const uint32_t*>(f.aux[i]);
+    for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < f.words[i]; k += (size_t)gridDim.x * blockDim.x)
+        dst[k] = src[k];
+}
+__global__ void auxNormalizeTable_(void** table, AuxFix f) {
+    const int i = threadIdx.x;
+    if (i < f.n && f.aux[i] != nullptr && table[i] == f.aux[i])
+        table[i] = f.v[i];
+}
+}  // namespace
+
+void auxNormalizeAsync(void** table, void* const* v, void* const* aux, const size_t* bytes, int n, cudaStream_t s) {
+    if (n <= 0 || n > MAXP || table == nullptr)
+        return;
+    AuxFix f{};
+    f.n = n;
+    for (int i = 0; i < n; ++i) {
+        f.v[i] = v[i];
+        f.aux[i] = aux[i];
+        f.words[i] = (uint32_t)(bytes[i] / sizeof(uint32_t));
+    }
+    auxNormalizeCopy_<<<dim3(32, n), 256, 0, s>>>(table, f);
+    auxNormalizeTable_<<<1, MAXP, 0, s>>>(table, f);
+}
+}  // namespace FIDESlib::CKKS

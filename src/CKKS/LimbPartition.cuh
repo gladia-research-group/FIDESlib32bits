@@ -116,6 +116,9 @@ class LimbPartition {
         size_t bytes = 0;
     };
     DevScratch scratch_[SC_N];
+    // Outgrown scratch buffers: work already enqueued on this partition's stream may still read them, so they are
+    // freed with the partition (scratchFreeAll) instead of behind a stream sync at the growth (FIDESLIB_SCRATCH_RETIRE).
+    std::vector<void*> scratchRetired_;
     /** Persistent scratch for `slot`, at least `bytes` big. Returns nullptr when bytes == 0 or the
      *  allocation fails; the caller must then fall back to its per-call allocation. */
     void* scratchGet(int slot, size_t bytes);
