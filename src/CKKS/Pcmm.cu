@@ -11,6 +11,7 @@
 #include "CKKS/Limb.cuh"
 #include "CKKS/LimbPartition.cuh"
 #include "CKKS/RNSPoly.cuh"
+#include "CudaUtils.cuh"
 
 namespace FIDESlib::CKKS {
 
@@ -430,7 +431,8 @@ void keySwitch(const uint32_t* x, uint32_t* res, int n, int outs, int nl, const 
     modDown<<<dim3((n + 255) / 256, outs, 2), 256, 0, s>>>(acc, res, n, outs, K.pr, pinv);
 }
 
-// cached device buffers, grown on demand
+// cached device buffers, grown on demand; an allocation the device cannot serve releases the runtime pool's idle
+// memory and retries once (the pool holds most of the device between its own allocations)
 struct Buf {
     void* p = nullptr;
     size_t n = 0;
@@ -438,7 +440,19 @@ struct Buf {
         const size_t want = count * sizeof(T);
         if (want > n) {
             if (p) cudaFree(p);
-            PCMM_CUDA(cudaMalloc(&p, want));
+            p = nullptr;
+            n = 0;
+            if (cudaMalloc(&p, want) != cudaSuccess) {
+                cudaGetLastError();
+                int dev = 0;
+                cudaGetDevice(&dev);
+                GPUpoolTrim(dev);
+                cudaMemPool_t pool;
+                if (cudaDeviceGetDefaultMemPool(&pool, dev) == cudaSuccess) cudaMemPoolTrimTo(pool, 0);
+                cudaDeviceSynchronize();
+                p = nullptr;
+                PCMM_CUDA(cudaMalloc(&p, want));
+            }
             n = want;
         }
         return static_cast<T*>(p);
