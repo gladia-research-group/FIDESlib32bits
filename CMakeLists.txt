@@ -257,6 +257,7 @@ if (TBB_FOUND)
 endif()
 
 target_link_libraries(fideslib
+	PUBLIC CUDA::cublas
 	PRIVATE CUDA::cudart
 	PRIVATE CUDA::cuda_driver
 )
