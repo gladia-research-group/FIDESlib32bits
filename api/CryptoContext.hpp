@@ -462,7 +462,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 /// No-op when FHE_PIN_STAGE=0.
 void PrewarmStageArenas();
 
-/// @brief FIDESLIB_FAST_DECRYPT (default 0), settable at run time for the gate.
+/// @brief FIDESLIB_FAST_DECRYPT (default 1), settable at run time for the gate.
 void SetFastDecrypt(int on);
 
 } // namespace fideslib

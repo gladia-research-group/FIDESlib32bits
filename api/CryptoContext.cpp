@@ -2190,11 +2190,12 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::Encrypt(const PrivateKey<DCRTP
 	return Encrypt(pt, sk);
 }
 
-// FIDESLIB_FAST_DECRYPT=1: the host container a device ciphertext is decrypted in is built empty instead of by a
+// FIDESLIB_FAST_DECRYPT (default 1; 0 restores the dummy encryption): the host container a device ciphertext is
+// decrypted in is built empty instead of by a
 // dummy secret-key encryption (~16 ms at 4 towers); the decrypted values are identical.
 static std::atomic<int> g_fast_decrypt{ [] {
 	const char* e = std::getenv("FIDESLIB_FAST_DECRYPT");
-	return e ? std::atoi(e) : 0;
+	return e ? std::atoi(e) : 1;
 }() };
 static bool fast_decrypt_on() {
 	return g_fast_decrypt.load(std::memory_order_relaxed) > 0;
