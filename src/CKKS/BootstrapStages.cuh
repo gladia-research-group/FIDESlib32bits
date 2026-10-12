@@ -29,7 +29,11 @@ struct BtsState {
 };
 
 BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirst = true);
-void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st);
+// FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1: StC-first only through the staged API (the PCMM), Bootstrap keeps the shipped order
+bool stcFirstStagedOnly();
+// StC-first input limb index on the route (-1: none)
+int btsStcFirstEntry(Ciphertext& ctxt, int slots);
+void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf = false);
 void btsModRaise(Ciphertext& ctxt, BtsState& st);
 void btsFold(Ciphertext& ctxt, const BtsState& st);
 void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k);

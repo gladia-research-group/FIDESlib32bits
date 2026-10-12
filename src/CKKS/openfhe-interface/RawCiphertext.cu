@@ -15,6 +15,7 @@
 #include "CKKS/SmallInt.cuh"
 #include "CKKS/SparseB.cuh"
 #include "CKKS/PtCompact.cuh"
+#include "CKKS/BootstrapStages.cuh"
 
 static int sparseBEnv();
 static bool sparseBGeometry(int N, int slots, int& n, int& r, int& s, int& b);
@@ -2000,7 +2001,7 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
         std::cerr << "[raise_variant] slots=" << slots << " drop " << drop << " skipped: SparseB route\n";
         return;
     }
-    if (base.stc_first_mode > 0) {  // its sites raise to the top (GetBootPrecomputation serves the base)
+    if (base.stc_first_mode > 0 && !FIDESlib::CKKS::stcFirstStagedOnly()) {  // its sites raise to the top (GetBootPrecomputation serves the base)
         std::cerr << "[raise] slots=" << slots << ": StC-first route, no variant for drop " << drop << "\n";
         return;
     }
