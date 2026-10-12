@@ -3514,6 +3514,30 @@ Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalRotate(const Ciphertext<DC
 	return result;
 }
 
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalRotateSumHoisted(const Ciphertext<DCRTPoly>& ciphertext,
+                                                                       const std::vector<int32_t>& indices) {
+	// Fall back to CPU.
+	if (this->devices.empty()) {
+		auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+		auto& ctImpl  = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+		auto acc	  = ctImpl->Clone();
+		for (int32_t index : indices)
+			acc = context->EvalAdd(acc, context->EvalRotate(ctImpl, index));
+		Ciphertext<DCRTPoly> result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+		result->cpu					= std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(acc);
+		return result;
+	}
+
+	// GPU path.
+	this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
+
+	Ciphertext<DCRTPoly> result = this->MakeGpuResultLike(ciphertext);
+	auto res_gpu				= std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+	res_gpu->rotateSumHoisted(std::vector<int>(indices.begin(), indices.end()));
+
+	return result;
+}
+
 void CryptoContextImpl<DCRTPoly>::EvalRotateInPlace(Ciphertext<DCRTPoly>& ciphertext, int32_t index) {
 
 	// Fall back to CPU.

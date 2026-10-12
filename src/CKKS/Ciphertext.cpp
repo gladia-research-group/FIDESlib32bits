@@ -1441,6 +1441,24 @@ void Ciphertext::rotate_hoisted_chunked(const std::vector<int>& indexes_, std::v
 			discardDigitLimbs(in.GPU[j], in.GPU[j].s.ptr());
 }
 
+void Ciphertext::rotateSumHoisted(const std::vector<int>& indexes) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(!indexes.empty());
+	std::vector<std::unique_ptr<Ciphertext>> tmp;
+	std::vector<Ciphertext*> res;
+	tmp.reserve(indexes.size());
+	for (size_t i = 0; i < indexes.size(); ++i) {
+		tmp.emplace_back(std::make_unique<Ciphertext>(cc_));
+		res.push_back(tmp.back().get());
+	}
+	rotate_hoisted(indexes, res, true);	 // every rotation left in the extended basis
+	for (size_t i = 1; i < res.size(); ++i)
+		res[0]->add(*res[i]);  // the group's sum, still extended (special limbs included)
+	res[0]->modDown();
+	add(*res[0]);
+}
+
 void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ciphertext*> results, const bool ext) {
 	std::vector<int> indexes;
 	for (auto i : indexes_) {

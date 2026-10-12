@@ -540,6 +540,10 @@ class Ciphertext {
      * @param ext     If true, extends ciphertexts before rotation.
      */
     void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext);
+    /// this += sum_i rot(this, indexes[i]): one hoisted ModUp, one key dot per index, the rotations summed in the
+    /// extended basis Q u P and ONE ModDown for the group (a radix group of a rotate-and-sum ladder; the ModDown
+    /// rounds once instead of once per rotation).
+    void rotateSumHoisted(const std::vector<int>& indexes);
     /// Chunked form for LinearTransform (fused single-GPU path, ext = true only): one ModUp,
     /// then the hoisted key-switch dot is launched per limb range and `on_chunk(part, begin,
     /// count)` runs right after each range (part 1 = special limbs, 0 = regular limbs), so the
