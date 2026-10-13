@@ -1152,14 +1152,17 @@ bool ContextData::hasAuxilarPoly() const {
 static std::mutex aux_poly_mtx;
 
 RNSPoly ContextData::getAuxilarPoly() {
-    std::lock_guard<std::mutex> g(aux_poly_mtx);
-    if (precom.auxPoly.empty()) {
-        return RNSPoly(*this);
-    } else {
-        RNSPoly res(std::move(precom.auxPoly.back()));
-        precom.auxPoly.pop_back();
-        return res;
+    {
+        std::lock_guard<std::mutex> g(aux_poly_mtx);
+        if (!precom.auxPoly.empty()) {
+            RNSPoly res(std::move(precom.auxPoly.back()));
+            precom.auxPoly.pop_back();
+            return res;
+        }
     }
+    // a fresh polynomial allocates outside the lock: a device-full allocation runs the pool's reclaim hook
+    // (releaseAuxilarPolys), which takes it
+    return RNSPoly(*this);
 }
 
 void ContextData::returnAuxilarPoly(RNSPoly&& c) {
