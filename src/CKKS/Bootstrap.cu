@@ -3,6 +3,7 @@
 //
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -243,6 +244,18 @@ void FIDESlib::CKKS::BootstrapCPUraise(
 
 namespace FIDESlib::CKKS {
 
+// Entries of the StC-first last-stage caches (FIDESLIB_STC_LAST_CACHE, default 4). An entry is the route's last stage
+// re-levelled for one input scale: ~0.2 GB on the sparse routes, 1-2 GB on the dense one, and the PCMM's inputs bring a
+// new scale per linear and block, so a long cache mostly holds misses.
+static size_t lastStageCacheCap() {
+    static const size_t cap = [] {
+        const char* e = std::getenv("FIDESLIB_STC_LAST_CACHE");
+        return (e && *e) ? std::max<size_t>(1, std::strtoull(e, nullptr, 10)) : size_t(4);
+    }();
+    return cap;
+}
+
+
 static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescaled, const bool allowStcFirst);
 
 std::function<void(Ciphertext&, int, bool)> g_bootstrapOverride;
@@ -414,7 +427,7 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
             const std::pair<int, long long> key{cfStage, std::llround(std::log2(nfIn) * 1e6)};  // nominal scales per level
             // The cached last stages must keep their special limbs (the Q-only variant lost 15 bits, chain93); the
             // cache is bounded (each entry ~0.2 GB; one per input scale).
-            constexpr size_t kLastStageCache = 24;
+            const size_t kLastStageCache = lastStageCacheCap();
             if (isLT) {
                 auto it = pre.lt_first_last.find(key);
                 if (it == pre.lt_first_last.end()) {
@@ -1344,7 +1357,7 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
         multIntScalar(ctxt, uint64_t{1} << (cfStage - cf));
     const double factor = std::ldexp(1.0, -cfStage) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
     const std::pair<int, long long> key{cfStage, std::llround(std::log2(nfIn) * 1e6)};
-    constexpr size_t kLastStageCache = 24;
+    const size_t kLastStageCache = lastStageCacheCap();
     if (st.isLT) {
         auto it = pre.lt_first_last.find(key);
         if (it == pre.lt_first_last.end()) {

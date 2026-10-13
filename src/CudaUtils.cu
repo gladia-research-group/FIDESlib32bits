@@ -576,6 +576,13 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
             throw std::runtime_error("[gpu_pool] device " + std::to_string(id) + " out of memory for " +
                                      std::to_string(bytes) + " B (after reclaim and trim)");
         }
+        if (pool_trace_on()) {     // the unpooled sizes are traced too (FIDESLIB_POOL_TRACE)
+            PoolTraceRec r;
+            r.bytes = bytes;
+            r.n = backtrace(r.fr, 40);
+            std::lock_guard<std::mutex> guard(mempool_lock[id]);
+            pool_live[id][ptr] = r;
+        }
     } else {
         if (size_to_memory[id][bytes].empty()) {
             cudaSetDevice(id);
@@ -652,6 +659,10 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
         s[id].init();
     }
 
+    if (pool_trace_on()) {
+        std::lock_guard<std::mutex> guard(mempool_lock[id]);
+        pool_live[id].erase(ptr);
+    }
     if (0) {
         cudaFree(ptr);
     } else if (1) {
