@@ -17,6 +17,7 @@
 #include <cassert>
 #include <list>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include "CudaUtils.cuh"
 
@@ -472,7 +473,13 @@ GPUpoolStats GPUpoolStatsOf(int id) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     void* ptr = nullptr;
 
-    uint64_t MBs = 1024;
+    // slab size of the pooled classes >= 64 KB (FIDESLIB_POOL_SLAB_MB, default 64): a slab goes back to CUDA only when
+    // every block in it is free, so one survivor pins the whole slab; small slabs keep idle memory trimmable
+    static const uint64_t slab_mb = [] {
+        const char* e = std::getenv("FIDESLIB_POOL_SLAB_MB");
+        return (e && *e) ? std::max<uint64_t>(1, std::strtoull(e, nullptr, 10)) : uint64_t(64);
+    }();
+    uint64_t MBs = slab_mb;
 
     if (bytes < 64 * 1024) {
         int next_pow2 = 1024;
@@ -496,7 +503,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
         CudaCheckErrorModNoSync;
         if (free_limb.empty()) {
             uint64_t* base = nullptr;
-            const size_t slab = MBs * 1024 * 1024;
+            const size_t slab = std::max<size_t>(MBs * 1024 * 1024, (size_t)bytes);
             cudaError_t e = cudaMallocAsync((void**)&base, slab, s[id].ptr());
             if (e == cudaErrorMemoryAllocation) {
                 cudaGetLastError();
@@ -522,6 +529,9 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
             }
         }
         CudaCheckErrorModNoSync;
+        if (free_limb.empty())     // still full after the reclaim and the trim: fail loudly, never pop an empty list
+            throw std::runtime_error("[gpu_pool] device " + std::to_string(id) + " out of memory for a " +
+                                     std::to_string(bytes) + " B block (after reclaim and trim)");
 
         if (stream != nullptr) {
             s[id].record();
@@ -550,7 +560,11 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     if (0) {
         cudaMalloc(&ptr, bytes);
     } else if (1) {
-        malloc_or_trim(id, &ptr, bytes, 0, false);
+        if (malloc_or_trim(id, &ptr, bytes, 0, false) != cudaSuccess || ptr == nullptr) {
+            cudaGetLastError();
+            throw std::runtime_error("[gpu_pool] device " + std::to_string(id) + " out of memory for " +
+                                     std::to_string(bytes) + " B (after reclaim and trim)");
+        }
     } else {
         if (size_to_memory[id][bytes].empty()) {
             cudaSetDevice(id);
