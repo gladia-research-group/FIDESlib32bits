@@ -1160,8 +1160,7 @@ RNSPoly ContextData::getAuxilarPoly() {
             return res;
         }
     }
-    // a fresh polynomial allocates outside the lock: a device-full allocation runs the pool's reclaim hook
-    // (releaseAuxilarPolys), which takes it
+    // allocate outside the lock: a device-full allocation's reclaim hook (releaseAuxilarPolys) takes it
     return RNSPoly(*this);
 }
 
@@ -1185,8 +1184,7 @@ size_t ContextData::releaseAuxilarPolys() {
         std::lock_guard<std::mutex> g(aux_poly_mtx);
         drop.swap(precom.auxPoly);
     }
-    // a recycled polynomial can still be read by kernels queued on the limb streams of its last use: wait for them
-    // before its limbs go back to the pool (device-full only, so the sync is rare)
+    // queued kernels may still read a recycled polynomial: sync before its limbs go back (device-full only)
     if (!drop.empty()) cudaDeviceSynchronize();
     return drop.size();   // destroyed here, outside the lock: their limbs go back to the pool
 }

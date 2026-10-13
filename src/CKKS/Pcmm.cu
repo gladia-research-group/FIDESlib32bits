@@ -431,8 +431,7 @@ void keySwitch(const uint32_t* x, uint32_t* res, int n, int outs, int nl, const 
     modDown<<<dim3((n + 255) / 256, outs, 2), 256, 0, s>>>(acc, res, n, outs, K.pr, pinv);
 }
 
-// cached device buffers, grown on demand; an allocation the device cannot serve releases the runtime pool's idle
-// memory and retries once (the pool holds most of the device between its own allocations)
+// cached device buffers, grown on demand; on OOM trim the runtime pools and retry once
 struct Buf {
     void* p = nullptr;
     size_t n = 0;
