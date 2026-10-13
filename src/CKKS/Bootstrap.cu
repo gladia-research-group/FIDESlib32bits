@@ -250,8 +250,17 @@ namespace FIDESlib::CKKS {
 static size_t lastStageCacheCap() {
     static const size_t cap = [] {
         const char* e = std::getenv("FIDESLIB_STC_LAST_CACHE");
-        return (e && *e) ? std::max<size_t>(1, std::strtoull(e, nullptr, 10)) : size_t(4);
+        return (e && *e) ? std::max<size_t>(1, std::strtoull(e, nullptr, 10)) : size_t(24);
     }();
+    // under memory pressure (device free < FIDESLIB_STC_LAST_CACHE_FREE_GB, default 8) the cache keeps one entry: the
+    // misses it saves are not worth an out-of-memory
+    static const double floor_gb = [] {
+        const char* e = std::getenv("FIDESLIB_STC_LAST_CACHE_FREE_GB");
+        return (e && *e) ? std::atof(e) : 8.0;
+    }();
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < floor_gb * (1ull << 30))
+        return 1;
     return cap;
 }
 
@@ -433,7 +442,8 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
                 if (it == pre.lt_first_last.end()) {
                     if (pre.lt_first_last.size() >= kLastStageCache) {
                         cudaDeviceSynchronize();  // the evicted plaintexts may still be read by the previous bootstrap's kernels
-                        pre.lt_first_last.erase(pre.lt_first_last.begin());
+                        while (pre.lt_first_last.size() >= kLastStageCache)
+                            pre.lt_first_last.erase(pre.lt_first_last.begin());
                     }
                     std::vector<Plaintext> v;
                     v.reserve(pre.LT.invA.size());
@@ -452,7 +462,8 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
                 if (it == pre.stc_first_last.end()) {
                     if (pre.stc_first_last.size() >= kLastStageCache) {
                         cudaDeviceSynchronize();  // the evicted plaintexts may still be read by the previous bootstrap's kernels
-                        pre.stc_first_last.erase(pre.stc_first_last.begin());
+                        while (pre.stc_first_last.size() >= kLastStageCache)
+                            pre.stc_first_last.erase(pre.stc_first_last.begin());
                     }
                     auto& st = pre.StC.back();
                     BootstrapPrecomputation::LTstep o;
@@ -1363,7 +1374,8 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
         if (it == pre.lt_first_last.end()) {
             if (pre.lt_first_last.size() >= kLastStageCache) {
                 cudaDeviceSynchronize();
-                pre.lt_first_last.erase(pre.lt_first_last.begin());
+                while (pre.lt_first_last.size() >= kLastStageCache)
+                    pre.lt_first_last.erase(pre.lt_first_last.begin());
             }
             std::vector<Plaintext> v;
             for (auto& pt : pre.LT.invA)
@@ -1379,7 +1391,8 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
         if (it == pre.stc_first_last.end()) {
             if (pre.stc_first_last.size() >= kLastStageCache) {
                 cudaDeviceSynchronize();
-                pre.stc_first_last.erase(pre.stc_first_last.begin());
+                while (pre.stc_first_last.size() >= kLastStageCache)
+                    pre.stc_first_last.erase(pre.stc_first_last.begin());
             }
             auto& s0 = pre.StC.back();
             BootstrapPrecomputation::LTstep o;
