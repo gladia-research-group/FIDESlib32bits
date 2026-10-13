@@ -332,8 +332,7 @@ static cudaError_t malloc_or_trim(int id, void** ptr, size_t bytes, cudaStream_t
     if (locked) {
         freed = pool_trim_locked(id);
     } else {
-        // every queued kernel finishes before anything is released: a block can be idle in the pool's books while a
-        // kernel on another stream still reads it, and the trim hands its memory to the next allocation
+        // sync first: a pool-idle block may still be read by a kernel on another stream
         cudaDeviceSynchronize();
         // idle cached objects (the context's polynomial recycler) give their blocks back first, so their slabs can go
         if (size_t n = run_reclaim_hook(id))
@@ -374,8 +373,7 @@ size_t GPUpoolTrim(int id) {
         return 0;
     size_t freed = pool_trim_locked(id);
     cudaStreamSynchronize(s[id].ptr());
-    // the CUDA stream-ordered pool keeps what it ever reserved (release threshold UINT64_MAX, Context.cu): give its
-    // unused memory back to the device too, so allocations outside it (cudaMalloc) can use it
+    // the stream-ordered pool never releases (threshold UINT64_MAX): trim it so plain cudaMalloc can use it
     cudaDeviceSynchronize();
     cudaMemPool_t mp;
     if (cudaDeviceGetDefaultMemPool(&mp, id) == cudaSuccess) cudaMemPoolTrimTo(mp, 0);
@@ -484,8 +482,7 @@ GPUpoolStats GPUpoolStatsOf(int id) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     void* ptr = nullptr;
 
-    // slab size of the pooled classes >= 64 KB (FIDESLIB_POOL_SLAB_MB, default 64): a slab goes back to CUDA only when
-    // every block in it is free, so one survivor pins the whole slab; small slabs keep idle memory trimmable
+    // FIDESLIB_POOL_SLAB_MB (default 64): one live block pins its slab, so small slabs keep idle memory trimmable
     static const uint64_t slab_mb = [] {
         const char* e = std::getenv("FIDESLIB_POOL_SLAB_MB");
         return (e && *e) ? std::max<uint64_t>(1, std::strtoull(e, nullptr, 10)) : uint64_t(64);
@@ -540,7 +537,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
             }
         }
         CudaCheckErrorModNoSync;
-        if (free_limb.empty())     // still full after the reclaim and the trim: fail loudly, never pop an empty list
+        if (free_limb.empty())     // never pop an empty list
             throw std::runtime_error("[gpu_pool] device " + std::to_string(id) + " out of memory for a " +
                                      std::to_string(bytes) + " B block (after reclaim and trim)");
 
@@ -576,7 +573,7 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
             throw std::runtime_error("[gpu_pool] device " + std::to_string(id) + " out of memory for " +
                                      std::to_string(bytes) + " B (after reclaim and trim)");
         }
-        if (pool_trace_on()) {     // the unpooled sizes are traced too (FIDESLIB_POOL_TRACE)
+        if (pool_trace_on()) {     // unpooled sizes are traced too
             PoolTraceRec r;
             r.bytes = bytes;
             r.n = backtrace(r.fr, 40);

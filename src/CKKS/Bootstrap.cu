@@ -244,16 +244,13 @@ void FIDESlib::CKKS::BootstrapCPUraise(
 
 namespace FIDESlib::CKKS {
 
-// Entries of the StC-first last-stage caches (FIDESLIB_STC_LAST_CACHE, default 4). An entry is the route's last stage
-// re-levelled for one input scale: ~0.2 GB on the sparse routes, 1-2 GB on the dense one, and the PCMM's inputs bring a
-// new scale per linear and block, so a long cache mostly holds misses.
+// StC-first last-stage cache entries (FIDESLIB_STC_LAST_CACHE, default 24): ~0.2 GB sparse, 1-2 GB dense each.
 static size_t lastStageCacheCap() {
     static const size_t cap = [] {
         const char* e = std::getenv("FIDESLIB_STC_LAST_CACHE");
         return (e && *e) ? std::max<size_t>(1, std::strtoull(e, nullptr, 10)) : size_t(24);
     }();
-    // under memory pressure (device free < FIDESLIB_STC_LAST_CACHE_FREE_GB, default 8) the cache keeps one entry: the
-    // misses it saves are not worth an out-of-memory
+    // under memory pressure (free < FIDESLIB_STC_LAST_CACHE_FREE_GB, default 8) keep one entry
     static const double floor_gb = [] {
         const char* e = std::getenv("FIDESLIB_STC_LAST_CACHE_FREE_GB");
         return (e && *e) ? std::atof(e) : 8.0;
