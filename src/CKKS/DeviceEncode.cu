@@ -163,7 +163,7 @@ void ensure(Scratch& s, ContextData& C) {
 
 namespace {
 // the encode of whatever sits in s.v (on stream E): the FFT, the coefficients, the limb scatter and the NTT
-cudaStream_t encodeFromScratch(Scratch& s, Plaintext& pt, int limbs, double scale, int deg) {
+cudaStream_t encodeFromScratch(Scratch& s, Plaintext& pt, int limbs, double scale, int deg, double* cmaxPinned = nullptr) {
     ContextData& C = pt.cc;
     const int N = C.N;
     const cudaStream_t E = s.stream;
@@ -188,6 +188,9 @@ cudaStream_t encodeFromScratch(Scratch& s, Plaintext& pt, int limbs, double scal
     }
     cudaMemsetAsync(s.cmax, 0, sizeof(unsigned long long), E);
     coeffs_<<<(N + 255) / 256, 256, 0, E>>>(in, N, scale, s.c, s.cmax);
+    // the max |coefficient| read back before `encoded` is recorded: a host wait on the plaintext's stream covers it
+    if (cmaxPinned)   // the bit pattern of a non-negative double, read back as one
+        cudaMemcpyAsync(cmaxPinned, s.cmax, sizeof(double), cudaMemcpyDeviceToHost, E);
     pt.c0.grow(limbs - 1);   // with the NTT's aux buffers (constant limbs have none), as Spru.cu
     const cudaStream_t ps = pt.c0.GPU.at(0).s.ptr();
     cudaEventRecord(s.limbsReady, ps);
@@ -213,11 +216,7 @@ cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double
     const cudaStream_t E = s.stream;
     cudaMemsetAsync(s.v, 0, sizeof(double2) * N / 2, E);
     cudaMemcpyAsync(s.v, values.data(), sizeof(double2) * values.size(), cudaMemcpyHostToDevice, E);
-    // the coefficients' max is read back before the scatter overwrites nothing it needs: same stream E
-    const cudaStream_t ps = encodeFromScratch(s, pt, limbs, scale, deg);
-    if (cmaxPinned)   // the bit pattern of a non-negative double, read back as one
-        cudaMemcpyAsync(cmaxPinned, s.cmax, sizeof(double), cudaMemcpyDeviceToHost, E);
-    return ps;
+    return encodeFromScratch(s, pt, limbs, scale, deg, cmaxPinned);
 }
 
 std::vector<cudaStream_t> encodeRowsOnDevice(const std::vector<Plaintext*>& pts, const void* rows, int dtype, size_t n,
