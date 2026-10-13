@@ -331,6 +331,9 @@ static cudaError_t malloc_or_trim(int id, void** ptr, size_t bytes, cudaStream_t
     if (locked) {
         freed = pool_trim_locked(id);
     } else {
+        // every queued kernel finishes before anything is released: a block can be idle in the pool's books while a
+        // kernel on another stream still reads it, and the trim hands its memory to the next allocation
+        cudaDeviceSynchronize();
         // idle cached objects (the context's polynomial recycler) give their blocks back first, so their slabs can go
         if (size_t n = run_reclaim_hook(id))
             std::cerr << "[gpu_pool] out of memory for " << bytes << " B: reclaimed " << n << " cached polynomials"
