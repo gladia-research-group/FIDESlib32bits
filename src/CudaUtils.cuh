@@ -172,6 +172,7 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache = fal
  * idle as a whole (what GPUpoolTrim would release). */
 struct GPUpoolStats {
     size_t reserved = 0, idle = 0, trimmable = 0, slabs = 0;
+    size_t cuda_reserved = 0, cuda_used = 0;   // the CUDA stream-ordered pool under it (every cudaMallocAsync)
 };
 GPUpoolStats GPUpoolStatsOf(int id);
 /* Hand the idle slabs of device `id` back to the CUDA stream-ordered pool (shared by every allocation). Returns the

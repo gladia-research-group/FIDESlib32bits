@@ -374,6 +374,11 @@ size_t GPUpoolTrim(int id) {
         return 0;
     size_t freed = pool_trim_locked(id);
     cudaStreamSynchronize(s[id].ptr());
+    // the CUDA stream-ordered pool keeps what it ever reserved (release threshold UINT64_MAX, Context.cu): give its
+    // unused memory back to the device too, so allocations outside it (cudaMalloc) can use it
+    cudaDeviceSynchronize();
+    cudaMemPool_t mp;
+    if (cudaDeviceGetDefaultMemPool(&mp, id) == cudaSuccess) cudaMemPoolTrimTo(mp, 0);
     return freed;
 }
 
@@ -466,6 +471,12 @@ GPUpoolStats GPUpoolStatsOf(int id) {
         if (sl.nfree == sl.nblocks)
             st.trimmable += total;
         st.slabs++;
+    }
+    cudaMemPool_t mp;
+    if (cudaDeviceGetDefaultMemPool(&mp, id) == cudaSuccess) {
+        uint64_t v = 0;
+        if (cudaMemPoolGetAttribute(mp, cudaMemPoolAttrReservedMemCurrent, &v) == cudaSuccess) st.cuda_reserved = v;
+        if (cudaMemPoolGetAttribute(mp, cudaMemPoolAttrUsedMemCurrent, &v) == cudaSuccess) st.cuda_used = v;
     }
     return st;
 }
