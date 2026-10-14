@@ -139,12 +139,13 @@ std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& 
     K->N = (int)cc->GetRingDimension();
     K->B = K->N / h;
     const int N = K->N, B = K->B, n = K->n;
-    // ---- block key s' (binary, one 1 per block, s'_0 = 1)
-    std::mt19937_64 rng(std::random_device{}());
+    // ---- block key s' (binary, one 1 per block, s'_0 = 1). Positions come from OpenFHE's CSPRNG, the one its own
+    // secret keys are drawn from: a generator seeded with one 32-bit word would leave the key 2^32 candidates.
+    std::uniform_int_distribution<int> pick(0, B - 1);
     K->pos.resize(h);
     std::vector<int64_t> sv(N, 0);
     for (int b = 0; b < h; ++b) {
-        K->pos[b] = b == 0 ? 0 : (int)(rng() % (uint64_t)B);
+        K->pos[b] = b == 0 ? 0 : pick(lbcrypto::PseudoRandomNumberGenerator::GetPRNG());
         sv[b * B + K->pos[b]] = 1;
     }
     auto params = cc->GetElementParams();
