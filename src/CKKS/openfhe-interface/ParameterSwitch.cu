@@ -110,6 +110,7 @@ createContextSwitchingKeys(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cca,
         skNewMain->SetKeyTag(a->GetKeyTag());
         atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
             cca->GetScheme()->KeySwitchGen(a, skNewMain));
+        KeepBottomLimbs(atob, cca->GetElementParams()->GetParams().size(), srcCompositeDegree);
     } else if (scaling != lbcrypto::FLEXIBLEAUTOEXT) {
         atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
             ccb->GetScheme()->KeySwitchGen(a, skNew));
