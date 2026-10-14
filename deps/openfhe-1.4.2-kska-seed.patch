@@ -26,19 +26,19 @@ OPENFHE_HAS_KSKA_SEED feature macro). u32-moduli chains only; threshold-HE
 
 diff --git a/src/core/include/utils/kskseedexpand.h b/src/core/include/utils/kskseedexpand.h
 new file mode 100644
-index 00000000..613d403e
+index 00000000..d9284543
 --- /dev/null
 +++ b/src/core/include/utils/kskseedexpand.h
 @@ -0,0 +1,166 @@
 +//
-+// Lever 1b-ii (KSK seed expansion): deterministic, random-access expansion of the
++// KSK seed expansion: deterministic, random-access expansion of the
 +// key-switching-key `a` component from a 256-bit per-key seed.
 +//
-+// ============================== FROZEN SPEC v1 ==============================
-+// Generator: ChaCha12 in counter mode (USER RULING 2026-07-27: crypto-grade expander,
-+// NOT Philox — seed-expanded public `a` is standard practice only with a cryptographic
-+// XOF; ChaCha is GPU-native. 12 rounds; the block function below takes the round count
-+// so ChaCha20 is a one-line swap at the call sites).
++// ===================== the 32-bit (KSKA) lane ===============================
++// The keystream below is frozen: any change to it invalidates every serialized key.
++// Generator: ChaCha12 in counter mode (a crypto-grade expander, not Philox: seed-expanded public
++// `a` is standard practice only with a cryptographic XOF; ChaCha is GPU-native. The block
++// function below takes the round count so ChaCha20 is a one-line swap at the call sites).
 +//
 +// State layout (standard ChaCha constants row):
 +//   s[0..3]  = "expa" "nd 3" "2-by" "te k"  (0x61707865, 0x3320646e, 0x79622d32, 0x6b206574)
@@ -59,12 +59,12 @@ index 00000000..613d403e
 +//     m = 0xFFFFFFFF / p  (== floor(2^32/p) since p is an odd prime)
 +//     accept the first v with v < m*p  ->  coefficient = v % p   (exact-uniform rejection)
 +//   all T_MAX rejected (prob < (p/2^32)^16 < 2^-64 per coeff): coefficient = last v % p.
-+// T_MAX = 16. Rejection prob per attempt < p/2^32 < 2^-4 for this campaign's p < 2^28,
++// T_MAX = 16. Rejection prob per attempt < p/2^32 < 2^-4 for p < 2^28,
 +// so the expected extra-block rate is < 2^-4 per coefficient — the stage-3 kernel path
 +// amortizes one block per 16 slots and takes the rare escalation divergently.
 +//
-+// `a` is sampled by OpenFHE DIRECTLY in EVALUATION format (poly-impl.h:64,
-+// keyswitch-hybrid.cpp:103 — verified 2026-07-27), so slot s is literally the eval-format
++// `a` is sampled by OpenFHE DIRECTLY in EVALUATION format (poly-impl.h,
++// keyswitch-hybrid.cpp), so slot s is literally the eval-format
 +// coefficient index on both platforms; loadDecompDigit copies host vectors verbatim.
 +//
 +// THE OPENFHE PATCH CARRIES A PLAIN-C++ COPY OF THIS FILE (the two trees cannot share a
@@ -132,8 +132,8 @@ index 00000000..613d403e
 +    out[12] = x12 + s[12]; out[13] = x13 + s[13]; out[14] = x14 + s[14]; out[15] = x15 + s[15];
 +}
 +
-+/* The original KSKA-lane block: byte-identical keystream to SPEC v1 (pure refactor onto
-+ * chacha_block_tail; the CpuGpuParity + keygen-vector gates prove the stream unchanged). */
++/* The KSKA-lane block, expressed through chacha_block_tail. The keystream is byte-identical
++ * to expanding the rounds here directly; the CpuGpuParity and keygen-vector gates check that. */
 +FIDESLIB_KSK_HD void chacha_block(const uint32_t key[8], uint32_t block_ctr, uint32_t digit, uint32_t modulus,
 +                                  uint32_t out[16]) {
 +    chacha_block_tail(key, block_ctr, digit, modulus, kDomainSep, out);
@@ -157,9 +157,9 @@ index 00000000..613d403e
 +    return v % p;
 +}
 +
-+// ========================= SPEC v2 — the 64-bit (KSKB) lane =========================
-+// (2026-08-26, NATIVE_SIZE=64 port.) Primes up to 2^60 (the n64 chain: 53-bit scale,
-+// 60-bit q0/specials). Additive next to SPEC v1: the u32 lane's keystream is untouched.
++// ========================= the 64-bit (KSKB) lane ===================================
++// Primes up to 2^60 (NATIVE_SIZE=64 chains). Additive: the 32-bit lane's keystream is
++// untouched.
 +//   s[13] = (digit & 0xF) | (uint32)(p >> 32) << 4    digit < 16 (dnum <= 8 everywhere
 +//                                                     deployed), p_hi = p>>32 < 2^28 for
 +//                                                     p < 2^60 — exact fit, asserted at
