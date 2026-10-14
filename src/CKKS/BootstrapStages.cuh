@@ -34,6 +34,8 @@ bool stcFirstStagedOnly();
 // StC-first input limb index on the route (-1: none)
 int btsStcFirstEntry(Ciphertext& ctxt, int slots);
 void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf = false);
+// StC outside a bootstrap, output at limb outLimb; skipMask bit s skips stage s (SinC encoding)
+void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int skipMask = 0, double nfRef = 0);
 void btsModRaise(Ciphertext& ctxt, BtsState& st);
 void btsFold(Ciphertext& ctxt, const BtsState& st);
 void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k);

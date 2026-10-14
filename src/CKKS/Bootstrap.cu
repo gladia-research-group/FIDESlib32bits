@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1406,6 +1408,63 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
     if (ctxt.getLevel() != lastL || ctxt.NoiseLevel != 2)
         throw std::runtime_error("[stc_first] folded last stage left the ciphertext at limb index " +
                                  std::to_string(ctxt.getLevel()));
+}
+
+void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int skipMask, double nfRef) {
+    CudaNvtxRange r(std::string{"bts::stc_high"});
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    auto& pre = cc.GetBootPrecomputation(slots);
+    if (slots != cc.N / 2 || pre.StC.empty())
+        throw std::runtime_error("[stc_high] dense full-slot route only");
+    const int d = cc.compositeDegree();
+    std::vector<int> keep;
+    for (int si = 0; si < (int)pre.StC.size(); ++si)
+        if (!(skipMask >> si & 1))
+            keep.push_back(si);
+    const int nS = (int)keep.size();
+    if (nS == 0)
+        throw std::runtime_error("[stc_high] every stage skipped");
+    const int entry = outLimb + nS * d;
+    if (ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    if (ctxt.getLevel() < entry)
+        throw std::runtime_error("[stc_high] input at limb index " + std::to_string(ctxt.getLevel()) + " below entry " +
+                                 std::to_string(entry));
+    if (ctxt.getLevel() > entry)
+        ctxt.dropToLevel(entry);
+    if (nfRef > 0)
+        factor *= nfRef / ctxt.NoiseFactor;
+    ctxt.slots = slots;
+    static std::map<std::tuple<int, int, int, long long>, std::vector<BootstrapPrecomputation::LTstep>> cache;
+    const auto key = std::make_tuple(slots, outLimb, skipMask, std::llround(std::log2(factor) * 1e6));
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() >= lastStageCacheCap()) {
+            cudaDeviceSynchronize();
+            cache.erase(cache.begin());
+        }
+        std::vector<BootstrapPrecomputation::LTstep> v;
+        for (int ki = 0; ki < nS; ++ki) {
+            auto& s0 = pre.StC.at(keep[ki]);
+            BootstrapPrecomputation::LTstep o;
+            o.slots = s0.slots; o.bStep = s0.bStep; o.gStep = s0.gStep; o.rotIn = s0.rotIn; o.rotOut = s0.rotOut;
+            const int lv = entry - ki * d;
+            const double fac = ki == nS - 1 ? factor : 1.0;
+            for (auto& pt : s0.A)
+                o.A.push_back(relevelPlaintext(cc_, cc, pt, (lv - pt.c0.getLevel()) / d, fac));
+            v.push_back(std::move(o));
+        }
+        cudaDeviceSynchronize();
+        it = cache.emplace(key, std::move(v)).first;
+    }
+    EvalLTStages(ctxt, it->second, "StCH-stage-");
+    if (ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    if (ctxt.getLevel() != outLimb)
+        throw std::runtime_error("[stc_high] output at limb index " + std::to_string(ctxt.getLevel()) + ", expected " +
+                                 std::to_string(outLimb));
+    cudaDeviceSynchronize();
 }
 
 void btsModRaise(Ciphertext& ctxt, BtsState& st) {
