@@ -15,6 +15,7 @@
 #include "CKKS/RNSPoly.cuh"
 #include "ConstantsGPU.cuh"
 #include "LimbUtils.cuh"
+#include "CKKS/openfhe-interface/ParameterSwitch.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "CKKS/Spru.cuh"  // last: pke/openfhe.h defines a `duration` macro
 #ifdef duration
@@ -155,6 +156,10 @@ std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& 
     skNew->SetKeyTag(keys.secretKey->GetKeyTag());
     auto atob = std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(
         cc->GetScheme()->KeySwitchGen(keys.secretKey, skNew));
+    // applied only at the bottom (spruBootstrap step 2, after dropToLevel(d - 1))
+    KeepBottomLimbs(atob, cc->GetElementParams()->GetParams().size(),
+                    std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters())
+                        ->GetCompositeDegree());
     K->atob = std::make_unique<KeySwitchingKey>(GPUcc_);
     {
         RawKeySwitchKey raw = GetKeySwitchKey(atob);
