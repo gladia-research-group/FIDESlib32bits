@@ -2,6 +2,7 @@
 
 #include <cublas_v2.h>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -500,25 +501,52 @@ void cmt(uint32_t* X, uint32_t* t1, uint32_t* t2, CcmmKeys& K, cudaStream_t s) {
     monoCols<<<g, 256, 0, s>>>(r2, X, -1, K.pr);
 }
 
+__global__ void moveLimbs(uint32_t* const* ptrs, uint32_t* big, bool toBig) {
+    const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= NB) return;
+    uint32_t* bj = big + (size_t)blockIdx.y * NB + k;
+    if (toBig) *bj = ptrs[blockIdx.y][k];
+    else ptrs[blockIdx.y][k] = *bj;
+}
+
+constexpr int NPOLY = 2 * NBIG;
+
+// limb j = (part * NQ + i) * NBIG + c of the staging layout
+uint32_t** limbTable(const std::vector<RNSPoly*>& polys, int which) {
+    static uint32_t** dev[2] = {nullptr, nullptr};
+    if (!dev[which]) CCMM_CUDA(cudaMalloc(&dev[which], sizeof(uint32_t*) * NQ * NPOLY));
+    std::vector<uint32_t*> h((size_t)NQ * NPOLY);
+    for (int part = 0; part < 2; ++part)
+        for (int c = 0; c < NBIG; ++c) {
+            auto& LP = polys[part * NBIG + c]->GPU.at(0);
+            for (int i = 0; i < NQ; ++i)
+                h[((size_t)part * NQ + i) * NBIG + c] = std::get<Limb<uint32_t>>(LP.limb[i]).v.data;
+        }
+    CCMM_CUDA(cudaMemcpy(dev[which], h.data(), sizeof(uint32_t*) * h.size(), cudaMemcpyHostToDevice));
+    return dev[which];
+}
+
 void ringIn(const std::vector<Ciphertext*>& ins, uint32_t* X, CcmmKeys& K, cudaStream_t s) {
     ContextData& cc = ins[0]->cc;
-    static RNSPoly* stage = nullptr;
+    static std::vector<std::unique_ptr<RNSPoly>> stage;
     static ContextData* stage_cc = nullptr;
     if (stage_cc != &cc) {
-        stage = new RNSPoly(cc, 3);
+        stage.clear();
+        for (int j = 0; j < NPOLY; ++j) stage.push_back(std::make_unique<RNSPoly>(cc, 3));
         stage_cc = &cc;
     }
     uint32_t* big = g_buf.big.get<uint32_t>((size_t)NBIG * 2 * NQ * NB);
-    for (int c = 0; c < NBIG; ++c)
-        for (int part = 0; part < 2; ++part) {
-            stage->copy(part ? ins[c]->c1 : ins[c]->c0);
-            stage->INTT(1, true);
-            cudaDeviceSynchronize();
-            auto& LP = stage->GPU.at(0);
-            for (int i = 0; i < NQ; ++i)
-                CCMM_CUDA(cudaMemcpy(big + (((size_t)part * NQ + i) * NBIG + c) * NB,
-                                     std::get<Limb<uint32_t>>(LP.limb[i]).v.data, 4 * NB, cudaMemcpyDeviceToDevice));
+    cudaDeviceSynchronize();
+    std::vector<RNSPoly*> polys(NPOLY);
+    for (int part = 0; part < 2; ++part)
+        for (int c = 0; c < NBIG; ++c) {
+            RNSPoly* st = stage[part * NBIG + c].get();
+            st->copy(part ? ins[c]->c1 : ins[c]->c0);
+            st->INTT(1, true);
+            polys[part * NBIG + c] = st;
         }
+    cudaDeviceSynchronize();
+    moveLimbs<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbTable(polys, 0), big, true);
     const size_t per = (size_t)NBIG * NB;
     uint32_t* res = g_buf.res.get<uint32_t>(2 * (size_t)NQ * per);
     keySwitch(K, big + (size_t)NQ * per, res, NB, NBIG, K.fwd, 0, 0, s);
@@ -527,32 +555,20 @@ void ringIn(const std::vector<Ciphertext*>& ins, uint32_t* X, CcmmKeys& K, cudaS
 }
 
 void ringOut(uint32_t* X, const std::vector<Ciphertext*>& outs, CcmmKeys& K, cudaStream_t s) {
-    ContextData& cc = outs[0]->cc;
-    static RNSPoly* stage = nullptr;
-    static ContextData* stage_cc = nullptr;
-    if (stage_cc != &cc) {
-        stage = new RNSPoly(cc, 3);
-        stage_cc = &cc;
-    }
     uint32_t* big = g_buf.big.get<uint32_t>((size_t)NBIG * 2 * NQ * NB);
     composeBig<<<blocks(COLS), 256, 0, s>>>(X, big);
     const size_t per = (size_t)NBIG * NB;
     uint32_t* res = g_buf.res.get<uint32_t>(2 * (size_t)NQ * per);
     keySwitch(K, big + (size_t)NQ * per, res, NB, NBIG, K.back, 0, 0, s);
     ksApply<<<blocks(NQ * per), 256, 0, s>>>(big, res, per, K.pr);
+    std::vector<RNSPoly*> polys(NPOLY);
+    for (int part = 0; part < 2; ++part)
+        for (int c = 0; c < NBIG; ++c) polys[part * NBIG + c] = part ? &outs[c]->c1 : &outs[c]->c0;
     cudaDeviceSynchronize();
-    for (int c = 0; c < NBIG; ++c)
-        for (int part = 0; part < 2; ++part) {
-            stage->copy(part ? outs[c]->c1 : outs[c]->c0);
-            auto& LP = stage->GPU.at(0);
-            for (int i = 0; i < NQ; ++i)
-                CCMM_CUDA(cudaMemcpy(std::get<Limb<uint32_t>>(LP.limb[i]).v.data,
-                                     big + (((size_t)part * NQ + i) * NBIG + c) * NB, 4 * NB, cudaMemcpyDeviceToDevice));
-            cudaDeviceSynchronize();
-            stage->NTT(1, true);
-            cudaDeviceSynchronize();
-            (part ? outs[c]->c1 : outs[c]->c0).copy(*stage);
-        }
+    moveLimbs<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbTable(polys, 1), big, false);
+    cudaDeviceSynchronize();
+    for (RNSPoly* p : polys) p->NTT(1, true);
+    cudaDeviceSynchronize();
 }
 
 void check(const std::vector<Ciphertext*>& v, CcmmKeys& K, const char* what) {
