@@ -458,7 +458,7 @@ struct Buf {
     }
 };
 struct Bufs {
-    Buf x, scratch, ks, A, Bm, Ap, Bp, C, pk, RA, RB, fb, Xd, Wd, G, Wdev, dst;
+    Buf x, scratch, ks, A, Bm, Ap, Bp, C, pk, RA, RB, fb, Xd, Wd, G, Wdev, dst, dstAll;
 };
 Bufs g_buf;
 
@@ -514,6 +514,10 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
     const int rowsIn = NCH * nIn, rowsOut = NCH * nOut;
     cudaStream_t s = 0;
     for (int i = 0; i < 6 && times; ++i) times[i] = 0;
+    // FIDESLIB_PCMM_ASYNC=1: no host fences inside (s is the legacy stream, which orders against FIDESlib's blocking
+    // streams both ways), no timing marks, outputs lifted straight into their limbs
+    static const bool async = [] { const char* e = std::getenv("FIDESLIB_PCMM_ASYNC"); return e && std::atoi(e) > 0; }();
+    if (async) times = nullptr;
     cudaDeviceSynchronize();
     auto tick = std::chrono::steady_clock::now();
     auto mark = [&](int slot) {
@@ -562,11 +566,16 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
         for (int part = 0; part < 2; ++part) {
             m.copy(part ? ins[c]->c0 : ins[c]->c1);
             m.INTT(1, true);
-            cudaDeviceSynchronize();
+            if (!async) cudaDeviceSynchronize();
             auto& LP = m.GPU.at(0);
-            for (int i = 0; i < 4; ++i)
-                PCMM_CUDA(cudaMemcpy(x + ((size_t)part * 4 + i) * N, std::get<Limb<uint32_t>>(LP.limb[i]).v.data,
-                                     4 * N, cudaMemcpyDeviceToDevice));
+            for (int i = 0; i < 4; ++i) {
+                uint32_t* d = x + ((size_t)part * 4 + i) * N;
+                const uint32_t* v = std::get<Limb<uint32_t>>(LP.limb[i]).v.data;
+                if (async)
+                    PCMM_CUDA(cudaMemcpyAsync(d, v, 4 * N, cudaMemcpyDeviceToDevice, s));
+                else
+                    PCMM_CUDA(cudaMemcpy(d, v, 4 * N, cudaMemcpyDeviceToDevice));
+            }
         }
         for (int part = 0; part < 2; ++part) {
             uint32_t* y = x + (size_t)part * 4 * N;
@@ -599,6 +608,17 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
     Primes lift{};
     const uint64_t q1 = (uint64_t)K.split[2] * K.split[3];
     lift.p[0] = (uint32_t)(q1 % K.split[0]); lift.p[1] = (uint32_t)(q1 % K.split[1]);
+    uint32_t** ddstAll = nullptr;
+    if (async) {
+        ddstAll = G.dstAll.get<uint32_t*>(8 * (size_t)nOut);
+        std::vector<uint32_t*> tab(8 * (size_t)nOut);
+        for (int o = 0; o < nOut; ++o)
+            for (int part = 0; part < 2; ++part) {
+                auto& LP = (part ? outs[o]->c0 : outs[o]->c1).GPU.at(0);
+                for (int i = 0; i < 4; ++i) tab[((size_t)o * 2 + part) * 4 + i] = std::get<Limb<uint32_t>>(LP.limb[i]).v.data;
+            }
+        PCMM_CUDA(cudaMemcpyAsync(ddstAll, tab.data(), sizeof(uint32_t*) * tab.size(), cudaMemcpyHostToDevice, s));
+    }
     for (int o = 0; o < nOut; ++o) {
         packC<<<dim3(N1 / 256, NCH, L), 256, 0, s>>>(Ap, C, rowsOut, o * NCH, K.ly);
         keySwitch(C, pk, N1, S, R, K.pack, K, K.t12, K.it12, scratch, s);
@@ -608,6 +628,16 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
         compose<<<dim3(N / 256, L), 256, 0, s>>>(pk + (size_t)L * S * N1, RB);
         keySwitch(RA, fb, N, 1, 1, K.back, K, K.t16, K.it16, scratch, s);
         addInto<<<(L * N + 255) / 256, 256, 0, s>>>(fb + (size_t)L * N, RB, (size_t)L * N, N, K.pr);
+        if (async) {
+            for (int part = 0; part < 2; ++part) {
+                RNSPoly& P = part ? outs[o]->c0 : outs[o]->c1;
+                liftOut<<<dim3(N / 256, 4), 256, 0, s>>>(fb + (size_t)(part ? 1 : 0) * L * N,
+                                                          ddstAll + ((size_t)o * 2 + part) * 4, K.pr, lift);
+                P.NTT(1, true);
+            }
+            mark(5);
+            continue;
+        }
         for (int part = 0; part < 2; ++part) {
             m.copy(part ? outs[o]->c0 : outs[o]->c1);       // the shape; overwritten
             auto& LP = m.GPU.at(0);
