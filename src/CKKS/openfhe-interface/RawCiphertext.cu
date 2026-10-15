@@ -2082,6 +2082,11 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     var->ghs_btoa = base.ghs_btoa;
     var->cts0_t = base.cts0_t;
     var->raise_drop = drop;
+    if (base.stc_first_mode > 0) {  // staged-only StC-first finishes (the PCMM's) raise to this variant's top
+        var->stc_first_mode = base.stc_first_mode;
+        var->stc_first_entry = base.stc_first_entry;
+        var->stc_first_deg = base.stc_first_deg;
+    }
     var->stc_single = base.stc_single;
     var->cts_single = base.cts_single;
     var->cts_single_lo = base.cts_single_lo;

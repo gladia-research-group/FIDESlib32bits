@@ -1249,6 +1249,10 @@ bool stcFirstStagedOnly() {
     return v;
 }
 
+static thread_local bool g_stcFirstRaiseScope = false;
+bool stcFirstRaiseScope() { return g_stcFirstRaiseScope; }
+void setStcFirstRaiseScope(bool on) { g_stcFirstRaiseScope = on; }
+
 int btsStcFirstEntry(Ciphertext& ctxt, int slots) {
     auto& pre = ctxt.cc.GetBootPrecomputation(slots);
     return pre.stc_first_mode > 0 ? pre.stc_first_entry : -1;
