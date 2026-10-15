@@ -18,6 +18,7 @@
 #include "CKKS/Parameters.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CKKS/forwardDefs.cuh"
+#include "CKKS/openfhe-interface/ParameterSwitch.cuh"
 #include "CKKS/openfhe-interface/RawCiphertext.cuh"
 #include "CudaUtils.cuh"
 #include "Definitions.hpp"
@@ -1827,6 +1828,14 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>
 
 	if (this->devices.empty()) {
 		context->EvalBootstrapKeyGen(skImpl, slots);
+		// the fork's composite dense->sparse key (M-4) is built over all of QP but applied only at the bottom
+		auto cp = std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(context->GetCryptoParameters());
+		if (cp->GetSecretKeyDist() == lbcrypto::SPARSE_ENCAPSULATED && cp->GetCompositeDegree() > 1) {
+			auto& keys = lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::GetEvalAutomorphismKeyMap(skImpl->GetKeyTag());
+			FIDESlib::CKKS::KeepBottomLimbs(
+				std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(keys.at(context->GetCyclotomicOrder() - 4)),
+				cp->GetElementParams()->GetParams().size(), cp->GetCompositeDegree());
+		}
 	} else {
 		FIDESlib::CKKS::GenBootstrapKeys(skImpl, static_cast<int>(slots));
 	}
