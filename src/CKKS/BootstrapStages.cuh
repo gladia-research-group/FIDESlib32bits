@@ -31,6 +31,10 @@ struct BtsState {
 BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirst = true);
 // FIDESLIB_BTS_STC_FIRST_STAGED_ONLY=1: StC-first only through the staged API (the PCMM), Bootstrap keeps the shipped order
 bool stcFirstStagedOnly();
+/** Staged-only StC-first finishes under a raise drop (the PCMM's): GetBootPrecomputation serves (and builds) the
+ *  route's raise variants inside this scope; elsewhere a StC-first route keeps raising to the top. */
+bool stcFirstRaiseScope();
+void setStcFirstRaiseScope(bool on);
 // StC-first input limb index on the route (-1: none)
 int btsStcFirstEntry(Ciphertext& ctxt, int slots);
 void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf = false);

@@ -19,6 +19,7 @@
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/BootstrapStages.cuh"
 
 #include "../parallel_for.hpp"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -751,7 +752,7 @@ BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
     if (drop <= base.raise_drop)
         return base;
     auto it = base.raise_variants.find(drop);
-    if (it == base.raise_variants.end() && base.stc_first_mode > 0)
+    if (it == base.raise_variants.end() && base.stc_first_mode > 0 && !(stcFirstStagedOnly() && stcFirstRaiseScope()))
         return base;  // a StC-first route keeps no variants: the raise goes to the top and lands shallower than planned
     if (it == base.raise_variants.end() && raiseVariantBuilder && raiseDropsAllowed.count(drop)) {
         static std::mutex build_mu;
