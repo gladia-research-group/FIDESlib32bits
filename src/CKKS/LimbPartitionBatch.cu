@@ -360,6 +360,7 @@ void LimbPartition::binomialMultAccumBatch(LimbPartition& acc0, LimbPartition& a
 }
 
 uint32_t g_ltPtMask = 0xFFFFFFFFu;
+int g_ltShareK = 1;
 
 void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const std::vector<LimbPartition*>& in,
                                         const std::vector<LimbPartition*>& pt, int bStep, int gStep, int stride,
@@ -558,6 +559,19 @@ void LimbPartition::LTdotProductPtBatch(std::vector<LimbPartition*>& out, const 
                     data_ptrs_d + soffset_in_c1, data_ptrs_d + soffset_pt, bStep, gStep,
                     SPECIAL(out[0]->id, special_start) + sp_begin, num_LT);
             }
+        } else if (g_ltShareK > 1 && num_LT == g_ltShareK && num_LT <= 4 && (gStep == 1 || gStep == 2 || gStep == 4 || gStep == 8)) {
+            dim3 g1 = grid, sg1 = sgrid;
+            g1.z = sg1.z = 1;
+            if (do_regular && limbsize > 0)
+                dotProductLtSharedPt_<<<g1, block, 0, s.ptr()>>>(
+                    data_ptrs_d + offset_out_c0, data_ptrs_d + offset_out_c1, data_ptrs_d + offset_in_c0,
+                    data_ptrs_d + offset_in_c1, data_ptrs_d + offset_pt, bStep, gStep, PARTITION(out[0]->id, 0) + reg_begin,
+                    num_LT, g_ltPtMask);
+            if (do_special && slimbsize > 0)
+                dotProductLtSharedPt_<<<sg1, block, 0, s.ptr()>>>(
+                    data_ptrs_d + soffset_out_c0, data_ptrs_d + soffset_out_c1, data_ptrs_d + soffset_in_c0,
+                    data_ptrs_d + soffset_in_c1, data_ptrs_d + soffset_pt, bStep, gStep,
+                    SPECIAL(out[0]->id, special_start) + sp_begin, num_LT, g_ltPtMask);
         } else {
             if (do_regular && limbsize > 0) {
                 dotProductLtBatchedPt3___<<<grid, block, shmem_bytes, s.ptr()>>>(

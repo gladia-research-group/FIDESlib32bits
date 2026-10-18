@@ -7,10 +7,14 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/Discard.cuh"
+#include "CKKS/KeySwitchingKey.cuh"
+#include "CKKS/LimbPartition.cuh"
 #include "CKKS/LinearTransform.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CudaUtils.cuh"
 #include <algorithm>
+#include <map>
+#include <memory>
 #include <cstdlib>
 
 #if defined(__clang__)
@@ -871,6 +875,219 @@ std::vector<int> FIDESlib::CKKS::GetConvolutionTransformRotationIndices(int rowS
 	}
 
 	return res;
+}
+
+namespace FIDESlib::CKKS {
+// key-switch aux of batch member c (c > 0: extra ones kept per context)
+static RNSPoly& batchKsAux(ContextData& cc, int c) {
+    if (c == 0)
+        return cc.getKeySwitchAux();
+    static std::map<ContextData*, std::vector<std::unique_ptr<RNSPoly>>> pool;
+    auto& v = pool[&cc];
+    while ((int)v.size() < c)
+        v.push_back(std::make_unique<RNSPoly>(cc, cc.L, false));
+    RNSPoly& p = *v[c - 1];
+    p.generateDecompAndDigit(false);
+    p.generateSpecialLimbs(false, false);
+    return p;
+}
+
+// rotate_hoisted's fused path on K ciphertexts, rot[c * bStep + i] = rotation indexes[i] of cts[c]; false: none done
+static bool hoistRotateBatch(const std::vector<Ciphertext*>& cts, std::vector<Ciphertext*>& rot,
+                             const std::vector<int>& indexes_, int bStep, bool ext) {
+    const int K = (int)cts.size();
+    Ciphertext& x0 = *cts[0];
+    ContextData& cc = x0.cc;
+    if (!hoistRotateFused || cc.GPUid.size() != 1 || K < 2 || K > 4)
+        return false;
+    for (auto* c : cts)
+        if (c->getLevel() != x0.getLevel() || c->keyID != x0.keyID || c->slots != x0.slots ||
+            c->c0.isModUp() != x0.c0.isModUp())
+            return false;
+    std::vector<int> indexes;
+    for (auto i : indexes_)
+        indexes.push_back(x0.normalyzeIndex(i));
+    std::vector<int> kidx;
+    std::vector<LimbPartition*> ka, kb;
+    for (int i = 0; i < bStep; ++i)
+        if (indexes[i] != 0) {
+            auto& ksk = cc.GetRotationKey(indexes[i], x0.keyID, x0.slots);
+            ka.push_back(&ksk.a.GPU[0]);
+            kb.push_back(&ksk.b.GPU[0]);
+            kidx.push_back(indexes[i] == 2 * cc.N - 1 ? 2 * cc.N - 1 : x0.c0.automorph_index_precomp(indexes[i]));
+        }
+    const int n = (int)kidx.size();
+    std::vector<std::vector<LimbPartition*>> c0p(K), c1p(K);
+    std::vector<LimbPartition*> srcs;
+    std::vector<const LimbPartition*> s0, s1;
+    for (int c = 0; c < K; ++c) {
+        Ciphertext& x = *cts[c];
+        for (int i = 0; i < bStep; ++i) {
+            Ciphertext* r = rot[c * bStep + i];
+            r->growToLevel(cc.L);
+            r->dropToLevel(x.c0.getLevel());
+            if (ext) {
+                r->c0.generateSpecialLimbs(false, false);
+                r->c1.generateSpecialLimbs(false, false);
+            }
+        }
+        RNSPoly& in = batchKsAux(cc, c);
+        in.setLevel(x.c1.getLevel());
+        x.c1.modupInto(in);
+        for (int i = 0; i < bStep; ++i) {
+            Ciphertext* r = rot[c * bStep + i];
+            if (indexes[i] == 0) {
+                if (ext && pwFuseFlag()) {
+                    r->copyExtend(x);
+                } else {
+                    r->copy(x);
+                    if (ext)
+                        r->extend();
+                }
+            } else {
+                r->c0.generateSpecialLimbs(false, false);
+                r->c1.generateSpecialLimbs(false, false);
+                c0p[c].push_back(&r->c0.GPU[0]);
+                c1p[c].push_back(&r->c1.GPU[0]);
+                r->copyMetadata(x);
+            }
+        }
+        srcs.push_back(&in.GPU[0]);
+        s0.push_back(&x.c0.GPU[0]);
+        s1.push_back(&x.c1.GPU[0]);
+    }
+    if (!LimbPartition::fusedHoistRotateK(n, kidx, c0p, c1p, ka, kb, srcs, s0, s1, x0.c0.isModUp())) {
+        cudaDeviceSynchronize();
+        return false;
+    }
+    for (int c = 0; c < K; ++c)
+        for (int i = 0; i < bStep; ++i)
+            if (indexes[i] != 0) {
+                Ciphertext* r = rot[c * bStep + i];
+                r->c0.SetModUp(true);
+                r->c1.SetModUp(true);
+                if (!ext)
+                    r->modDown();
+            }
+    return true;
+}
+}  // namespace FIDESlib::CKKS
+
+void FIDESlib::CKKS::LinearTransformBatch(const std::vector<Ciphertext*>& cts, int rowSize, int bStep,
+                                          const std::vector<Plaintext*>& pts, int stride, int offset) {
+    CudaNvtxRange r(std::string{sc::current().function_name()});
+    const int K = (int)cts.size();
+    Context& cc_ = cts[0]->cc_;
+    ContextData& cc = cts[0]->cc;
+    const uint32_t gStep = ceil(static_cast<double>(rowSize) / bStep);
+    if (K == 1 || K > 4 || ltChunkEnv() > 0 || cc.GPUid.size() != 1 ||
+        !(gStep == 1 || gStep == 2 || gStep == 4 || gStep == 8)) {
+        for (auto* c : cts)
+            LinearTransform(*c, rowSize, bStep, pts, stride, offset);
+        return;
+    }
+    assert(rowSize == (int)pts.size());
+    bool ext = bStep != 1;
+    for (auto& i : pts)
+        if (!i->c0.isModUp())
+            ext = false;
+    std::vector<int> indexes;
+    for (int i = 0; i < bStep; ++i)
+        indexes.push_back(i * stride);
+
+    std::vector<std::vector<Ciphertext>> fastRotation(K);
+    std::vector<Ciphertext*> allRot;
+    for (int c = 0; c < K; ++c) {
+        Ciphertext& ctxt = *cts[c];
+        if (ctxt.NoiseLevel == 2)
+            ctxt.rescale();
+        fastRotation[c].reserve(bStep);
+        for (int i = 0; i < bStep; ++i) {
+            fastRotation[c].emplace_back(cc_);
+            fastRotation[c].back().growToLevel(ctxt.getLevel());
+            fastRotation[c].back().dropToLevel(ctxt.getLevel());
+            fastRotation[c].back().extend(false);
+        }
+        for (int i = 0; i < bStep; ++i)
+            allRot.push_back(&fastRotation[c][i]);
+    }
+    if (!hoistRotateBatch(cts, allRot, indexes, bStep, ext)) {
+        // the key-switch aux is shared: each rotation completes before the next starts
+        for (int c = 0; c < K; ++c) {
+            std::vector<Ciphertext*> ptrs(allRot.begin() + c * bStep, allRot.begin() + (c + 1) * bStep);
+            cts[c]->rotate_hoisted(indexes, ptrs, ext);
+            cudaDeviceSynchronize();
+        }
+    }
+
+    std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
+    for (uint32_t j = 0; j < gStep; ++j)
+        for (int i = 0; i < bStep; ++i)
+            if (bStep * (int)j + i < rowSize)
+                Aptr[bStep * j + i] = pts[bStep * j + i];
+    std::vector<Plaintext*> AptrK;
+    for (int c = 0; c < K; ++c)
+        AptrK.insert(AptrK.end(), Aptr.begin(), Aptr.end());
+
+    std::vector<std::shared_ptr<Ciphertext>> results;
+    for (int c = 0; c < K; ++c)
+        for (uint32_t g = 0; g < gStep; ++g) {
+            results.emplace_back(std::make_shared<Ciphertext>(cc_));
+            results.back()->growToLevel(cts[c]->getLevel());
+            results.back()->dropToLevel(cts[c]->getLevel());
+            results.back()->extend(false);
+        }
+    Stream& hub = results[0]->c0.GPU[0].s;
+    for (auto& i : results) {
+        hub.wait(i->c0.GPU[0].s);
+        hub.wait(i->c1.GPU[0].s);
+    }
+    for (auto* i : allRot) {
+        hub.wait(i->c0.GPU[0].s);
+        hub.wait(i->c1.GPU[0].s);
+    }
+    {
+        LtShareScope share(K);
+        DotProductPtInternal<Ciphertext*, Plaintext*>(results, allRot, AptrK, bStep, 1, gStep, ext);
+    }
+    for (auto& i : results) {
+        i->c0.GPU[0].s.wait(hub);
+        i->c1.GPU[0].s.wait(hub);
+    }
+    for (auto* i : allRot) {
+        i->c0.GPU[0].s.wait(hub);
+        i->c1.GPU[0].s.wait(hub);
+    }
+
+    for (int c = 0; c < K; ++c) {
+        std::vector<std::shared_ptr<Ciphertext>> res(results.begin() + c * gStep, results.begin() + (c + 1) * gStep);
+        for (uint32_t j = gStep - 1; j < gStep; --j) {
+            if (j != gStep - 1) {
+                if (res[j + 1]->c1.isModUp())
+                    res[j]->extend();
+                res[j]->add(*res[j + 1]);
+                res.pop_back();
+            }
+            if (j > 0) {
+                if ((bStep * stride) % (cc.N / 2) != 0) {
+                    if (res[j]->c1.isModUp())
+                        res[j]->c1.moddown(true, false);
+                    res[j]->rotate((int)bStep * stride, false);
+                }
+            } else if (offset != 0) {
+                if (res[j]->c1.isModUp())
+                    res[j]->c1.moddown(true, false);
+                res[j]->rotate(offset, true);
+            } else if (res[j]->c1.isModUp()) {
+                if (g_ltFuseAllowed && ltFusedRescaleEnv() && res[j]->NoiseLevel == 2 && cc.compositeDegree() == 2 &&
+                    res[j]->c0.isModUp())
+                    res[j]->modDownRescale();
+                else
+                    res[j]->modDown(false);
+            }
+        }
+        cts[c]->takeFrom(*res[0]);
+    }
 }
 
 namespace FIDESlib::CKKS {

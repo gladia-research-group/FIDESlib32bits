@@ -144,6 +144,24 @@ __global__ void dotProductLtBatchedPt2___(void*** c0_out, void*** c1_out, void**
                                           const int bStep, const int gStep, const int primeidInit, const int n);
 __global__ void dotProductLtBatchedPt3___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
                                           const int bStep, const int gStep, const int primeidInit, const int n, uint32_t ptMask = 0xFFFFFFFFu);
+/// Per-ciphertext tables of hoistedRotateDotKSKRegen4K_ (up to 4 ciphertexts).
+struct HoistKArgs {
+    void*** din1[4];
+    void** c0[4];
+    void** sc0[4];
+    void*** out1[4];
+    void*** sout1[4];
+    void*** out2[4];
+    void*** sout2[4];
+};
+/// false: no batched arm for this configuration.
+bool launchHoistedRotateDotKSKRegen4K(dim3 grid, dim3 block, cudaStream_t stream, const HoistKArgs& A, int kb, int n,
+                                      const int* indexes, void*** digits, int num_d, int id, int num_special, int init,
+                                      bool c0_modup, int ksk_pack_bits, const uint32_t* seeds, uint32_t n16);
+/// dotProductLtBatchedPt3___ for n ciphertexts sharing LT 0's plaintexts.
+__global__ void dotProductLtSharedPt_(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
+                                      const int bStep, const int gStep, const int primeidInit, const int n,
+                                      uint32_t ptMask);
 
 __global__ void addScaleB_(void** a, void** b, void** c, const int primeid_init);
 __global__ void scaleByP_(void** a, const int primeid_init);

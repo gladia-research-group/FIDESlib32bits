@@ -1696,6 +1696,179 @@ __global__ void
 }
 
 
+#if FIDESLIB_LAZY_DOT_ACC && !FIDESLIB_DIN_SMEM
+// hoistedRotateDotKSKRegen4_ on KB ciphertexts of one level, each key word regenerated / loaded once for all KB
+template <int KSK_BITS, int KB>
+__global__ void hoistedRotateDotKSKRegen4K_(const __grid_constant__ HoistKArgs A, const int n, const int* indexes,
+                                            FLPT3 digits, int num_d, int id, int num_special, int init, bool c0_modup,
+                                            const uint32_t* __restrict__ seeds, const uint32_t n16) {
+    constexpr int SLOTS = 4;
+    const uint32_t gtid = (uint32_t)(threadIdx.x + blockIdx.x * blockDim.x);
+    const int base = (int)(gtid * SLOTS);
+    const uint32_t b0 = gtid >> 2;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t k = lane & 3u;
+    const uint32_t gmask = 0xFu << (lane & ~3u);
+    const int blky = blockIdx.y + init;
+    const int primeid =
+        (blky < num_special) ? C_.primeid_digit_to[0][blky] : C_.primeid_partition[id][blky - num_special];
+    const int primeid_digit = C_.primeid_digit[primeid];
+    const int pos_dec = blky - num_special;
+    const uint32_t pval = (uint32_t)C_.primes[primeid];
+    const uint32_t recip = 0xFFFFFFFFu / pval;
+    const uint32_t m_p = recip * pval;
+    const bool has_c0 = c0_modup || primeid < C_.L;
+    const bool c0_shoup = (!c0_modup && primeid < C_.L);
+
+    for (int j = 0; j < n; ++j) {
+        const int offset = j * 3 * 2 * C_.dnum;
+        const uint32_t* key = seeds + j * 8;
+        const uint32_t key0 = key[k];
+        const uint32_t key4 = key[4 + k];
+        uint64_t aux1[KB][SLOTS], aux2[KB][SLOTS];
+#pragma unroll
+        for (int c = 0; c < KB; ++c) {
+            if (has_c0) {
+                const uint32_t* c0p = primeid < C_.L ? (const uint32_t*)((void**)A.c0[c])[pos_dec]
+                                                     : (const uint32_t*)((void**)A.sc0[c])[primeid - C_.L];
+                const uint4 cv = *(const uint4*)(c0p + base);
+                const uint32_t c4[4] = {cv.x, cv.y, cv.z, cv.w};
+#pragma unroll
+                for (int w = 0; w < SLOTS; ++w) {
+                    aux1[c][w] = 0;
+                    aux2[c][w] = c0_shoup ? modmult<ALGO_SHOUP>(c4[w], (uint32_t)C_.P[primeid], primeid,
+                                                               (uint32_t)C_.P_shoup[primeid])
+                                          : c4[w];
+                }
+            } else {
+#pragma unroll
+                for (int w = 0; w < SLOTS; ++w)
+                    aux1[c][w] = aux2[c][w] = 0;
+            }
+        }
+        for (int i = 0; i < num_d; ++i) {
+            const bool decomp = (i == primeid_digit);
+            const int pos = C_.pos_in_digit[i][primeid];
+            const int p = decomp ? pos_dec : pos;
+            const void* kskbp = digits[offset + 2 * C_.dnum + i + decomp * 3 * C_.dnum][p];
+            uint4 dv[KB];
+#pragma unroll
+            for (int c = 0; c < KB; ++c)
+                dv[c] = *(const uint4*)((const uint32_t*)((void***)A.din1[c])[i + decomp * 3 * C_.dnum][p] + base);
+            uint32_t kb[5];
+            if constexpr (KSK_BITS == 28) {
+                const uint32_t bit0 = (uint32_t)base * KSK_BITS;
+#pragma unroll
+                for (int t = 0; t < 5; ++t)
+                    kb[t] = FIDESLIB_STREAM_LD((const uint32_t*)kskbp + (bit0 >> 5) + t);
+            }
+            uint32_t ca, cb, cc, cd;
+            chachaCoop4(gmask, k, key0, key4, b0, (uint32_t)i, pval, ca, cb, cc, cd);
+            uint32_t need = ((ca >= m_p) ? 1u : 0u) | ((cb >= m_p) ? 2u : 0u) | ((cc >= m_p) ? 4u : 0u) |
+                            ((cd >= m_p) ? 8u : 0u);
+            uint32_t gneed = need;
+            gneed |= __shfl_xor_sync(gmask, gneed, 1, 4);
+            gneed |= __shfl_xor_sync(gmask, gneed, 2, 4);
+            if (gneed) {
+                for (uint32_t t = 1; t < (uint32_t)kskexpand::kTMax; ++t) {
+                    uint32_t ea, eb, ec, ed;
+                    chachaCoop4(gmask, k, key0, key4, b0 + t * n16, (uint32_t)i, pval, ea, eb, ec, ed);
+                    if (need & 1u) { ca = ea; if (ea < m_p) need &= ~1u; }
+                    if (need & 2u) { cb = eb; if (eb < m_p) need &= ~2u; }
+                    if (need & 4u) { cc = ec; if (ec < m_p) need &= ~4u; }
+                    if (need & 8u) { cd = ed; if (ed < m_p) need &= ~8u; }
+                    gneed = need;
+                    gneed |= __shfl_xor_sync(gmask, gneed, 1, 4);
+                    gneed |= __shfl_xor_sync(gmask, gneed, 2, 4);
+                    if (!gneed)
+                        break;
+                }
+            }
+            uint32_t ks[SLOTS] = {0u, 0u, 0u, 0u};
+#pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                const uint32_t pub = sel4((k - (uint32_t)s) & 3u, ca, cb, cc, cd);
+                const uint32_t rcv = __shfl_sync(gmask, pub, (k + (uint32_t)s) & 3u, 4);
+                const uint32_t r = (k + (uint32_t)s) & 3u;
+                ks[0] = (r == 0) ? rcv : ks[0];
+                ks[1] = (r == 1) ? rcv : ks[1];
+                ks[2] = (r == 2) ? rcv : ks[2];
+                ks[3] = (r == 3) ? rcv : ks[3];
+            }
+#pragma unroll
+            for (int w = 0; w < SLOTS; ++w) {
+                uint32_t kskb;
+                if constexpr (KSK_BITS == 28) {
+                    if (gtid & 1u) {
+                        const uint32_t lo = 16u + (uint32_t)(w * KSK_BITS);
+                        kskb = __funnelshift_r(kb[lo >> 5], kb[(lo >> 5) + 1], lo & 31) & ((1u << KSK_BITS) - 1u);
+                    } else {
+                        const uint32_t lo = (uint32_t)(w * KSK_BITS);
+                        kskb = __funnelshift_r(kb[lo >> 5], kb[(lo >> 5) + 1], lo & 31) & ((1u << KSK_BITS) - 1u);
+                    }
+                } else if constexpr (KSK_BITS)
+                    kskb = kskUnpack(kskbp, (uint32_t)(base + w), KSK_BITS, (1u << KSK_BITS) - 1u);
+                else
+                    kskb = ((const uint32_t*)kskbp)[base + w];
+                const uint32_t ka = C_.prime_bits[primeid] > 28 ? modByRecip(ks[w], pval, recip) : ks[w];
+#pragma unroll
+                for (int c = 0; c < KB; ++c) {
+                    const uint32_t d = w == 0 ? dv[c].x : w == 1 ? dv[c].y : w == 2 ? dv[c].z : dv[c].w;
+                    aux1[c][w] += (uint64_t)d * ka;
+                    aux2[c][w] += (uint64_t)d * kskb;
+                }
+            }
+        }
+        const int rot_index = indexes[j];
+#pragma unroll
+        for (int w = 0; w < SLOTS; ++w) {
+            const uint32_t out_idx = automorph_slot(C_.logN, rot_index, (uint32_t)(base + w));
+#pragma unroll
+            for (int c = 0; c < KB; ++c) {
+                const uint32_t r1 = modreduce_lazy(aux1[c][w], primeid);
+                const uint32_t r2 = modreduce_lazy(aux2[c][w], primeid);
+                if (primeid < C_.L) {
+                    FIDESLIB_HOISTED_ST((uint32_t*)((void***)A.out1[c])[j][pos_dec] + out_idx, r1);
+                    FIDESLIB_HOISTED_ST((uint32_t*)((void***)A.out2[c])[j][pos_dec] + out_idx, r2);
+                } else {
+                    FIDESLIB_HOISTED_ST((uint32_t*)((void***)A.sout1[c])[j][primeid - C_.L] + out_idx, r1);
+                    FIDESLIB_HOISTED_ST((uint32_t*)((void***)A.sout2[c])[j][primeid - C_.L] + out_idx, r2);
+                }
+            }
+        }
+    }
+}
+#endif
+
+bool launchHoistedRotateDotKSKRegen4K(dim3 grid, dim3 block, cudaStream_t stream, const HoistKArgs& A, int kb, int n,
+                                      const int* indexes, void*** digits, int num_d, int id, int num_special, int init,
+                                      bool c0_modup, int ksk_pack_bits, const uint32_t* seeds, uint32_t n16) {
+#if FIDESLIB_LAZY_DOT_ACC && !FIDESLIB_DIN_SMEM
+    dim3 grid4 = grid;
+    grid4.x *= 4u;
+#define FIDESLIB_HOISTK_ARM(BITS, K)                                                                                \
+    hoistedRotateDotKSKRegen4K_<BITS, K><<<grid4, block, 0, stream>>>(A, n, indexes, digits, num_d, id, num_special, \
+                                                                     init, c0_modup, seeds, n16)
+#define FIDESLIB_HOISTK_BITS(BITS)                       \
+    switch (kb) {                                        \
+        case 2: FIDESLIB_HOISTK_ARM(BITS, 2); return true; \
+        case 3: FIDESLIB_HOISTK_ARM(BITS, 3); return true; \
+        case 4: FIDESLIB_HOISTK_ARM(BITS, 4); return true; \
+        default: return false;                           \
+    }
+    switch (ksk_pack_bits) {
+        case 0: FIDESLIB_HOISTK_BITS(0)
+        case 27: FIDESLIB_HOISTK_BITS(27)
+        case 28: FIDESLIB_HOISTK_BITS(28)
+        default: return false;
+    }
+#undef FIDESLIB_HOISTK_BITS
+#undef FIDESLIB_HOISTK_ARM
+#else
+    return false;
+#endif
+}
+
 void launchHoistedRotateDotKSK_2(dim3 grid, dim3 block, size_t shmem, cudaStream_t stream, void*** din1, void** c0,
                                  void*** out1, void*** sout1, void*** out2, void*** sout2, int n, const int* indexes,
                                  void*** digits, int num_d, int id, int num_special, int init, void** sc0,
@@ -2401,6 +2574,84 @@ __global__ void dotProductLtBatchedPt3___(void*** c0_out, void*** c1_out, void**
     else
         dotProductLtBatchedPt3Body<uint32_t, uint64_t>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, n, idx,
                                                        primeid, buffer, ptMask);
+}
+
+// dotProductLtBatchedPt3BodyG with K ciphertexts on LT 0's plaintexts: one plaintext load feeds K products
+template <typename T, typename ACC, int GSTEP, int K>
+__device__ __forceinline__ void dotProductLtSharedPtBody(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in,
+                                                         void*** pts, const int bStep, const int idx,
+                                                         const int primeid, const uint32_t ptMask) {
+    const int pidx = ((ptMask >> 24) == 0x7Fu) ? (idx >> (ptMask & 0xFFu)) : (int)((uint32_t)idx & ptMask);
+    const bool compact = ptMask != 0xFFFFFFFFu;
+    auto ptld = [compact](const T* p) -> T { return compact ? __ldg(p) : FIDESLIB_STREAM_LD(p); };
+    const bool wideAcc = sizeof(T) == 4 && C_.prime_bits[primeid] > 28;
+    const bool im_c0 = threadIdx.y == 0;
+    void*** inputs = im_c0 ? c0_in : c1_in;
+    void*** outputs = im_c0 ? c0_out : c1_out;
+    ACC acc[K][GSTEP];
+#pragma unroll
+    for (int c = 0; c < K; ++c)
+#pragma unroll
+        for (int j = 0; j < GSTEP; ++j)
+            acc[c][j] = 0;
+    for (int i = 0; i < bStep; ++i) {
+        T in[K];
+#pragma unroll
+        for (int c = 0; c < K; ++c)
+            in[c] = FIDESLIB_STREAM_LD2((T*)inputs[c * bStep + i][blockIdx.y] + idx);
+#pragma unroll
+        for (int j = 0; j < GSTEP; ++j) {
+            void** p = pts[j * bStep + i];
+            if (p == nullptr)
+                continue;
+            const ACC pv = (ACC)ptld((const T*)p[blockIdx.y] + pidx);
+#pragma unroll
+            for (int c = 0; c < K; ++c) {
+                acc[c][j] = acc[c][j] + (ACC)in[c] * pv;
+                if (wideAcc)
+                    acc[c][j] = (ACC)modreduce_lazy((uint64_t)acc[c][j], primeid);
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < K; ++c)
+#pragma unroll
+        for (int j = 0; j < GSTEP; ++j)
+            ((T*)outputs[c * GSTEP + j][blockIdx.y])[idx] = modreduce<ALGO_NATIVE>(acc[c][j], primeid);
+}
+
+template <typename T, typename ACC, int K>
+__device__ __forceinline__ void dotProductLtSharedPtG(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in,
+                                                      void*** pts, const int bStep, const int gStep, const int idx,
+                                                      const int primeid, const uint32_t ptMask) {
+    if (gStep == 1)
+        dotProductLtSharedPtBody<T, ACC, 1, K>(c0_out, c1_out, c0_in, c1_in, pts, bStep, idx, primeid, ptMask);
+    else if (gStep == 2)
+        dotProductLtSharedPtBody<T, ACC, 2, K>(c0_out, c1_out, c0_in, c1_in, pts, bStep, idx, primeid, ptMask);
+    else if (gStep == 4)
+        dotProductLtSharedPtBody<T, ACC, 4, K>(c0_out, c1_out, c0_in, c1_in, pts, bStep, idx, primeid, ptMask);
+    else
+        dotProductLtSharedPtBody<T, ACC, 8, K>(c0_out, c1_out, c0_in, c1_in, pts, bStep, idx, primeid, ptMask);
+}
+
+__global__ void dotProductLtSharedPt_(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,
+                                      const int bStep, const int gStep, const int primeidInit, const int n,
+                                      uint32_t ptMask) {
+    const int idx = threadIdx.x + threadIdx.z * blockDim.x + blockIdx.x * blockDim.x * blockDim.z;
+    const int primeid = C_.primeid_flattened[primeidInit + blockIdx.y];
+    if (ISU64(primeid)) {
+        switch (n) {
+            case 2: dotProductLtSharedPtG<uint64_t, __uint128_t, 2>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, idx, primeid, ptMask); break;
+            case 3: dotProductLtSharedPtG<uint64_t, __uint128_t, 3>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, idx, primeid, ptMask); break;
+            default: dotProductLtSharedPtG<uint64_t, __uint128_t, 4>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, idx, primeid, ptMask); break;
+        }
+    } else {
+        switch (n) {
+            case 2: dotProductLtSharedPtG<uint32_t, uint64_t, 2>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, idx, primeid, ptMask); break;
+            case 3: dotProductLtSharedPtG<uint32_t, uint64_t, 3>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, idx, primeid, ptMask); break;
+            default: dotProductLtSharedPtG<uint32_t, uint64_t, 4>(c0_out, c1_out, c0_in, c1_in, pts, bStep, gStep, idx, primeid, ptMask); break;
+        }
+    }
 }
 
 __global__ void dotProductLtBatchedPt___(void*** c0_out, void*** c1_out, void*** c0_in, void*** c1_in, void*** pts,

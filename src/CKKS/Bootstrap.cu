@@ -1571,6 +1571,44 @@ void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k) {
     ltStep(ctxt, step);
 }
 
+void btsCtSStageBatch(const std::vector<Ciphertext*>& cts, const std::vector<const BtsState*>& sts, int k) {
+    CudaNvtxRange r(std::string{"bts::cts_stage_batch"});
+    if (cts.size() > 4)
+        throw std::invalid_argument("[cts_stage_batch] at most 4 ciphertexts");
+    const BtsState& st = *sts.at(0);
+    ContextData& cc = cts.at(0)->cc;
+    auto& pre = cc.GetBootPrecomputation(st.slots);
+    bool same = cts.size() > 1;
+    for (size_t i = 1; i < cts.size(); ++i)
+        same = same && sts[i]->slots == st.slots && cts[i]->getLevel() == cts[0]->getLevel() &&
+               cts[i]->NoiseLevel == cts[0]->NoiseLevel;
+    if (!same || st.sparseB || st.isLT || (k == 0 && pre.aks0)) {
+        for (size_t i = 0; i < cts.size(); ++i)
+            btsCtSStage(*cts[i], *sts[i], k);
+        return;
+    }
+    const int cLo = pre.cts_single_lo, cHi = pre.cts_single_lo + pre.cts_single;
+    for (auto* c : cts) {
+        if (k == 0 && c->NoiseLevel == 2)
+            c->rescale();
+        if (k > cLo && k <= cHi && c->NoiseLevel == 2) {
+            RescaleOneScope one(true);
+            c->rescale();
+        }
+    }
+    const int fuseMode = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
+    LtFuseScope fuseScope(fuseMode != 3 && !(k >= cLo && k < cHi));
+    auto& step = pre.CtS.at(k);
+    std::vector<Plaintext*> Aptr(step.slots, nullptr);
+    for (int j = 0; j < step.gStep; ++j)
+        for (int i = 0; i < step.bStep; ++i)
+            if (step.bStep * j + i < step.slots)
+                Aptr[step.bStep * j + i] = &(step.A[step.bStep * j + i]);
+    const int stride = step.bStep > 1 ? step.rotIn[1] - step.rotIn[0] : step.rotOut[1] - step.rotOut[0];
+    LtPtMaskScope ptMaskScope(step.ptMask);
+    LinearTransformBatch(cts, step.slots, step.bStep, Aptr, stride, step.rotOut[0]);
+}
+
 void btsEvalMod(Ciphertext& ctxt, const BtsState& st) {
     CudaNvtxRange r(std::string{"bts::eval_mod"});
     Context& cc_ = ctxt.cc_;

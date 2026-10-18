@@ -347,6 +347,12 @@ class LimbPartition {
                           std::vector<LimbPartition*>& c1, const std::vector<LimbPartition*>& ksk_a,
                           const std::vector<LimbPartition*>& ksk_b, const LimbPartition& src_c0,
                           const LimbPartition& src_c1, bool c0_modup, int y_begin = 0, int y_count = -1);
+    /// fusedHoistRotate on K <= 4 ciphertexts of one level, the key loads shared; false: nothing launched.
+    static bool fusedHoistRotateK(int n, const std::vector<int>& indexes,
+                                  std::vector<std::vector<LimbPartition*>>& c0, std::vector<std::vector<LimbPartition*>>& c1,
+                                  const std::vector<LimbPartition*>& ksk_a, const std::vector<LimbPartition*>& ksk_b,
+                                  const std::vector<LimbPartition*>& srcs, const std::vector<const LimbPartition*>& src_c0,
+                                  const std::vector<const LimbPartition*>& src_c1, bool c0_modup);
 
     void modup_ksk_moddown_mgpu(LimbPartition& c0, const LimbPartition& ksk_a, const LimbPartition& ksk_b,
                                 LimbPartition& auxLimbs1, LimbPartition& auxLimbs2, const bool moddown,

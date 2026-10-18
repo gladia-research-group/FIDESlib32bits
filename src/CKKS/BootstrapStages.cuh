@@ -43,6 +43,8 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
 void btsModRaise(Ciphertext& ctxt, BtsState& st);
 void btsFold(Ciphertext& ctxt, const BtsState& st);
 void btsCtSStage(Ciphertext& ctxt, const BtsState& st, int k);
+// btsCtSStage on up to 4 ciphertexts of one route and level, sharing the key and plaintext loads
+void btsCtSStageBatch(const std::vector<Ciphertext*>& cts, const std::vector<const BtsState*>& sts, int k);
 void btsEvalMod(Ciphertext& ctxt, const BtsState& st);
 void btsStcFirstOutput(Ciphertext& ctxt, const BtsState& st);
 void btsStCEnter(Ciphertext& ctxt, const BtsState& st);

@@ -37,6 +37,13 @@ struct LtPtMaskScope {
     }
     ~LtPtMaskScope() { g_ltPtMask = old; }
 };
+/// LinearTransformBatch: the dot's g_ltShareK LTs share LT 0's plaintexts (1 everywhere else).
+extern int g_ltShareK;
+struct LtShareScope {
+    int old;
+    explicit LtShareScope(int k) : old(g_ltShareK) { g_ltShareK = k; }
+    ~LtShareScope() { g_ltShareK = old; }
+};
 struct AksStage;
 
 class BootstrapPrecomputation {

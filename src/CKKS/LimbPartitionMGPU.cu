@@ -694,6 +694,112 @@ void LimbPartition::fusedHoistRotate(int n, std::vector<int> indexes, std::vecto
     //digits.free(s);
 }
 
+bool LimbPartition::fusedHoistRotateK(int n, const std::vector<int>& indexes,
+                                      std::vector<std::vector<LimbPartition*>>& c0,
+                                      std::vector<std::vector<LimbPartition*>>& c1,
+                                      const std::vector<LimbPartition*>& ksk_a, const std::vector<LimbPartition*>& ksk_b,
+                                      const std::vector<LimbPartition*>& srcs,
+                                      const std::vector<const LimbPartition*>& src_c0,
+                                      const std::vector<const LimbPartition*>& src_c1, bool c0_modup) {
+    const int K = (int)srcs.size();
+    LimbPartition& src = *srcs[0];
+    ContextData& cc = src.cc;
+    constexpr uint32_t BLOCK_X = 128;
+    if (K < 2 || K > 4 || n == 0 || !kskRegenHoist(ksk_a, (int)BLOCK_X) || cc.precom.constants[0].type != 0)
+        return false;
+    cudaSetDevice(src.device);
+    const int D = cc.dnum;
+    const int limbsize = *src.level + 1;
+    // table: keys (n * 6 D, as fusedHoistRotate), per ciphertext 6 D digits + 4 n outputs, indexes, seeds
+    const int offKeys = 0, offDin = n * D * 6, offOut = offDin + K * D * 6, offIdx = offOut + K * 4 * n,
+              offSeeds = offIdx + n, total = offSeeds + 4 * n;
+    std::vector<void**> h(total, nullptr);
+    int nd = 0;
+    for (; nd < (int)src.DIGITlimb.size(); ++nd) {
+        int start = 0;
+        for (int j = 0; j < nd; ++j)
+            start += src.DECOMPmeta[j].size();
+        if (std::min((int)src.DECOMPmeta[nd].size(), limbsize - start) <= 0)
+            break;
+    }
+    for (int k = 0; k < n; ++k) {
+        if (ksk_a[k]->key_q_band >= 0 && limbsize > ksk_a[k]->key_q_band + 1)
+            return false;
+        if (ksk_a[k]->key_pack_bits != ksk_a[0]->key_pack_bits)
+            return false;
+        for (int i = 0; i < nd; ++i) {
+            h[offKeys + k * D * 6 + i + D] = ksk_a[k]->DIGITlimbptr.at(i).data;
+            h[offKeys + k * D * 6 + i + 2 * D] = ksk_b[k]->DIGITlimbptr.at(i).data;
+            h[offKeys + k * D * 6 + i + 4 * D] = ksk_a[k]->limbptr.data;
+            h[offKeys + k * D * 6 + i + 5 * D] = ksk_b[k]->limbptr.data;
+        }
+    }
+    for (int c = 0; c < K; ++c) {
+        if (*srcs[c]->level != *src.level)
+            return false;
+        for (int i = 0; i < nd; ++i) {
+            h[offDin + c * D * 6 + i] = srcs[c]->DIGITlimbptr.at(i).data;
+            h[offDin + c * D * 6 + i + 3 * D] = src_c1[c]->limbptr.data;
+        }
+        for (int k = 0; k < n; ++k) {
+            h[offOut + c * 4 * n + k] = c1[c][k]->limbptr.data;
+            h[offOut + c * 4 * n + n + k] = c1[c][k]->SPECIALlimbptr.data;
+            h[offOut + c * 4 * n + 2 * n + k] = c0[c][k]->limbptr.data;
+            h[offOut + c * 4 * n + 3 * n + k] = c0[c][k]->SPECIALlimbptr.data;
+        }
+    }
+    for (int k = 0; k < n; ++k) {
+        ((int*)&h[offIdx])[k] = indexes[k];
+        for (int t = 0; t < 8; ++t)
+            ((uint32_t*)&h[offSeeds])[k * 8 + t] = ksk_a[k]->ksk_seed[t];
+    }
+    Stream& s = src.s;
+    for (int c = 0; c < K; ++c) {
+        s.wait(srcs[c]->s);
+        s.wait(src_c0[c]->getS());
+        s.wait(src_c1[c]->getS());
+        for (int k = 0; k < n; ++k) {
+            s.wait(c0[c][k]->s);
+            s.wait(c1[c][k]->s);
+        }
+    }
+    void*** d = nullptr;
+    cudaMallocAsync((void**)&d, (size_t)total * sizeof(void**), s.ptr());
+    cudaMemcpyAsync(d, h.data(), (size_t)total * sizeof(void**), cudaMemcpyHostToDevice, s.ptr());
+    HoistKArgs A{};
+    for (int c = 0; c < K; ++c) {
+        A.din1[c] = d + offDin + c * D * 6;
+        A.c0[c] = src_c0[c]->limbptr.data;
+        A.sc0[c] = src_c0[c]->SPECIALlimbptr.data;
+        A.out1[c] = d + offOut + c * 4 * n;
+        A.sout1[c] = d + offOut + c * 4 * n + n;
+        A.out2[c] = d + offOut + c * 4 * n + 2 * n;
+        A.sout2[c] = d + offOut + c * 4 * n + 3 * n;
+    }
+    int num_special = 0;
+    while (num_special < (int)src.DIGITmeta.at(0).size() && src.DIGITmeta.at(0).at(num_special).id > cc.L)
+        num_special++;
+    int num_limbs = 0;
+    while (num_limbs < (int)src.meta.size() && src.meta.at(num_limbs).id <= *src.level)
+        num_limbs++;
+    const int kpb = ksk_a[0]->key_pack_bits;
+    const bool ok = launchHoistedRotateDotKSKRegen4K(
+        dim3{(uint32_t)cc.N / (BLOCK_X * 16), (uint32_t)(num_special + num_limbs)}, BLOCK_X, s.ptr(), A, K, n,
+        (const int*)(d + offIdx), d + offKeys, nd, src.id, num_special, 0, c0_modup, kpb,
+        (const uint32_t*)(d + offSeeds), (uint32_t)cc.N >> 4);
+    cudaFreeAsync(d, s.ptr());
+    for (int c = 0; c < K; ++c) {
+        srcs[c]->s.wait(s);
+        src_c0[c]->getS().wait(s);
+        src_c1[c]->getS().wait(s);
+        for (int k = 0; k < n; ++k) {
+            c0[c][k]->s.wait(s);
+            c1[c][k]->s.wait(s);
+        }
+    }
+    return ok;
+}
+
 void LimbPartition::modup_ksk_moddown_mgpu(
     LimbPartition& c0, const LimbPartition& ksk_a, const LimbPartition& ksk_b, LimbPartition& auxLimbs1,
     LimbPartition& auxLimbs2, const bool moddown, const std::vector<uint64_t*>& bufferGather_,
