@@ -247,6 +247,12 @@ void FIDESlib::CKKS::BootstrapCPUraise(
 namespace FIDESlib::CKKS {
 
 // StC-first last-stage cache entries (FIDESLIB_STC_LAST_CACHE, default 24): ~0.2 GB sparse, 1-2 GB dense each.
+// FIDESLIB_STC_CACHE_ASYNC=1: cache misses re-level and evict under GPU-side barriers instead of device syncs
+static bool stcCacheAsync() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_ASYNC"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+
 static size_t lastStageCacheCap() {
     static const size_t cap = [] {
         const char* e = std::getenv("FIDESLIB_STC_LAST_CACHE");
@@ -258,7 +264,17 @@ static size_t lastStageCacheCap() {
         return (e && *e) ? std::atof(e) : 8.0;
     }();
     size_t fr = 0, tot = 0;
-    if (cudaMemGetInfo(&fr, &tot) == cudaSuccess && fr < floor_gb * (1ull << 30))
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess)
+        return cap;
+    // FIDESLIB_STC_CACHE_POOLFREE=1: idle pool blocks and the CUDA pool's unused reserve count as free
+    static const bool poolFree = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_POOLFREE"); return e && std::atoi(e) > 0; }();
+    if (poolFree && fr < floor_gb * (1ull << 30)) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const FIDESlib::GPUpoolStats ps = FIDESlib::GPUpoolStatsOf(dev);
+        fr += ps.idle + (ps.cuda_reserved > ps.cuda_used ? ps.cuda_reserved - ps.cuda_used : 0);
+    }
+    if (fr < floor_gb * (1ull << 30))
         return 1;
     return cap;
 }
@@ -1375,15 +1391,16 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
     if (st.isLT) {
         auto it = pre.lt_first_last.find(key);
         if (it == pre.lt_first_last.end()) {
+            RelevelAsyncScope async(stcCacheAsync());
             if (pre.lt_first_last.size() >= kLastStageCache) {
-                cudaDeviceSynchronize();
+                relevelSync();
                 while (pre.lt_first_last.size() >= kLastStageCache)
                     pre.lt_first_last.erase(pre.lt_first_last.begin());
             }
             std::vector<Plaintext> v;
             for (auto& pt : pre.LT.invA)
                 v.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
-            cudaDeviceSynchronize();
+            relevelSync();
             it = pre.lt_first_last.emplace(key, std::move(v)).first;
         }
         EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, it->second);
@@ -1392,8 +1409,9 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
             EvalLTStages(ctxt, pre.StC_first, "StC1-stage-");
         auto it = pre.stc_first_last.find(key);
         if (it == pre.stc_first_last.end()) {
+            RelevelAsyncScope async(stcCacheAsync());
             if (pre.stc_first_last.size() >= kLastStageCache) {
-                cudaDeviceSynchronize();
+                relevelSync();
                 while (pre.stc_first_last.size() >= kLastStageCache)
                     pre.stc_first_last.erase(pre.stc_first_last.begin());
             }
@@ -1404,7 +1422,7 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
                 o.A.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
             std::vector<BootstrapPrecomputation::LTstep> v;
             v.push_back(std::move(o));
-            cudaDeviceSynchronize();
+            relevelSync();
             it = pre.stc_first_last.emplace(key, std::move(v)).first;
         }
         EvalLTStages(ctxt, it->second, "StC1-last-");
@@ -1444,8 +1462,9 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
     const auto key = std::make_tuple(slots, outLimb, skipMask, std::llround(std::log2(factor) * 1e6));
     auto it = cache.find(key);
     if (it == cache.end()) {
+        RelevelAsyncScope async(stcCacheAsync());
         if (cache.size() >= lastStageCacheCap()) {
-            cudaDeviceSynchronize();
+            relevelSync();
             cache.erase(cache.begin());
         }
         std::vector<BootstrapPrecomputation::LTstep> v;
@@ -1459,7 +1478,7 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
                 o.A.push_back(relevelPlaintext(cc_, cc, pt, (lv - pt.c0.getLevel()) / d, fac));
             v.push_back(std::move(o));
         }
-        cudaDeviceSynchronize();
+        relevelSync();
         it = cache.emplace(key, std::move(v)).first;
     }
     EvalLTStages(ctxt, it->second, "StCH-stage-");
@@ -1468,7 +1487,12 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
     if (ctxt.getLevel() != outLimb)
         throw std::runtime_error("[stc_high] output at limb index " + std::to_string(ctxt.getLevel()) + ", expected " +
                                  std::to_string(outLimb));
-    cudaDeviceSynchronize();
+    // FIDESLIB_STC_HIGH_ASYNC=1: a GPU-side barrier instead
+    static const bool async = [] { const char* e = std::getenv("FIDESLIB_STC_HIGH_ASYNC"); return e && std::atoi(e) > 0; }();
+    if (async)
+        gpuBarrier();
+    else
+        cudaDeviceSynchronize();
 }
 
 void btsModRaise(Ciphertext& ctxt, BtsState& st) {

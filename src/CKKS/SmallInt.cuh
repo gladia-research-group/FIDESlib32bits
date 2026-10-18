@@ -50,6 +50,16 @@ void smallIntDivideKeepLevel(ContextData& cc, RNSPoly& p, int k, long double D, 
 /// dst (allocated at its level, specials allocated when `withSpecials`) := round(x / D) on every limb, x the small
 /// integer reconstructed from the first k limbs of src (NTT form). dst ends in NTT form.
 void smallIntDivideFromTo(ContextData& cc, const RNSPoly& src, RNSPoly& dst, int k, long double D, bool withSpecials);
+/// An empty kernel on the legacy stream: later work on the blocking streams waits for earlier work, the host does not.
+void gpuBarrier();
+/// Inside a RelevelAsyncScope the relevel helpers end with gpuBarrier() instead of cudaDeviceSynchronize().
+extern thread_local bool g_relevelAsync;
+struct RelevelAsyncScope {
+    bool old;
+    explicit RelevelAsyncScope(bool on) : old(g_relevelAsync) { g_relevelAsync = on || old; }
+    ~RelevelAsyncScope() { g_relevelAsync = old; }
+};
+void relevelSync();
 /// A fresh plaintext `shift` composite levels above pt, encoding factor * (its values) (exact small-integer lift of
 /// its first 4 limbs combined with the real rescale sf(old) / (factor sf(new)): one rounding of <= 0.5 at scale). Bootstrap plaintexts are
 /// constant-allocated and cannot be grown in place, hence the copy.

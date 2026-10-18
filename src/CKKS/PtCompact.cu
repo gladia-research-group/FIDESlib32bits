@@ -1,5 +1,6 @@
 // Compact storage of NTT-structured plaintexts (see PtCompact.cuh).
 #include "CKKS/PtCompact.cuh"
+#include "CKKS/SmallInt.cuh"
 
 #include <cstdlib>
 #include <iostream>
@@ -140,7 +141,7 @@ Plaintext expandCompact(Context& cc, const Plaintext& src) {
         expand(sp.limb, dp.limb);
         expand(sp.SPECIALlimb, dp.SPECIALlimb);
     }
-    cudaDeviceSynchronize();
+    relevelSync();
     return np;
 }
 

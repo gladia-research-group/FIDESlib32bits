@@ -385,6 +385,18 @@ void smallIntDivideFromTo(ContextData& cc, const RNSPoly& src, RNSPoly& dst, int
         dst.SetModUp(true);
 }
 
+thread_local bool g_relevelAsync = false;
+static __global__ void gpuBarrier_() {}
+void gpuBarrier() {
+    gpuBarrier_<<<1, 1, 0, cudaStreamLegacy>>>();
+}
+void relevelSync() {
+    if (g_relevelAsync)
+        gpuBarrier();
+    else
+        cudaDeviceSynchronize();
+}
+
 Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor) {
     if (pt.compactMask != 0xFFFFFFFFu) {
         Plaintext full = expandCompact(cc_, pt);
@@ -401,7 +413,7 @@ Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, i
     smallIntDivideFromTo(cc, pt.c0, np.c0, 4, D, pt.c0.isModUp());
     np.copyMetadata(pt);
     np.NoiseFactor = cc.sfAtLimb(newL);
-    cudaDeviceSynchronize();
+    relevelSync();
     return np;
 }
 
@@ -418,7 +430,7 @@ Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt,
     smallIntDivideFromTo(cc, pt.c0, np.c0, 4, D, pt.c0.isModUp());
     np.copyMetadata(pt);
     np.NoiseFactor = newNF;
-    cudaDeviceSynchronize();
+    relevelSync();
     return np;
 }
 
