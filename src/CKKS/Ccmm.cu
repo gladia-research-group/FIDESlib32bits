@@ -511,6 +511,36 @@ __global__ void moveLimbs(uint32_t* const* ptrs, uint32_t* big, bool toBig) {
 
 constexpr int NPOLY = 2 * NBIG;
 
+// FIDESLIB_CCMM_ASYNC=1: no host syncs or step timings (the legacy stream orders the CCMM), limb table as a kernel arg
+bool ccmmAsync() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_CCMM_ASYNC"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+void ccmmSync() {
+    if (!ccmmAsync())
+        cudaDeviceSynchronize();
+}
+struct LimbPtrs {
+    uint32_t* p[NQ * NPOLY];
+};
+__global__ void moveLimbsArg(const __grid_constant__ LimbPtrs t, uint32_t* big, bool toBig) {
+    const size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (k >= NB) return;
+    uint32_t* bj = big + (size_t)blockIdx.y * NB + k;
+    if (toBig) *bj = t.p[blockIdx.y][k];
+    else t.p[blockIdx.y][k] = *bj;
+}
+LimbPtrs limbArg(const std::vector<RNSPoly*>& polys) {
+    LimbPtrs t{};
+    for (int part = 0; part < 2; ++part)
+        for (int c = 0; c < NBIG; ++c) {
+            auto& LP = polys[part * NBIG + c]->GPU.at(0);
+            for (int i = 0; i < NQ; ++i)
+                t.p[((size_t)part * NQ + i) * NBIG + c] = std::get<Limb<uint32_t>>(LP.limb[i]).v.data;
+        }
+    return t;
+}
+
 // limb j = (part * NQ + i) * NBIG + c of the staging layout
 uint32_t** limbTable(const std::vector<RNSPoly*>& polys, int which) {
     static uint32_t** dev[2] = {nullptr, nullptr};
@@ -536,7 +566,7 @@ void ringIn(const std::vector<Ciphertext*>& ins, uint32_t* X, CcmmKeys& K, cudaS
         stage_cc = &cc;
     }
     uint32_t* big = g_buf.big.get<uint32_t>((size_t)NBIG * 2 * NQ * NB);
-    cudaDeviceSynchronize();
+    ccmmSync();
     std::vector<RNSPoly*> polys(NPOLY);
     for (int part = 0; part < 2; ++part)
         for (int c = 0; c < NBIG; ++c) {
@@ -545,8 +575,12 @@ void ringIn(const std::vector<Ciphertext*>& ins, uint32_t* X, CcmmKeys& K, cudaS
             st->INTT(1, true);
             polys[part * NBIG + c] = st;
         }
-    cudaDeviceSynchronize();
-    moveLimbs<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbTable(polys, 0), big, true);
+    if (ccmmAsync()) {
+        moveLimbsArg<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbArg(polys), big, true);
+    } else {
+        cudaDeviceSynchronize();
+        moveLimbs<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbTable(polys, 0), big, true);
+    }
     const size_t per = (size_t)NBIG * NB;
     uint32_t* res = g_buf.res.get<uint32_t>(2 * (size_t)NQ * per);
     keySwitch(K, big + (size_t)NQ * per, res, NB, NBIG, K.fwd, 0, 0, s);
@@ -564,6 +598,11 @@ void ringOut(uint32_t* X, const std::vector<Ciphertext*>& outs, CcmmKeys& K, cud
     std::vector<RNSPoly*> polys(NPOLY);
     for (int part = 0; part < 2; ++part)
         for (int c = 0; c < NBIG; ++c) polys[part * NBIG + c] = part ? &outs[c]->c1 : &outs[c]->c0;
+    if (ccmmAsync()) {
+        moveLimbsArg<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbArg(polys), big, false);
+        for (RNSPoly* p : polys) p->NTT(1, true);
+        return;
+    }
     cudaDeviceSynchronize();
     moveLimbs<<<dim3(NB / 256, NQ * NPOLY), 256, 0, s>>>(limbTable(polys, 1), big, false);
     cudaDeviceSynchronize();
@@ -638,7 +677,9 @@ void ccmmTranspose(const std::vector<Ciphertext*>& ins, const std::vector<Cipher
     check(outs, K, "outs");
     cudaStream_t s = 0;
     if (times) for (int i = 0; i < 5; ++i) times[i] = 0;
-    cudaDeviceSynchronize();
+    if (ccmmAsync())
+        times = nullptr;
+    ccmmSync();
     Timer tm{times};
     uint32_t* X = g_buf.c[0].get<uint32_t>(COLS);
     uint32_t* t1 = g_buf.c[1].get<uint32_t>(COLS);
@@ -649,7 +690,7 @@ void ccmmTranspose(const std::vector<Ciphertext*>& ins, const std::vector<Cipher
     tm.mark(1);
     ringOut(X, outs, K, s);
     tm.mark(4);
-    cudaDeviceSynchronize();
+    ccmmSync();
 }
 
 void ccmmMul(const std::vector<Ciphertext*>& insM, const std::vector<Ciphertext*>& insMp,
@@ -659,7 +700,9 @@ void ccmmMul(const std::vector<Ciphertext*>& insM, const std::vector<Ciphertext*
     check(outs, K, "outs");
     cudaStream_t s = 0;
     if (times) for (int i = 0; i < 5; ++i) times[i] = 0;
-    cudaDeviceSynchronize();
+    if (ccmmAsync())
+        times = nullptr;
+    ccmmSync();
     Timer tm{times};
     uint32_t* XM = g_buf.c[0].get<uint32_t>(COLS);
     uint32_t* XMp = g_buf.c[1].get<uint32_t>(COLS);
@@ -688,7 +731,7 @@ void ccmmMul(const std::vector<Ciphertext*>& insM, const std::vector<Ciphertext*
     tm.mark(3);
     ringOut(XM, outs, K, s);
     tm.mark(4);
-    cudaDeviceSynchronize();
+    ccmmSync();
 }
 
 }  // namespace FIDESlib::CKKS
