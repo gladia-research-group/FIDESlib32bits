@@ -8,6 +8,7 @@
 #include "CKKS/Discard.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
 #include "CKKS/Plaintext.cuh"
+#include "CKKS/SmallInt.cuh"
 #include <omp.h>
 #include <cstdio>
 #include <cstdlib>
@@ -2316,7 +2317,12 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 	const int key = power * 1024 + this->getLevel();
 	if (!cc.precom.monomialCache.contains(key)) {
 		// The build writes into a pooled auxiliary polynomial: wait for work still using it.
-		cudaDeviceSynchronize();
+		// FIDESLIB_MONOMIAL_ASYNC=1: both fences as GPU-side barriers
+		static const bool monoAsync = [] { const char* e = std::getenv("FIDESLIB_MONOMIAL_ASYNC"); return e && std::atoi(e) > 0; }();
+		if (monoAsync)
+			gpuBarrier();
+		else
+			cudaDeviceSynchronize();
 		// TODO compute fully as a GPU function.
 		RNSPoly monomial(cc.getAuxilarPoly());
 		monomial.grow(c0.getLevel());
@@ -2366,7 +2372,10 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 		// cudaDeviceSynchronize();
 		monomial.NTT(cc.batch, true);
 		// multElement runs on this ciphertext's streams, which do not wait on the NTT's.
-		cudaDeviceSynchronize();
+		if (monoAsync)
+			gpuBarrier();
+		else
+			cudaDeviceSynchronize();
 
 		cc.precom.monomialCache.emplace(key, std::move(monomial));
 	}

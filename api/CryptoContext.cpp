@@ -1400,8 +1400,14 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 			// No host wait here (FIDESLIB_ENCODE_NOSYNC=0 restores it). The encode's completion is already ordered on
 			// the plaintext's own stream (`ready`), which every consumer op waits on, and the scratch release below is
 			// event-ordered after it; the host only stalled until the GPU reached this encode.
-			if (!plaintext_streams_enabled && !encode_nosync_on())
-				cudaStreamSynchronize(ready);
+			// FIDESLIB_ENCODE_BARRIER=1: a GPU-side barrier instead of the host wait
+			static const bool encBarrier = [] { const char* e = std::getenv("FIDESLIB_ENCODE_BARRIER"); return e && std::atoi(e) > 0; }();
+			if (!plaintext_streams_enabled && !encode_nosync_on()) {
+				if (encBarrier)
+					FIDESlib::CKKS::gpuBarrier();
+				else
+					cudaStreamSynchronize(ready);
+			}
 			release_pt_scratch(*gpu_pt, ready);
 		}
 		uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
