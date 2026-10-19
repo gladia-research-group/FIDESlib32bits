@@ -1,7 +1,7 @@
 #pragma once
 // Transient-scratch discard (traffic campaign, 2026-10-03). `discard.global.L2` drops lines from L2
 // without the DRAM write-back; legal only for scratch whose every line is fully rewritten before it is
-// read again. All helpers are no-ops unless the FIDESLIB_DISCARD_SCRATCH flag is set (see NTT.cu).
+// read again. All helpers are no-ops unless the FIDESLIB_DISCARD_SCRATCH flag is set (default on; see NTT.cu).
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <vector>

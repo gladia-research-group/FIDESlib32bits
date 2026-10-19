@@ -123,9 +123,10 @@ void setTcTables(const TcTables& t0, int device) {
 void setTcNtt(int v) {
     cudaMemcpyToSymbol(g_fides_tc_ntt, &v, sizeof(int));
 }
+// FIDESLIB_DISCARD_SCRATCH: default 1 (10-19 A/B: Llama pf128 -1.2 s alone; GPT-2 decode -2%); 0 keeps the dead lines
 int discardScratchEnv() {
     const char* e = std::getenv("FIDESLIB_DISCARD_SCRATCH");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 1;
 }
 __device__ __forceinline__ void discard_l2_line(const void* p) {
     asm volatile("discard.global.L2 [%0], 128;" ::"l"(p) : "memory");
