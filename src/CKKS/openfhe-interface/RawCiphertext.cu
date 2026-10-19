@@ -1,12 +1,15 @@
 //
 // Created by carlosad on 24/04/24.
 //
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <complex>
 #include <cassert>
 #include <cstdlib>
 #include <fstream>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <type_traits>
 #include "CKKS/AccumulateBroadcast.cuh"
@@ -708,6 +711,52 @@ constexpr bool remove_extension = false;
 constexpr bool MAKE_CTS_LT_FRIENDLY = true;
 constexpr bool MAKE_STC_LT_FRIENDLY = true;
 
+int FIDESlib::CKKS::stcAltBudget() {
+    static const int k = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_BUDGET"); return e && *e ? std::atoi(e) : 0; }();
+    return k;
+}
+std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& FIDESlib::CKKS::stcAltPrecoms() {
+    static std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>> m;
+    return m;
+}
+int FIDESlib::CKKS::ctsAltBudget() {
+    static const int k = [] { const char* e = std::getenv("FIDESLIB_CTS_ALT_BUDGET"); return e && *e ? std::atoi(e) : 0; }();
+    return k;
+}
+std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& FIDESlib::CKKS::ctsAltPrecoms() {
+    static std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>> m;
+    return m;
+}
+namespace {
+thread_local bool tlStcAlt = false;  // inside an alternative precomputation's own indices / plaintexts (StC or CtS)
+// Runs fn with the route's OpenFHE precomputation swapped for a parked alternative one
+template <typename F>
+void withAltPrecom(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, int slots,
+                   std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& parked, F&& fn) {
+    auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE);
+    auto main = fhe->m_bootPrecomMap.at(slots);
+    fhe->m_bootPrecomMap[slots] = parked.at(slots);
+    tlStcAlt = true;
+    try {
+        fn();
+    } catch (...) {
+        tlStcAlt = false;
+        fhe->m_bootPrecomMap[slots] = main;
+        throw;
+    }
+    tlStcAlt = false;
+    fhe->m_bootPrecomMap[slots] = main;
+}
+template <typename F>
+void withStcAltPrecom(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, int slots, F&& fn) {
+    withAltPrecom(cc, slots, FIDESlib::CKKS::stcAltPrecoms(), std::forward<F>(fn));
+}
+template <typename F>
+void withCtsAltPrecom(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, int slots, F&& fn) {
+    withAltPrecom(cc, slots, FIDESlib::CKKS::ctsAltPrecoms(), std::forward<F>(fn));
+}
+}  // namespace
+
 std::vector<int> FIDESlib::CKKS::GetBootstrapIndexes(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
                                                      FIDESlib::CKKS::BootstrapPrecomputation* result_) {
     // ContextData& GPUcc = *GPUcc_;
@@ -1059,6 +1108,36 @@ std::vector<int> FIDESlib::CKKS::GetBootstrapIndexes(lbcrypto::CryptoContext<lbc
             for (int idx : GetAccumulateRotationIndices(4, n, r / 2))
                 indexes.push_back(idx);         // StC block partial sum
             indexes.push_back(n / 2);
+        }
+    }
+    // FIDESLIB_STC_ALT_BUDGET: the alternative StC's rotations join the route's keys
+    if (!tlStcAlt && stcAltPrecoms().count(slots)) {
+        std::vector<int> alt;
+        withStcAltPrecom(cc, slots, [&] { alt = GetBootstrapIndexes(cc, slots, nullptr); });
+        const size_t before = indexes.size();
+        for (int i : alt)
+            if (std::find(indexes.begin(), indexes.end(), i) == indexes.end())
+                indexes.push_back(i);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::cerr << "[stc_alt] slots=" << slots << ": " << indexes.size() - before
+                      << " rotation index(es) added for the alternative StC\n";
+        }
+    }
+    // FIDESLIB_CTS_ALT_BUDGET: the alternative CtS's rotations join the route's keys
+    if (!tlStcAlt && ctsAltPrecoms().count(slots)) {
+        std::vector<int> alt;
+        withCtsAltPrecom(cc, slots, [&] { alt = GetBootstrapIndexes(cc, slots, nullptr); });
+        const size_t before = indexes.size();
+        for (int i : alt)
+            if (std::find(indexes.begin(), indexes.end(), i) == indexes.end())
+                indexes.push_back(i);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::cerr << "[cts_alt] slots=" << slots << ": " << indexes.size() - before
+                      << " rotation index(es) added for the alternative CtS\n";
         }
     }
 
@@ -2008,14 +2087,19 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     if (base.aks0)
         throw std::runtime_error("AddBootstrapRaiseVariant: not supported with FIDESLIB_AKS");
     const int d = GPUcc.compositeDegree();
+    // FIDESLIB_CTS_ALT_BUDGET: the alternative CtS has one stage more, so raising one composite level higher (drop - 1)
+    // it hands EvalMod the level the shipped CtS would at `drop`: the variant lands the same on cheaper stages
+    const bool ctsAlt = !base.CtS_alt.empty() && drop >= base.raise_drop + 1;
+    const int raiseDrop = ctsAlt ? drop - 1 : drop;  // the variant's raise target
     const int shift = -(drop - base.raise_drop);
+    const int ctsShift = -(raiseDrop - base.raise_drop);
     const double sfBase = GPUcc.sfAtLimb(GPUcc.L - d * base.raise_drop);
-    const double sfVar = GPUcc.sfAtLimb(GPUcc.L - d * drop);
+    const double sfVar = GPUcc.sfAtLimb(GPUcc.L - d * raiseDrop);
     const double fdrop = sfBase / sfVar;
-    auto relevel = [&](const Plaintext& pt, double factor) {
+    auto relevel = [&](const Plaintext& pt, double factor, int sh) {
         // stage-0 plaintexts carry 2^-t in their scale bookkeeping (NoiseFactor = sf x 2^-t): keep that ratio
         const double tag = pt.NoiseFactor / GPUcc.sfAtLimb(pt.c0.getLevel());
-        Plaintext np = relevelPlaintext(GPUcc_, GPUcc, pt, shift, factor);
+        Plaintext np = relevelPlaintext(GPUcc_, GPUcc, pt, sh, factor);
         np.NoiseFactor *= tag;
         return np;
     };
@@ -2023,11 +2107,12 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     var->LT.slots = base.LT.slots;
     var->LT.bStep = base.LT.bStep;
     for (auto& pt : base.LT.A)
-        var->LT.A.push_back(relevel(pt, 1.0));
+        var->LT.A.push_back(relevel(pt, 1.0, shift));
     for (auto& pt : base.LT.invA)  // single-LT route: invA is its only StC stage
-        var->LT.invA.push_back(relevel(pt, fdrop));
+        var->LT.invA.push_back(relevel(pt, fdrop, shift));
     auto copySteps = [&](const std::vector<BootstrapPrecomputation::LTstep>& src,
                          std::vector<BootstrapPrecomputation::LTstep>& dst, bool isStC) {
+        const int sh = isStC ? shift : ctsShift;
         for (size_t si = 0; si < src.size(); ++si) {
             BootstrapPrecomputation::LTstep o;
             o.slots = src[si].slots;
@@ -2045,10 +2130,10 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
             o.A.reserve(src[si].A.size());
             for (auto& pt : src[si].A) {
                 if (!single) {
-                    o.A.push_back(relevel(pt, f));
+                    o.A.push_back(relevel(pt, f, sh));
                     continue;
                 }
-                const int l = pt.c0.getLevel(), lv = l + d * shift;
+                const int l = pt.c0.getLevel(), lv = l + d * sh;
                 const int l0 = l + j, l0v = lv + j;
                 double nf = pt.NoiseFactor / GPUcc.modReduceFactorAt(l) * GPUcc.modReduceFactorAt(lv);
                 if (j == sN - 1)
@@ -2058,11 +2143,27 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
             dst.push_back(std::move(o));
         }
     };
-    copySteps(base.CtS, var->CtS, false);
-    copySteps(base.StC, var->StC, true);
+    copySteps(ctsAlt ? base.CtS_alt : base.CtS, var->CtS, false);
+    // FIDESLIB_BTS_RAISE_NOSTC=d,..: drops that only the staged StC-first finishes (the PCMM's) raise at carry no StC
+    // tables, about half a variant's memory; a path that needs them throws (Bootstrap.cu requireStC)
+    static const std::set<int> noStc = [] {
+        std::set<int> s;
+        if (const char* e = std::getenv("FIDESLIB_BTS_RAISE_NOSTC"); e && *e) {
+            std::stringstream ss{std::string(e)};
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) s.insert(std::atoi(tok.c_str()));
+        }
+        return s;
+    }();
+    const bool withStc = !(noStc.count(drop) && base.stc_first_mode > 0 && base.LT.slots != slots && !base.sparseB);
+    if (withStc)
+        copySteps(base.StC, var->StC, true);
     for (auto& pt : base.stcRealA0) {
+        if (!withStc)
+            break;
         if (base.stc_single == 0) {
-            var->stcRealA0.push_back(relevel(pt, base.StC.size() == 1 ? fdrop : 1.0));
+            var->stcRealA0.push_back(relevel(pt, base.StC.size() == 1 ? fdrop : 1.0, shift));
             continue;
         }
         // single-prime StC stage 0: the variant's limb at its own prime
@@ -2081,7 +2182,7 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     var->sparse_btoa = base.sparse_btoa;
     var->ghs_btoa = base.ghs_btoa;
     var->cts0_t = base.cts0_t;
-    var->raise_drop = drop;
+    var->raise_drop = raiseDrop;
     if (base.stc_first_mode > 0) {  // staged-only StC-first finishes (the PCMM's) raise to this variant's top
         var->stc_first_mode = base.stc_first_mode;
         var->stc_first_entry = base.stc_first_entry;
@@ -2100,9 +2201,26 @@ void FIDESlib::CKKS::AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::
     }
     cudaDeviceSynchronize();
     std::cerr << "[bts_raise] slots=" << slots << " variant drop=" << drop << " (base " << base.raise_drop
-              << "): plaintexts re-levelled by " << shift << " composite level(s), raise top " << (GPUcc.L - d * drop)
-              << " of " << GPUcc.L << "\n";
+              << "): plaintexts re-levelled by " << shift << " composite level(s), raise top " << (GPUcc.L - d * raiseDrop)
+              << " of " << GPUcc.L;
+    if (ctsAlt)
+        std::cerr << " (alternative " << var->CtS.size() << "-stage CtS re-levelled by " << ctsShift << ")";
+    if (!withStc)
+        std::cerr << " [no StC tables: StC-first finishes only]";
+    std::cerr << "\n";
     base.raise_variants[drop] = std::move(var);
+    // the alternative CtS only feeds variants: drop it once every allowed drop has one
+    if (ctsAlt && !GPUcc.raiseDropsAllowed.empty()) {
+        bool all = true;
+        for (int k : GPUcc.raiseDropsAllowed)
+            if (k > base.raise_drop && !base.raise_variants.count(k))
+                all = false;
+        if (all) {
+            base.CtS_alt.clear();
+            base.CtS_alt.shrink_to_fit();
+            std::cerr << "[cts_alt] slots=" << slots << ": every allowed drop has its variant, source CtS freed\n";
+        }
+    }
 }
 
 void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey, int slots,
@@ -2119,6 +2237,53 @@ void FIDESlib::CKKS::AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcryp
         std::vector<int> indexes = GetBootstrapIndexes(cc, slots, &result);
 
         AddBootstrapPlaintexts(cc, slots, GPUcc_, result);
+
+        // FIDESLIB_STC_ALT_BUDGET: the parked alternative precomputation's StC-first stages (the rest is dropped)
+        if (result.stc_first_mode == 2 && stcAltPrecoms().count(slots)) {
+            BootstrapPrecomputation alt;
+            withStcAltPrecom(cc, slots, [&] {
+                GetBootstrapIndexes(cc, slots, &alt);
+                AddBootstrapPlaintexts(cc, slots, GPUcc_, alt);
+            });
+            if (alt.stc_first_mode == 2 && !alt.StC.empty() && alt.stc_first_entry >= 0) {
+                size_t n = 0;
+                for (auto& st : alt.StC_first)
+                    n += st.A.size();
+                result.StC_alt_first = std::move(alt.StC_first);
+                result.stc_alt_lastSrc.push_back(std::move(alt.StC.back()));
+                result.stc_alt_entry = alt.stc_first_entry;
+                std::cerr << "[stc_alt] slots=" << slots << ": " << alt.StC.size() << "-stage StC-first input, " << n
+                          << " + " << result.stc_alt_lastSrc[0].A.size() << " plaintexts, entry "
+                          << result.stc_alt_entry << " (shipped: " << result.StC.size() << " stages, entry "
+                          << result.stc_first_entry << ")\n";
+            }
+            cudaDeviceSynchronize();
+        }
+        // FIDESLIB_CTS_ALT_BUDGET: the parked alternative precomputation's CtS stages, the source of the raise variants
+        // of drop >= 1 (the rest is dropped)
+        if (ctsAltPrecoms().count(slots) && result.LT.slots != slots && !result.sparseB && !result.aks0 &&
+            result.cts_single == 0) {
+            BootstrapPrecomputation alt;
+            withCtsAltPrecom(cc, slots, [&] {
+                GetBootstrapIndexes(cc, slots, &alt);
+                AddBootstrapPlaintexts(cc, slots, GPUcc_, alt);
+            });
+            if (alt.CtS.size() == result.CtS.size() + 1 && alt.cts_single == 0 && !alt.aks0 &&
+                alt.raise_drop == result.raise_drop && alt.cts0_t == result.cts0_t) {
+                size_t n = 0;
+                for (auto& st : alt.CtS)
+                    n += st.A.size();
+                result.CtS_alt = std::move(alt.CtS);
+                std::cerr << "[cts_alt] slots=" << slots << ": " << result.CtS_alt.size() << "-stage CtS, " << n
+                          << " plaintexts (shipped: " << result.CtS.size() << " stages), used by raise drops >= "
+                          << result.raise_drop + 1 << " one composite level higher\n";
+            } else {
+                std::cerr << "[cts_alt] slots=" << slots << ": alternative CtS skipped (" << alt.CtS.size()
+                          << " stages vs shipped " << result.CtS.size() << ", t " << alt.cts0_t << " vs "
+                          << result.cts0_t << ")\n";
+            }
+            cudaDeviceSynchronize();
+        }
 
         result.correctionFactor =
             std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(cc->GetScheme()->m_FHE)->m_correctionFactor;

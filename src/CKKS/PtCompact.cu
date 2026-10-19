@@ -148,7 +148,7 @@ Plaintext expandCompact(Context& cc, const Plaintext& src) {
 std::pair<size_t, size_t> compactStages(BootstrapPrecomputation& pre) {
     if (const char* e = std::getenv("FIDESLIB_PT_COMPACT"); e && e[0] == '0') return {0, 0};
     size_t n = 0, freed = 0;
-    for (auto* v : {&pre.CtS, &pre.StC})
+    for (auto* v : {&pre.CtS, &pre.StC, &pre.stc_alt_lastSrc})   // the alternative StC's last stage: a source, like StC
         for (auto& st : *v) {
             if (st.ptMask == 0xFFFFFFFFu || (st.ptMask >> 24) == 0x7Fu || st.A.empty()) continue;
             // a stage reads every diagonal through one mask: compact all of them or none

@@ -159,6 +159,18 @@ void AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, in
 std::vector<int> GetBootstrapIndexes(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
                                      FIDESlib::CKKS::BootstrapPrecomputation* result_);
 
+/** FIDESLIB_STC_ALT_BUDGET=k (default 0 = off): EvalBootstrapSetup also builds the dense route's OpenFHE precomputation
+ *  at StC level budget k and parks it here (slots -> precom); AddBootstrapPrecomputation turns it into the staged
+ *  StC-first input's alternative stages and GetBootstrapIndexes adds its rotations to the route's keys. */
+int stcAltBudget();
+std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& stcAltPrecoms();
+/** FIDESLIB_CTS_ALT_BUDGET=k (default 0 = off): EvalBootstrapSetup also builds the dense route's OpenFHE precomputation
+ *  at CtS level budget k (one stage more than the shipped) and parks it here; AddBootstrapPrecomputation keeps its CtS
+ *  stages (CtS_alt) and a raise variant of drop >= 1 takes them raising one composite level higher (drop - 1): same
+ *  landing, cheaper stages. GetBootstrapIndexes adds its rotations to the route's keys. */
+int ctsAltBudget();
+std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& ctsAltPrecoms();
+
 /** Server-side bootstrap setup */
 void AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey, int slots,
                                 FIDESlib::CKKS::Context& GPUcc_);

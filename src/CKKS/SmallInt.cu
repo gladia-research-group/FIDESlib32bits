@@ -397,10 +397,10 @@ void relevelSync() {
         cudaDeviceSynchronize();
 }
 
-Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor) {
+Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor, bool sync) {
     if (pt.compactMask != 0xFFFFFFFFu) {
         Plaintext full = expandCompact(cc_, pt);
-        return relevelPlaintext(cc_, cc, full, shift, factor);
+        return relevelPlaintext(cc_, cc, full, shift, factor, sync);
     }
     const int d = cc.compositeDegree();
     const int oldL = pt.c0.getLevel();
@@ -413,7 +413,8 @@ Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, i
     smallIntDivideFromTo(cc, pt.c0, np.c0, 4, D, pt.c0.isModUp());
     np.copyMetadata(pt);
     np.NoiseFactor = cc.sfAtLimb(newL);
-    relevelSync();
+    if (sync)       // sync = false: the caller fences once after a batch
+        relevelSync();
     return np;
 }
 

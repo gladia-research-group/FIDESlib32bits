@@ -72,6 +72,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// BEFORE LoadContext.
 	void RegenerateEncapsulationKeys(const PrivateKey<DCRTPoly>& secretKey);
 	void LoadAksKeys(const PrivateKey<DCRTPoly>& secretKey);
+	/// @brief FIDESLIB_LAR=1: generate the level-adaptive relinearization keys (FIDESlib CKKS/LevelAdaptiveKS.cuh)
+	/// from the secret key, fresh randomness. Needs a loaded context with the eval mult key; keygen side only.
+	void LoadLarKeys(const PrivateKey<DCRTPoly>& secretKey);
 	/// @brief Keep the secret key on the GPU for noise-flooding-free diagnostic decryptions (FIDESlib SmallInt.cuh).
 	void LoadDiagSecret(const PrivateKey<DCRTPoly>& secretKey);
 	/// @brief Diagnostic: FIDESlib's coefficient-domain index order. Returns pi with natural[pi[i]] = stored[i].
@@ -97,6 +100,11 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @param pt Plaintext to load.
 	/// @param stream CUDA stream for async H2D copies (single-GPU contexts only).
 	void LoadPlaintext(Plaintext& pt, cudaStream_t stream);
+	/// @brief Reload a dumped device-encoded plaintext ahead of its first use, on a non-blocking stream; its first
+	/// GetDevicePlaintext consumes the copy-done event (perseus PF_MASK_PREFETCH). The caller fences the device just
+	/// before a batch of these: the pool hands out blocks freed on the legacy stream without an event.
+	/// @return true if the plaintext was reloaded (false: already loaded, not device-encoded, or not dumped).
+	bool PrefetchPlaintext(Plaintext& pt);
 	/// @brief CPU-ONLY pre-extraction half of the acquire (no CUDA). Builds the host RawPlainText
 	/// (GetRawPlainText: limb copy + bit-reverse — the ~10.5 s/tok serial cost) and stashes it in
 	/// prefetched_raw, so a later LoadPlaintext uploads without re-extracting. Safe to call from a

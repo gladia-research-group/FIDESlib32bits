@@ -59,6 +59,14 @@ Plaintext::Plaintext(Context& cc)
     CudaNvtxStop();
 }
 
+Plaintext::Plaintext(Context& cc, bool def_stream)
+    : my_range(loc, LIFETIME),
+      cc_((assert(cc != nullptr), CudaNvtxStart(std::string{sc::current().function_name()}.substr()), cc)),
+      cc(*cc_),
+      c0(this->cc, -1, false, def_stream) {
+    CudaNvtxStop();
+}
+
 Plaintext::Plaintext(Context& cc, const RawPlainText& raw)
     : my_range(loc, LIFETIME),
       cc_((assert(cc != nullptr), CudaNvtxStart(std::string{sc::current().function_name()}.substr()), cc)),

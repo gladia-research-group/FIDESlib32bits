@@ -79,7 +79,7 @@ RNSPoly::RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>&
 }
 
 RNSPoly::RNSPoly(RNSPoly&& src) noexcept
-    : uid(src.uid), cc(src.cc), level(src.level), modUp(src.modUp), GPU(std::move(src.GPU)) {
+    : uid(src.uid), cc(src.cc), level(src.level), modUp(src.modUp), GPU(std::move(src.GPU)), graphOwned(src.graphOwned) {
     for (auto& g : GPU) {
         g.level = &(this->level);
     }
@@ -90,6 +90,7 @@ void RNSPoly::swap(RNSPoly& other) noexcept {
     assert(&cc == &other.cc);
     std::swap(level, other.level);
     std::swap(modUp, other.modUp);
+    std::swap(graphOwned, other.graphOwned);   // travels with the buffers
     GPU.swap(other.GPU);
     for (auto& g : GPU)
         g.level = &this->level;

@@ -9,6 +9,8 @@
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/CoeffRows.cuh"
 #include "CKKS/AksKeys.cuh"
+#include "CKKS/LevelAdaptiveKS.cuh"
+#include "CKKS/KskSeedExpand.cuh"
 #include "CKKS/SmallInt.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/DeviceEncode.cuh"
@@ -458,6 +460,117 @@ void CryptoContextImpl<DCRTPoly>::LoadAksKeys(const PrivateKey<DCRTPoly>& secret
 	}
 }
 
+void CryptoContextImpl<DCRTPoly>::LoadLarKeys(const PrivateKey<DCRTPoly>& secretKey) {
+	if (!this->loaded)
+		throw std::runtime_error("LoadLarKeys: LoadContext first");
+	auto& c	   = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	auto geos = FIDESlib::CKKS::larPlanClasses(c);
+	if (geos.empty())
+		return;
+	auto& cpu_cc	  = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+	auto& skImpl	  = std::any_cast<const lbcrypto::PrivateKey<lbcrypto::DCRTPoly>&>(secretKey->pimpl);
+	const auto cp	  = std::dynamic_pointer_cast<lbcrypto::CryptoParametersRNS>(cpu_cc->GetCryptoParameters());
+	const auto qp	  = cp->GetParamsQP();
+	const auto& s	  = skImpl->GetPrivateElement();  // EVAL form over Q
+	const uint32_t N  = cpu_cc->GetRingDimension();
+	const auto& C	  = c->precom.constants.at(0);
+	const int nTot	  = C.L + C.K;
+	const size_t nQP  = qp->GetParams().size();
+	auto mulmod		  = [](uint64_t a, uint64_t b, uint64_t p) { return (uint64_t)((unsigned __int128)a * b % p); };
+	// FIDESlib prime id -> OpenFHE QP tower
+	std::vector<size_t> tower(nTot, nQP);
+	for (int id = 0; id < nTot; ++id)
+		for (size_t t = 0; t < nQP; ++t)
+			if (qp->GetParams()[t]->GetModulus().ConvertToInt() == C.primes[id])
+				tower[id] = t;
+	for (int id = 0; id < nTot; ++id)
+		if (tower[id] == nQP)
+			throw std::runtime_error("LoadLarKeys: a FIDESlib prime is not in the OpenFHE QP basis");
+	// the secret over every prime: its signed (ternary) coefficients lifted tower by tower
+	auto s0 = s.GetElementAtIndex(0);
+	s0.SetFormat(Format::COEFFICIENT);
+	const uint64_t q0 = s0.GetModulus().ConvertToInt();
+	std::vector<int64_t> sc(N);
+	for (uint32_t i = 0; i < N; ++i) {
+		const uint64_t v = s0[i].ConvertToInt();
+		sc[i]			 = v > q0 / 2 ? (int64_t)v - (int64_t)q0 : (int64_t)v;
+	}
+	lbcrypto::DCRTPoly sExt(qp, Format::COEFFICIENT, true);
+	for (size_t t = 0; t < nQP; ++t) {
+		auto& tw		= sExt.GetAllElements()[t];
+		const int64_t m = (int64_t)tw.GetModulus().ConvertToInt();
+		for (uint32_t i = 0; i < N; ++i)
+			tw[i] = NativeInteger((uint64_t)(((sc[i] % m) + m) % m));
+	}
+	sExt.SetFormat(Format::EVALUATION);
+	for (size_t t = 0; t < s.GetNumOfElements(); ++t)
+		if (!(sExt.GetElementAtIndex(t) == s.GetElementAtIndex(t)))
+			throw std::runtime_error("LoadLarKeys: the lifted secret does not match the key on Q");
+	const lbcrypto::DCRTPoly s2 = sExt * sExt;
+	lbcrypto::DCRTPoly::DugType dug;
+	const auto& dgg = cp->GetDiscreteGaussianGenerator();
+	auto limbs		= [&](const lbcrypto::DCRTPoly& x) {
+		 std::vector<std::vector<uint64_t>> out(nTot, std::vector<uint64_t>(N));
+		 for (int id = 0; id < nTot; ++id) {
+			 const auto& v = x.GetElementAtIndex(tower[id]);
+			 for (uint32_t i = 0; i < N; ++i)
+				 out[id][i] = v[i].ConvertToInt();
+		 }
+		 return out;
+	};
+	// seeded `a` (FIDESLIB_LAR_SEEDED, default): the production eval key's ChaCha12 lane, a fresh 256-bit seed per class
+	auto seededA = [&](const std::vector<uint32_t>& seed, uint32_t digit) {
+		lbcrypto::DCRTPoly a(qp, Format::EVALUATION, true);
+		for (int id = 0; id < nTot; ++id) {
+			auto& tw		   = a.GetAllElements()[tower[id]];
+			const uint32_t p   = (uint32_t)C.primes[id];
+			const uint32_t m_p = (0xFFFFFFFFu / p) * p;
+			uint32_t out[16];
+			for (uint32_t b0 = 0; b0 < N / 16; ++b0) {
+				FIDESlib::CKKS::kskexpand::chacha_block(seed.data(), b0, digit, p, out);
+				for (uint32_t w = 0; w < 16; ++w) {
+					const uint32_t slot = b0 * 16 + w;
+					tw[slot] = NativeInteger(out[w] < m_p ? out[w] % p
+														  : FIDESlib::CKKS::kskexpand::expand_coeff(seed.data(), digit, p, slot, N >> 4));
+				}
+			}
+		}
+		return a;
+	};
+	std::random_device rd;
+	std::vector<FIDESlib::CKKS::LarHostKey> keys;
+	for (auto& g : geos) {
+		FIDESlib::CKKS::LarHostKey hk;
+		hk.geo		   = g;
+		const int beta = (int)g.start.size() - 1;
+		if (FIDESlib::CKKS::larSeeded()) {
+			hk.seed.resize(8);
+			for (auto& w : hk.seed)
+				w = rd();
+		}
+		for (int j = 0; j < beta; ++j) {
+			// b_j = e - a_j s + (P' on the primes of digit j) s^2: the digit's CRT idempotent is 1 there, 0 on the others
+			lbcrypto::DCRTPoly a = hk.seed.empty() ? lbcrypto::DCRTPoly(dug, qp, Format::EVALUATION) : seededA(hk.seed, (uint32_t)j);
+			lbcrypto::DCRTPoly e(dgg, qp, Format::EVALUATION);
+			lbcrypto::DCRTPoly b = e - a * sExt;
+			std::vector<NativeInteger> f(nQP, NativeInteger(0));
+			for (int id = g.start[j]; id < g.start[j + 1]; ++id) {
+				const uint64_t q = C.primes[id];
+				uint64_t P		 = 1;
+				for (int pid : g.pPrimeIds)
+					P = mulmod(P, C.primes[pid] % q, q);
+				f[tower[id]] = NativeInteger(P);
+			}
+			b += s2.Times(f);
+			if (hk.seed.empty())
+				hk.a.push_back(limbs(a));
+			hk.b.push_back(limbs(b));
+		}
+		keys.push_back(std::move(hk));
+	}
+	FIDESlib::CKKS::InstallLarKeys(c, std::move(keys), skImpl->GetKeyTag());
+}
+
 void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicKey) {
 	if (this->loaded || this->devices.empty())
 		return;
@@ -807,9 +920,8 @@ void stage_arena_begin() {
 					 ov > 0 ? " (raise FHE_STAGE_ARENA_GB)" : "");
 	if (a.cap < kStageArenaBytes) {
 		if (a.base)
-			cudaFreeHost(a.base);
-		void* p = nullptr;
-		cudaMallocHost(&p, kStageArenaBytes);
+			FIDESlib::pinnedHostFree(a.base);
+		void* p = FIDESlib::pinnedHostAlloc(kStageArenaBytes);
 		a.base = static_cast<uint8_t*>(p);
 		a.cap  = a.base ? kStageArenaBytes : 0;
 	}
@@ -909,8 +1021,7 @@ StagedEntry& persist_stage_locked(const void* key, FIDESlib::CKKS::RawPlainText&
 	if (it != g_persist_staged.end())
 		return it->second;   // already staged (constant weight) — reuse
 	if (g_persist_arena.base == nullptr) {
-		void* p = nullptr;
-		cudaMallocHost(&p, kPersistArenaBytes);
+		void* p = FIDESlib::pinnedHostAlloc(kPersistArenaBytes);
 		g_persist_arena.base = static_cast<uint8_t*>(p);
 		g_persist_arena.cap	 = g_persist_arena.base ? kPersistArenaBytes : 0;
 		g_persist_arena.used = 0;
@@ -948,8 +1059,7 @@ std::future<void>						g_kv_prewarm;   // background 12GB cudaMallocHost (hides 
 // Reserve (first sight) or reuse a stable pinned slot for a cache position. Caller holds g_kv_mutex.
 KvSlot& kv_slot_ensure(const std::string& pos_key, size_t bytes) {
 	if (g_kv_arena.base == nullptr) {
-		void* p = nullptr;
-		cudaMallocHost(&p, kKvArenaBytes);
+		void* p = FIDESlib::pinnedHostAlloc(kKvArenaBytes);
 		g_kv_arena.base = static_cast<uint8_t*>(p);
 		g_kv_arena.cap	= g_kv_arena.base ? kKvArenaBytes : 0;
 		g_kv_arena.used = 0;
@@ -985,8 +1095,7 @@ void PrewarmStageArenas() {
 	std::call_once(once, [] {
 		g_stage_prewarm = std::async(std::launch::async, [] {
 			for (int i = 0; i < kStageSlots; ++i) {
-				void* p = nullptr;
-				cudaMallocHost(&p, kStageArenaBytes);
+				void* p = FIDESlib::pinnedHostAlloc(kStageArenaBytes);
 				std::lock_guard<std::mutex> g(g_stage_mutex);
 				PinnedArena& a = g_stage_arena[i];
 				if (a.base == nullptr && p) {
@@ -994,7 +1103,7 @@ void PrewarmStageArenas() {
 					a.cap  = kStageArenaBytes;
 					a.used = 0;
 				} else if (p) {
-					cudaFreeHost(p);   // lazy-alloc won the race — drop ours
+					FIDESlib::pinnedHostFree(p);   // lazy-alloc won the race — drop ours
 				}
 			}
 		});
@@ -1153,15 +1262,14 @@ void CryptoContextImpl<DCRTPoly>::PrewarmKvArena() {
 	static std::once_flag once;
 	std::call_once(once, [] {
 		g_kv_prewarm = std::async(std::launch::async, [] {
-			void* p = nullptr;
-			cudaMallocHost(&p, kKvArenaBytes);   // ~3.5s pinning 12GB (pinned pages commit at alloc)
+			void* p = FIDESlib::pinnedHostAlloc(kKvArenaBytes);   // ~3.5s pinning 12GB (pinned pages commit at alloc)
 			std::lock_guard<std::mutex> g(g_kv_mutex);
 			if (g_kv_arena.base == nullptr) {
 				g_kv_arena.base = static_cast<uint8_t*>(p);
 				g_kv_arena.cap	= p ? kKvArenaBytes : 0;
 				g_kv_arena.used = 0;
 			} else if (p) {
-				cudaFreeHost(p);   // kv_slot_ensure won the race — drop ours
+				FIDESlib::pinnedHostFree(p);   // kv_slot_ensure won the race — drop ours
 			}
 		});
 	});
@@ -1249,6 +1357,14 @@ size_t g_dump_bytes = 0, g_full_bytes = 0;
 uint8_t*										 g_slab	  = nullptr;
 size_t											 g_slab_left = 0;
 
+// Slabs live for the process.
+uint8_t* dump_slab_alloc(size_t sz) {
+	uint8_t* p = static_cast<uint8_t*>(FIDESlib::pinnedHostAlloc(sz));
+	if (!p)
+		OPENFHE_THROW("device dump: pinned allocation failed");
+	return p;
+}
+
 uint8_t* dump_alloc_locked(size_t bytes) {
 	auto& fl = g_dump_free[bytes];
 	if (!fl.empty()) {
@@ -1258,8 +1374,7 @@ uint8_t* dump_alloc_locked(size_t bytes) {
 	}
 	if (g_slab_left < bytes) {
 		const size_t sz = std::max(bytes, size_t(1) << 30);
-		if (cudaMallocHost(reinterpret_cast<void**>(&g_slab), sz) != cudaSuccess)
-			OPENFHE_THROW("device dump: cudaMallocHost failed");
+		g_slab = dump_slab_alloc(sz);
 		g_slab_left = sz;
 	}
 	uint8_t* p = g_slab;
@@ -1293,11 +1408,13 @@ static void dump_device_plaintext_locked(const void* key, FIDESlib::CKKS::Plaint
 	DeviceDump d;
 	cudaStreamSynchronize(dev.c0.GPU.at(0).s.ptr());   // the encode (and its max |coefficient| copy) is done
 	d.limbs		= dev.c0.getLevel() + 1;
-	// compact when every integer coefficient fits a quarter of the first composite group's product
+	// compact when every integer coefficient fits a quarter of the first composite group's product; FIDESLIB_DUMP_FULL=1
+	// (default 0) dumps every limb instead, so the reload is one H2D per limb (no Garner lift, no NTT)
+	static const bool dump_full = [] { const char* e = std::getenv("FIDESLIB_DUMP_FULL"); return e && std::atoi(e) > 0; }();
 	double group = 1;
 	for (int l = 0; l < dev.cc.compositeDegree(); ++l)
 		group *= (double)dev.cc.prime[l].p;
-	const bool compact = cmax && *cmax < 0.25 * group;
+	const bool compact = !dump_full && cmax && *cmax < 0.25 * group;
 	const int  src	   = compact ? std::min(d.limbs, dev.cc.compositeDegree()) : d.limbs;
 	d.bytes = (size_t)src * dev.cc.N * sizeof(uint32_t);
 	for (int l = 0; l < src; ++l)
@@ -1319,6 +1436,79 @@ static void dump_device_plaintext_locked(const void* key, FIDESlib::CKKS::Plaint
 		OPENFHE_THROW("device dump: " + std::to_string(cursor) + " bytes stored, " + std::to_string(d.bytes) + " expected");
 	g_dumps[key] = std::move(d);
 }
+
+// PrefetchPlaintext: dumped plaintexts reloaded ahead of use on a non-blocking stream, so the H2D overlaps compute
+// instead of riding the legacy stream (where every per-limb copy fences all blocking streams). The first
+// GetDevicePlaintext of a prefetched handle consumes its copy-done event: a host query, plus a legacy-stream wait only
+// if the copy is still running; an eviction before first use waits for the copy on the host.
+namespace {
+struct PrefetchKey {
+	const void* cc;
+	uint32_t	handle;
+	bool		operator==(const PrefetchKey& o) const { return cc == o.cc && handle == o.handle; }
+};
+struct PrefetchKeyHash {
+	size_t operator()(const PrefetchKey& k) const { return std::hash<const void*>()(k.cc) ^ (size_t(k.handle) * 0x9E3779B97F4A7C15ull); }
+};
+std::mutex												  g_prefetch_mutex;
+std::unordered_map<PrefetchKey, cudaEvent_t, PrefetchKeyHash> g_prefetch_pending;
+std::vector<cudaEvent_t>								  g_prefetch_events;
+std::atomic<bool>										  g_prefetch_any{ false };
+struct PrefetchStats {
+	long n = 0, done = 0, waited = 0, evicted = 0, lazy = 0, compact = 0;   // lazy: dump reloads at first use (LoadPlaintext)
+	~PrefetchStats() {
+		if (n)
+			std::cerr << "[pt_prefetch] reloaded " << n << " (" << compact << " compact), done at first use " << done << ", waited " << waited
+			          << ", evicted before use " << evicted << "; lazy reloads (whole process) " << lazy << std::endl;
+	}
+} g_prefetch_stats;
+cudaStream_t prefetch_stream(int device) {
+	static std::map<int, cudaStream_t> streams;
+	std::lock_guard<std::mutex> g(g_prefetch_mutex);
+	auto it = streams.find(device);
+	if (it != streams.end())
+		return it->second;
+	cudaStream_t s = nullptr;
+	cudaSetDevice(device);
+	cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+	return streams[device] = s;
+}
+cudaEvent_t prefetch_event_locked() {
+	if (!g_prefetch_events.empty()) {
+		cudaEvent_t e = g_prefetch_events.back();
+		g_prefetch_events.pop_back();
+		return e;
+	}
+	cudaEvent_t e = nullptr;
+	cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+	return e;
+}
+// first use / eviction of a handle: true if a prefetch was pending (then consumed)
+bool consume_prefetch(const void* cc, uint32_t handle, bool evict) {
+	if (!g_prefetch_any.load(std::memory_order_relaxed))
+		return false;
+	std::lock_guard<std::mutex> g(g_prefetch_mutex);
+	auto it = g_prefetch_pending.find(PrefetchKey{ cc, handle });
+	if (it == g_prefetch_pending.end())
+		return false;
+	cudaEvent_t e = it->second;
+	if (evict) {
+		cudaEventSynchronize(e);   // the copy writes the limbs the eviction frees
+		++g_prefetch_stats.evicted;
+	} else if (cudaEventQuery(e) == cudaSuccess) {
+		++g_prefetch_stats.done;
+	} else {
+		cudaGetLastError();   // cudaErrorNotReady
+		cudaStreamWaitEvent(0, e, 0);   // legacy: every later blocking-stream op waits for the copy
+		++g_prefetch_stats.waited;
+	}
+	g_prefetch_events.push_back(e);
+	g_prefetch_pending.erase(it);
+	if (g_prefetch_pending.empty())
+		g_prefetch_any.store(false, std::memory_order_relaxed);
+	return true;
+}
+}   // namespace
 
 // FIDESLIB_GPU_ENCODE_CHECK=1: a reloaded plaintext against a fresh device encode of its values, limb for limb.
 static long g_check_n = 0, g_check_bad = 0, g_check_compact = 0;
@@ -1347,6 +1537,87 @@ static void check_reload_locked(FIDESlib::CKKS::Plaintext& got, const lbcrypto::
 		          << std::endl;
 }
 
+bool CryptoContextImpl<DCRTPoly>::PrefetchPlaintext(Plaintext& pt) {
+	if (pt->loaded || this->devices.empty() || !pt->device_encode || this->devices.size() != 1)
+		return false;
+	const void* dkey = static_cast<const void*>(pt.get());
+	auto&		context_gpu = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+	std::shared_ptr<FIDESlib::CKKS::Plaintext> gpu_pt;
+	const cudaStream_t R	= prefetch_stream(this->devices[0]);
+	cudaStream_t	   done_on = R;
+	{
+		std::lock_guard<std::mutex> g(g_dump_mutex);
+		auto it = g_dumps.find(dkey);
+		if (it == g_dumps.end())
+			return false;   // not dumped: the lazy path encodes it
+		const DeviceDump& d = it->second;
+		if ((int)d.off.size() < d.limbs) {
+			// compact: upload + Garner lift + NTT on the plaintext's own (non-legacy) streams, whose allocations wait on
+			// the pool's event; then its scratch goes (read-only from here) and the copy-done event follows all of it
+			gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu, false);
+			auto& part = gpu_pt->c0.GPU.at(0);
+			const cudaStream_t ps = part.s.ptr();
+			gpu_pt->loadCoeffExpand(d.meta, d.base, d.off, d.len, (int)d.off.size(), d.limbs, ps, 0, true);
+			for (auto& l : part.limb)
+				std::visit([&](auto& x) { part.s.wait(x.stream); }, l);
+			gpu_pt->c0.releaseAux();
+			done_on = part.s.ptr();
+		}
+	}
+	if (gpu_pt) {
+		cudaEvent_t done = nullptr;
+		{
+			std::lock_guard<std::mutex> gp(g_prefetch_mutex);
+			done = prefetch_event_locked();
+		}
+		cudaEventRecord(done, done_on);
+		const uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
+		pt->gpu				  = handle;
+		pt->loaded			  = true;
+		std::lock_guard<std::mutex> gp(g_prefetch_mutex);
+		g_prefetch_pending[PrefetchKey{ this, handle }] = done;
+		g_prefetch_any.store(true, std::memory_order_relaxed);
+		++g_prefetch_stats.n;
+		++g_prefetch_stats.compact;
+		return true;
+	}
+	gpu_pt = std::make_shared<FIDESlib::CKKS::Plaintext>(context_gpu);
+	{
+		std::lock_guard<std::mutex> g(g_dump_mutex);
+		auto it = g_dumps.find(dkey);
+		if (it == g_dumps.end())
+			return false;
+		const DeviceDump& d = it->second;
+		// limbs first (the pool's own stream may grow a slab: R starts after it, through a legacy event, which is
+		// immediate right after the caller's device fence), then the copies on R
+		gpu_pt->c0.grow((int)d.meta.moduli.size() - 1, false, true);
+		cudaEvent_t e0 = nullptr;
+		{
+			std::lock_guard<std::mutex> gp(g_prefetch_mutex);
+			e0 = prefetch_event_locked();
+		}
+		cudaEventRecord(e0, 0);
+		cudaStreamWaitEvent(R, e0, 0);
+		gpu_pt->loadStaged(d.meta, d.base, d.off, d.len, R);
+		std::lock_guard<std::mutex> gp(g_prefetch_mutex);
+		g_prefetch_events.push_back(e0);   // waits capture the record: reusable at once
+	}
+	cudaEvent_t done = nullptr;
+	{
+		std::lock_guard<std::mutex> gp(g_prefetch_mutex);
+		done = prefetch_event_locked();
+	}
+	cudaEventRecord(done, R);
+	const uint32_t handle = this->RegisterDevicePlaintext(std::move(gpu_pt));
+	pt->gpu				  = handle;
+	pt->loaded			  = true;
+	std::lock_guard<std::mutex> gp(g_prefetch_mutex);
+	g_prefetch_pending[PrefetchKey{ this, handle }] = done;
+	g_prefetch_any.store(true, std::memory_order_relaxed);
+	++g_prefetch_stats.n;
+	return true;
+}
+
 void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stream_override) {
 	if (pt->loaded || this->devices.empty())
 		return;
@@ -1373,6 +1644,7 @@ void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt, cudaStream_t stre
 				else
 					gpu_pt->loadStaged(d.meta, d.base, d.off, d.len, load_stream);
 				reloaded = true;
+				++g_prefetch_stats.lazy;
 				if (std::getenv("FIDESLIB_GPU_ENCODE_CHECK"))
 					check_reload_locked(*gpu_pt, std::any_cast<const lbcrypto::Plaintext&>(pt->cpu), total_q_limbs(this->cpu),
 					                    (int)d.off.size() < d.limbs);
@@ -1818,6 +2090,23 @@ void CryptoContextImpl<DCRTPoly>::EvalBootstrapSetup(const std::vector<uint32_t>
 		return;
 	}
 
+	// FIDESLIB_STC_ALT_BUDGET=k: the dense route's precomputation at StC level budget k first, parked for the staged
+	// StC-first input's alternative stages (AddBootstrapPrecomputation); the shipped one below replaces it in the map
+	if (const int k = FIDESlib::CKKS::stcAltBudget(); k > 0 && levelBudget.size() == 2 && (int)levelBudget[1] != k &&
+	    slots == context->GetRingDimension() / 2) {
+		context->EvalBootstrapSetup({ levelBudget[0], (uint32_t)k }, dim1, slots, correctionFactor, true, modall);
+		auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
+		FIDESlib::CKKS::stcAltPrecoms()[(int)slots] = fhe->m_bootPrecomMap.at(slots);
+		fhe->m_bootPrecomMap.erase(slots);
+	}
+	// FIDESLIB_CTS_ALT_BUDGET=k: likewise at CtS level budget k, parked for the raise variants' alternative CtS
+	if (const int k = FIDESlib::CKKS::ctsAltBudget(); k > 0 && levelBudget.size() == 2 && (int)levelBudget[0] != k &&
+	    slots == context->GetRingDimension() / 2) {
+		context->EvalBootstrapSetup({ (uint32_t)k, levelBudget[1] }, dim1, slots, correctionFactor, true, modall);
+		auto fhe = std::dynamic_pointer_cast<lbcrypto::FHECKKSRNS>(context->GetScheme()->m_FHE);
+		FIDESlib::CKKS::ctsAltPrecoms()[(int)slots] = fhe->m_bootPrecomMap.at(slots);
+		fhe->m_bootPrecomMap.erase(slots);
+	}
 	context->EvalBootstrapSetup(levelBudget, std::move(dim1), slots, correctionFactor, true, modall);
 }
 
@@ -2381,7 +2670,7 @@ struct MagRing {
 		const size_t gb = (e && *e && std::atoi(e) > 0) ? (size_t)std::atoi(e) : 6;
 		slot_bytes		= slot_bytes_;
 		nslots			= (int)std::max<size_t>(4, (gb << 30) / slot_bytes);
-		cudaMallocHost(&base, (size_t)nslots * slot_bytes);
+		base = static_cast<uint8_t*>(FIDESlib::pinnedHostAlloc((size_t)nslots * slot_bytes));
 		for (int i = nslots - 1; i >= 0; --i)
 			freelist.push_back(i);
 		cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
@@ -4193,6 +4482,7 @@ std::shared_ptr<void>& CryptoContextImpl<DCRTPoly>::GetDevicePlaintext(uint32_t 
 	device_plaintexts_mutex->lock_shared();
 	auto& it = device_plaintexts.at(handle);
 	device_plaintexts_mutex->unlock_shared();
+	consume_prefetch(this, handle, false);   // PrefetchPlaintext: the copy is done before any consumer reads
 	return it;
 }
 
@@ -4204,6 +4494,7 @@ std::shared_ptr<void>& CryptoContextImpl<DCRTPoly>::GetDeviceCiphertext(uint32_t
 }
 
 bool CryptoContextImpl<DCRTPoly>::EvictDevicePlaintext(uint32_t handle) {
+	consume_prefetch(this, handle, true);
 	{   // FIDESLIB_GPU_ENCODE: a device encode is dumped at its first eviction, so the next load reloads it
 		std::lock_guard<std::mutex> g(g_dump_mutex);
 		auto u = g_undumped.find(handle);

@@ -163,8 +163,12 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 		Lockstep L;
 		const int dev = ctxtEnc.c0.GPU.at(0).device;
 		std::exception_ptr err;
+		// FIDESLIB_EVALMOD_LANES=1: the Im chain's key switches in lane 1's workspaces, so the two chains overlap on the GPU
+		static const bool lanes = [] { const char* e = std::getenv("FIDESLIB_EVALMOD_LANES"); return e && std::atoi(e) > 0; }();
 		std::thread im([&] {
 			cudaSetDevice(dev);
+			if (lanes)
+				ContextData::ksLane() = 1;
 			tlLock = &L;
 			tlSide = 1;
 			L.wait(1);
@@ -1041,7 +1045,8 @@ void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey
 	for (int32_t j = 1; j < r + 1; j++) {
 		if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
 			ctxt.rescale();
-		ctxt.square(fusedRescaleFlag() != 0);
+		// the last square stays unfused: EvalMod's output keeps its pending rescale (deg 2), as planned
+		ctxt.square(fusedRescaleFlag() != 0 && j < r);
 		if (FIDESlib::CKKS::g_btsStageStash) {
 			cudaDeviceSynchronize();
 			auto c = std::make_shared<FIDESlib::CKKS::Ciphertext>(ctxt.cc_);

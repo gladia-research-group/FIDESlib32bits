@@ -20,6 +20,7 @@ class RNSPoly {
 
    public:
     std::vector<LimbPartition> GPU;
+    bool graphOwned = false;   // used inside a graph capture: lives in the graph pool, never back in the eager one
 
     explicit RNSPoly(ContextData& context, int level = -1, bool single_malloc = false, bool def_stream = false);
     explicit RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>& data);

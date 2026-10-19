@@ -81,6 +81,20 @@ int discardScratchFlag() {
     return g_host_discard_scratch;
 }
 
+int pdlFlag() {
+    static const int v = [] { const char* e = std::getenv("FIDESLIB_PDL"); return e && *e ? std::atoi(e) : 0; }();
+    return v;
+}
+
+// FIDESLIB_PDL: let the next kernel of the stream be scheduled now, then wait until the previous kernel has completed
+// and its writes are visible. Both are no-ops unless this launch carried programmatic stream serialization.
+__device__ __forceinline__ void pdlEntry() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+
 // Tensor-core NTT core (NTTtc.cuh): per-device tables and the routing flag, set from the host.
 __device__ int g_fides_tc_ntt = 0;
 __device__ const uint8_t* g_tc_R[MAXP];
@@ -482,11 +496,11 @@ __device__ __forceinline__ void INTT__(const Global::Globals* Globals, const T* 
 }
 
 template <typename T, bool second, ALGO algo, INTT_MODE mode>
-__global__ void INTT_(const Global::Globals* Globals, T* __restrict__ dat, const int __grid_constant__ primeid,
+__global__ void FIDES_NTT_LB INTT_(const Global::Globals* Globals, T* __restrict__ dat, const int __grid_constant__ primeid,
                       T* __restrict__ res, const T* __restrict__ dat2, T* __restrict__ res0, T* __restrict__ res1,
                       const T* __restrict__ kska, const T* __restrict__ kskb, T* __restrict__ c0,
                       const T* __restrict__ c0tilde) {
-
+    pdlEntry();
     INTT__<T, second, algo, mode>(Globals, dat, primeid, res, dat2, res0, res1, kska, kskb, c0, c0tilde);
 }
 
@@ -501,11 +515,11 @@ __global__ void INTT_(const Global::Globals* Globals, T* __restrict__ dat, const
 #undef W
 
 template <bool second, ALGO algo, INTT_MODE mode>
-__global__ void INTT_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
+__global__ void FIDES_NTT_LB INTT_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
                       void** __restrict__ res, void** __restrict__ dat2, void** __restrict__ res0,
                       void** __restrict__ res1, void** __restrict__ kska, void** __restrict__ kskb,
                       void** __restrict__ c0, void** __restrict__ c0tilde) {
-
+    pdlEntry();
     const int primeid = C_.primeid_flattened[primeid_init + blockIdx.y];
     // if (threadIdx.x == 0 && blockIdx.x == 0)
     //     printf("%d %d\n", primeid_init + blockIdx.y, primeid);
@@ -1097,10 +1111,10 @@ __device__ __forceinline__ void NTT__(const Global::Globals* Globals, T* __restr
 }
 
 template <typename T, bool second, ALGO algo, NTT_MODE mode>
-__global__ void NTT_(const Global::Globals* Globals, T* __restrict__ dat, const int __grid_constant__ primeid,
+__global__ void FIDES_NTT_LB NTT_(const Global::Globals* Globals, T* __restrict__ dat, const int __grid_constant__ primeid,
                      T* __restrict__ res, const T* __restrict__ pt, const int __grid_constant__ primeid_rescale,
                      T* __restrict__ res2, const T* __restrict__ kskb) {
-
+    pdlEntry();
     NTT__<T, second, algo, mode>(Globals, dat, primeid, res, pt, primeid_rescale, res2, kskb);
 }
 
@@ -1115,9 +1129,10 @@ __global__ void NTT_(const Global::Globals* Globals, T* __restrict__ dat, const 
 #undef V
 
 template <bool second, ALGO algo, NTT_MODE mode>
-__global__ void NTT_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
+__global__ void FIDES_NTT_LB NTT_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
                      void** __restrict__ res, void** __restrict__ pt, const int __grid_constant__ primeid_rescale,
                      void** __restrict__ res2, void** __restrict__ kskb) {
+    pdlEntry();
     // a multi-digit table (lever B1-2) is num_d * MAXP rows with nullptr holes: nothing to do for a hole
     if (!((mode == NTT_RESCALE || mode == NTT_MULTPT || mode == NTT_RESCALE2) && !second) && dat[blockIdx.y] == nullptr)
         return;

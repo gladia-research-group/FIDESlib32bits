@@ -50,6 +50,9 @@ void btsStcFirstOutput(Ciphertext& ctxt, const BtsState& st);
 void btsStCEnter(Ciphertext& ctxt, const BtsState& st);
 void btsStCStage(Ciphertext& ctxt, const BtsState& st, int k);
 void btsFinish(Ciphertext& ctxt, const BtsState& st);
+/// The StC-first output refresh (raise, fold, CtS, EvalMod, StC-first output, then `mul` > 1 as an exact integer
+/// product): eager, or a CUDA graph per shape under FIDESLIB_FINISH_GRAPH=1.
+void btsFinishStcFirst(Ciphertext& ctxt, BtsState& st, uint64_t mul = 1);
 /// The stage sequence above, in C++ (reference for the external orchestration).
 void BootstrapStaged(Ciphertext& ctxt, int slots, bool prescaled);
 

@@ -75,6 +75,9 @@ namespace FIDESlib::CKKS {
      * @param cc Reference to the CKKS context that will be used for operations.
      */
     explicit Plaintext(Context& cc);
+    /** @brief As Plaintext(cc), on the partition's own streams when `def_stream` is false (the default constructor
+     *  uses the legacy stream): a plaintext built off the critical path (CryptoContext::PrefetchPlaintext). */
+    Plaintext(Context& cc, bool def_stream);
     /**
      * @brief Construct a plaintext from a raw ciphertext representation.
      *

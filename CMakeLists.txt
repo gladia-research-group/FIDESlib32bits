@@ -230,6 +230,7 @@ if (NOT nccl_FOUND)
 endif()
 
 target_sources(fideslib PRIVATE ${SOURCE_FILES_CXX} ${SOURCE_FILES_CUDA} ${SOURCE_FILES_API})
+target_compile_definitions(fideslib PRIVATE FIDESLIB_CAPTURE_HOOKS=1)   # CudaUtils.cuh capture hooks (FIDESLIB_BTS_GRAPH)
 target_sources (fideslib PRIVATE 
 	FILE_SET private_headers
 	TYPE HEADERS 

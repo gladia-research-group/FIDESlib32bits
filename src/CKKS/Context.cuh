@@ -87,6 +87,12 @@ class ContextData {
     std::unique_ptr<RNSPoly> key_switch_aux;
     std::unique_ptr<RNSPoly> key_switch_aux2;
     std::array<std::unique_ptr<RNSPoly>, 2> moddown_aux = {nullptr};
+    // lanes 1..kKsLanes-1's copies (index 0 unused; ksLane() picks them): FIDESLIB_EVALMOD_LANES puts the EvalMod Im
+    // chain on lane 1, bts.ks_lane spreads independent refreshes over lanes so they do not serialize on one workspace
+    static constexpr int kKsLanes = 4;
+    std::array<std::unique_ptr<RNSPoly>, kKsLanes> key_switch_aux_ln;
+    std::array<std::unique_ptr<RNSPoly>, kKsLanes> key_switch_aux2_ln;
+    std::array<std::array<std::unique_ptr<RNSPoly>, 2>, kKsLanes> moddown_aux_ln;
     std::vector<Stream> top_limb_stream;
     std::vector<uint64_t*> top_limb_buffer;
     std::vector<void*> top_limb_buffer_handle;
@@ -101,6 +107,11 @@ class ContextData {
     std::vector<std::vector<Stream>> digitStream;
     std::vector<std::vector<std::vector<Stream>>> digitStreamForMemcpyPeer;
     std::vector<std::vector<Stream>> digitStream2;
+    // lanes 1..kKsLanes-1's digit streams (index 0 unused): a key switch on lane l forks its digits onto lane l's streams,
+    // so key switches on different lanes do not queue behind each other on shared streams
+    std::array<std::vector<std::vector<Stream>>, 4> digitStreamLn, digitStream2Ln;
+    std::vector<std::vector<Stream>>& digitStreamL() { const int l = ksLane() % 4; return l ? digitStreamLn[l] : digitStream; }
+    std::vector<std::vector<Stream>>& digitStream2L() { const int l = ksLane() % 4; return l ? digitStream2Ln[l] : digitStream2; }
 
     // std::vector<RNSPoly> key_switch_digits;
     bool canP2P = false;
@@ -111,6 +122,9 @@ class ContextData {
     RNSPoly& getKeySwitchAux();
     RNSPoly& getKeySwitchAux2();
     RNSPoly& getModdownAux(const int num);
+    /** The calling thread's keyswitch workspace lane (0 default; the EvalMod lockstep Im thread uses 1 under
+     *  FIDESLIB_EVALMOD_LANES so the Re / Im chains do not serialize on one workspace). */
+    static int& ksLane();
 
     bool isValidPrimeId(const int i) const;
 

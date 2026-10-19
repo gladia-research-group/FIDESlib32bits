@@ -7,6 +7,7 @@
 #include "CKKS/Context.cuh"
 #include "CKKS/Discard.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
+#include "CKKS/LevelAdaptiveKS.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CKKS/SmallInt.cuh"
 #include <omp.h>
@@ -552,6 +553,12 @@ void Ciphertext::rescale() {
 
 /** "in" needs to have Digit and Gather limbs pre-generated */
 RNSPoly& MGPUkeySwitchCore(RNSPoly& in, const KeySwitchingKey& kskEval, const bool moddown) {
+	// FIDESLIB_LAR=1: the eval key at a level a level-adaptive class covers (LevelAdaptiveKS.cuh)
+	if (moddown && larEnabled()) {
+		RNSPoly& aux2 = in.GPU.at(0).cc.getKeySwitchAux2();
+		if (&aux2 != &in && larTryKeySwitch(in, aux2, kskEval))
+			return aux2;
+	}
 	{
 		RNSPoly& aux = in.modup_ksk_moddown_mgpu(kskEval, moddown);
 

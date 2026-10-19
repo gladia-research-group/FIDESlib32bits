@@ -6,6 +6,9 @@
 #define FIDESLIB_NTT_CUH
 
 #include <cinttypes>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include "CKKS/forwardDefs.cuh"
 #include "ConstantsGPU.cuh"
 
@@ -35,6 +38,48 @@ void* get_NTT_reference(bool second);
 void setDiscardScratch(int v);
 int discardScratchEnv();
 int discardScratchFlag();
+
+/// FIDESLIB_PDL (default 0): the NTT_ / INTT_ launches that go through nttLaunch carry programmatic stream
+/// serialization, so a transform is scheduled while the previous kernel of its stream drains. The kernels trigger
+/// their dependents and wait for their predecessor's completion at entry (both no-ops on a plain launch); 0 = plain.
+int pdlFlag();
+#ifdef __CUDACC__  // the launch helpers need the CUDA compiler (host-only translation units include this header too)
+// Argument I of an NTT_ / INTT_ launch: the caller's, else the declaration's default, which for these two kernel
+// families is nullptr for every pointer and -1 for their one integer (NTT_'s primeid_rescale)
+template <size_t I, typename T, typename Tup>
+__host__ inline T nttArg(const Tup& given) {
+    if constexpr (I < std::tuple_size_v<Tup>)
+        return static_cast<T>(std::get<I>(given));
+    else if constexpr (std::is_integral_v<T>)
+        return T(-1);
+    else
+        return T{};
+}
+template <typename... KArgs, size_t... I, typename Tup>
+inline void nttLaunchImpl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s,
+                          std::index_sequence<I...>, const Tup& given) {
+    if (pdlFlag()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid;
+        cfg.blockDim = block;
+        cfg.dynamicSmemBytes = smem;
+        cfg.stream = s;
+        cudaLaunchAttribute attr[1];
+        attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attr;
+        cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, kernel, nttArg<I, KArgs>(given)...);
+    } else {
+        kernel<<<grid, block, smem, s>>>(nttArg<I, KArgs>(given)...);
+    }
+}
+template <typename... KArgs, typename... Args>
+inline void nttLaunch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t s, Args... args) {
+    static_assert(sizeof...(Args) <= sizeof...(KArgs), "nttLaunch: too many kernel arguments");
+    nttLaunchImpl(kernel, grid, block, smem, s, std::index_sequence_for<KArgs...>{}, std::tuple<Args...>(args...));
+}
+#endif
 
 // ------------------------------------- INTT ----------------------------------------
 /** Kernel fusions */

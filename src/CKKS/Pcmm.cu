@@ -473,7 +473,11 @@ void modGemm(PcmmKeys& K, const int8_t* Wd, int nW, const uint32_t* X, uint32_t*
     const size_t cin = (size_t)rowsIn * c2, cw = (size_t)rowsOut * rowsIn;
     int8_t* Xd = xdBuf.get<int8_t>(4 * cin);
     digits4both<<<(cin + 255) / 256, 256, 0, s>>>(X, Xd, rowsIn, cols, K.pr);
-    const size_t budget = (size_t)1 << 30;
+    // FIDESLIB_PCMM_GEMM_MB: the int32 product buffer's budget (default 1024 MB; it stays allocated for the process)
+    static const size_t budget = [] {
+        const char* e = std::getenv("FIDESLIB_PCMM_GEMM_MB");
+        return (size_t)((e && *e) ? std::max(64, std::atoi(e)) : 1024) << 20;
+    }();
     int rc = (int)std::min<size_t>(rowsOut, std::max<size_t>(512, budget / ((size_t)E * 4 * (size_t)c2)));
     int32_t* G = gBuf.get<int32_t>((size_t)E * rc * c2);
     const int32_t one = 1, zero = 0;
@@ -518,7 +522,11 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
     // streams both ways), no timing marks, outputs lifted straight into their limbs
     static const bool async = [] { const char* e = std::getenv("FIDESLIB_PCMM_ASYNC"); return e && std::atoi(e) > 0; }();
     if (async) times = nullptr;
-    cudaDeviceSynchronize();
+    // FIDESLIB_PCMM_NOSYNC=1 (with ASYNC): no device fences at entry / exit and the weight planes uploaded on s without
+    // blocking the host (pinned planes); the legacy stream already orders the call against FIDESlib's streams
+    static const bool nosync = [] { const char* e = std::getenv("FIDESLIB_PCMM_NOSYNC"); return e && std::atoi(e) > 0; }();
+    const bool fence = !(async && nosync);
+    if (fence) cudaDeviceSynchronize();
     auto tick = std::chrono::steady_clock::now();
     auto mark = [&](int slot) {
         if (!times) return;
@@ -527,29 +535,40 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
         times[slot] += std::chrono::duration<double, std::milli>(now - tick).count();
         tick = now;
     };
-    cudaDeviceSynchronize();
+    if (fence) cudaDeviceSynchronize();
     Bufs& G = g_buf;
     uint32_t* x = G.x.get<uint32_t>(8 * (size_t)N);
     uint32_t* scratch = G.scratch.get<uint32_t>((size_t)L * B * NCH * N1 + 2 * (size_t)B * S * N1);
     uint32_t* ks = G.ks.get<uint32_t>(2 * L * (size_t)S * N1);
     uint32_t* A = G.A.get<uint32_t>((size_t)L * rowsIn * N1);
     uint32_t* Bm = G.Bm.get<uint32_t>((size_t)L * rowsIn * NP);
-    uint32_t* Ap = G.Ap.get<uint32_t>((size_t)L * rowsOut * N1);
-    uint32_t* Bp = G.Bp.get<uint32_t>((size_t)L * rowsOut * NP);
+    // FIDESLIB_PCMM_OUT_CHUNK=k: the GEMMs and the output switches in groups of k output blocks, so Ap / Bp / Wd hold k
+    // blocks instead of all of them (gate_up: 56 -> k); 0 = one group. Planes path only.
+    static const int outChunk = [] {
+        const char* e = std::getenv("FIDESLIB_PCMM_OUT_CHUNK");
+        return (e && *e) ? std::max(0, std::atoi(e)) : 0;
+    }();
+    const int chunk = (outChunk > 0 && !W16) ? std::min(outChunk, nOut) : nOut;
+    const int rowsChunk = NCH * chunk;
+    uint32_t* Ap = G.Ap.get<uint32_t>((size_t)L * rowsChunk * N1);
+    uint32_t* Bp = G.Bp.get<uint32_t>((size_t)L * rowsChunk * NP);
     uint32_t* C = G.C.get<uint32_t>((size_t)L * NCH * N1);
     uint32_t* pk = G.pk.get<uint32_t>(2 * L * (size_t)S * N1);
     uint32_t* RA = G.RA.get<uint32_t>((size_t)L * N);
     uint32_t* RB = G.RB.get<uint32_t>((size_t)L * N);
     uint32_t* fb = G.fb.get<uint32_t>(2 * (size_t)L * N);
     const size_t nw = (size_t)rowsOut * rowsIn;
-    int8_t* Wd = G.Wd.get<int8_t>((size_t)nW * nw);
+    int8_t* Wd = G.Wd.get<int8_t>((size_t)nW * rowsChunk * rowsIn);
     uint32_t** ddst = G.dst.get<uint32_t*>(4);
     if (W16) {
         int16_t* Wdev = G.Wdev.get<int16_t>(nw);
         PCMM_CUDA(cudaMemcpy(Wdev, W16, sizeof(int16_t) * nw, cudaMemcpyHostToDevice));
         digits2<<<(nw + 255) / 256, 256, 0, s>>>(Wdev, Wd, nw);
-    } else {
-        PCMM_CUDA(cudaMemcpy(Wd, Wplanes, (size_t)nW * nw, cudaMemcpyHostToDevice));
+    } else if (chunk == nOut) {
+        if (fence)
+            PCMM_CUDA(cudaMemcpy(Wd, Wplanes, (size_t)nW * nw, cudaMemcpyHostToDevice));
+        else
+            PCMM_CUDA(cudaMemcpyAsync(Wd, Wplanes, (size_t)nW * nw, cudaMemcpyHostToDevice, s));
     }
 
     // staging poly kept for the process (never freed: it would outlive its context)
@@ -599,11 +618,6 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
         mark(2);
     }
 
-    // GEMMs mod q
-    modGemm(K, Wd, nW, A, Ap, rowsIn, rowsOut, N1, G.Xd, G.G, s);
-    modGemm(K, Wd, nW, Bm, Bp, rowsIn, rowsOut, NP, G.Xd, G.G, s);
-    mark(3);
-
     // per output: pack, compose, switch back, lift
     Primes lift{};
     const uint64_t q1 = (uint64_t)K.split[2] * K.split[3];
@@ -620,9 +634,25 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
         PCMM_CUDA(cudaMemcpyAsync(ddstAll, tab.data(), sizeof(uint32_t*) * tab.size(), cudaMemcpyHostToDevice, s));
     }
     for (int o = 0; o < nOut; ++o) {
-        packC<<<dim3(N1 / 256, NCH, L), 256, 0, s>>>(Ap, C, rowsOut, o * NCH, K.ly);
+        const int o0 = o - o % chunk, rc = NCH * std::min(chunk, nOut - o0);
+        if (o == o0) {
+            if (chunk != nOut)          // this group's rows of every digit plane
+                for (int u = 0; u < nW; ++u) {
+                    int8_t* dst = Wd + (size_t)u * rc * rowsIn;
+                    const int8_t* src = Wplanes + (size_t)u * nw + (size_t)o0 * NCH * rowsIn;
+                    if (fence)
+                        PCMM_CUDA(cudaMemcpy(dst, src, (size_t)rc * rowsIn, cudaMemcpyHostToDevice));
+                    else
+                        PCMM_CUDA(cudaMemcpyAsync(dst, src, (size_t)rc * rowsIn, cudaMemcpyHostToDevice, s));
+                }
+            // GEMMs mod q
+            modGemm(K, Wd, nW, A, Ap, rowsIn, rc, N1, G.Xd, G.G, s);
+            modGemm(K, Wd, nW, Bm, Bp, rowsIn, rc, NP, G.Xd, G.G, s);
+            mark(3);
+        }
+        packC<<<dim3(N1 / 256, NCH, L), 256, 0, s>>>(Ap, C, rc, (o - o0) * NCH, K.ly);
         keySwitch(C, pk, N1, S, R, K.pack, K, K.t12, K.it12, scratch, s);
-        addBpk<<<dim3(N1 / 256, S, L), 256, 0, s>>>(pk + (size_t)L * S * N1, Bp, K.pr, rowsOut, o * NCH, K.ly);
+        addBpk<<<dim3(N1 / 256, S, L), 256, 0, s>>>(pk + (size_t)L * S * N1, Bp, K.pr, rc, (o - o0) * NCH, K.ly);
         mark(4);
         compose<<<dim3(N / 256, L), 256, 0, s>>>(pk, RA);
         compose<<<dim3(N / 256, L), 256, 0, s>>>(pk + (size_t)L * S * N1, RB);
@@ -652,7 +682,7 @@ void pcmmCore(const std::vector<Ciphertext*>& ins, const std::vector<Ciphertext*
         }
         mark(5);
     }
-    cudaDeviceSynchronize();
+    if (fence) cudaDeviceSynchronize();
 }
 
 }  // namespace

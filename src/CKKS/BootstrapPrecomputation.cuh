@@ -109,6 +109,10 @@ class BootstrapPrecomputation {
     int stc_single = 0;
     int cts_single = 0;     // FIDESLIB_CTS_SINGLE: CtS stages [cts_single_lo, cts_single_lo + cts_single) on one prime
     int cts_single_lo = 0;
+    // FIDESLIB_CTS_ALT_BUDGET=k: the CtS stages of a second OpenFHE precomputation of this route at CtS level budget k
+    // (one stage more, at this route's own levels): the source of the raise variants of drop >= raise_drop + 1, which
+    // raise one composite level higher and land where the shipped CtS would. Freed once every allowed drop is built.
+    std::vector<LTstep> CtS_alt;
     // diagnostics (BTS_TRACE_DIR): the un-shifted plaintext stages, for a within-run reference bootstrap
     std::vector<LTstep> CtS_orig, StC_orig;
     // FIDESLIB_BTS_STC_FIRST (lever A, SOTA_2026-10-05: Lattigo "DecodeThenModUp" / slim order). SlotsToCoeffs runs on
@@ -135,6 +139,13 @@ class BootstrapPrecomputation {
     int stc_first_mode = 0;
     std::map<std::pair<int, long long>, std::vector<LTstep>> stc_first_last;     // multi-stage routes
     std::map<std::pair<int, long long>, std::vector<Plaintext>> lt_first_last;   // single-LT route
+    // FIDESLIB_STC_ALT_BUDGET=k: an alternative k-stage StC for the staged StC-first input (a second OpenFHE
+    // precomputation of this route at StC level budget k, set aside at setup): fewer diagonals per stage, entered at
+    // stc_alt_entry. An input that has the levels takes these stages, one that does not the shipped ones; both end at
+    // limb index 2d - 1, so the plan does not see the choice. stc_alt_lastSrc[0] = its last stage at the shipped level.
+    std::vector<LTstep> StC_alt_first, stc_alt_lastSrc;
+    int stc_alt_entry = -1;
+    std::map<std::pair<int, long long>, std::vector<LTstep>> stc_alt_last;
 
     // FIDESLIB_BTS_SPARSE_B (lever B, eprint 2026/1023 Algorithms 4/5, the n > r/2 case): repetition-aware depth-1
     // CoeffToSlot / SlotToCoeff for a sparse route with n = 2*slots effective coefficients repeated r = N/n times.

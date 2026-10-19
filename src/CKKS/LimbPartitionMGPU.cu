@@ -158,13 +158,11 @@ void LimbPartition::rescaleMGPU() {
                     cc.top_limb_stream.at(id).wait(s);
                     uint32_t num_limbs = 1;
 
-                    INTT_<false, algo, INTT_NONE>
-                        <<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
-                           stream.ptr()>>>(getGlobals(), limbptr.data + start + i, PARTITION(id, start + i),
+                    nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
+                           stream.ptr(), getGlobals(), limbptr.data + start + i, PARTITION(id, start + i),
                                            cc.top_limbptr.at(cc.GPUid.size() + id).data);
-                    INTT_<true, algo, INTT_NONE>
-                        <<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond,
-                           stream.ptr()>>>(getGlobals(), cc.top_limbptr.at(cc.GPUid.size() + id).data,
+                    nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond,
+                           stream.ptr(), getGlobals(), cc.top_limbptr.at(cc.GPUid.size() + id).data,
                                            PARTITION(id, start + i), cc.top_limbptr.at(id).data);
                 }
                 //s.wait(cc.top_limb_stream.at(id));
@@ -257,14 +255,12 @@ void LimbPartition::rescaleMGPU() {
             for (int i = 0; i < size; i += batch) {
                 uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(size - i));
 
-                NTT_<false, algo, mode>
-                    <<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+                nttLaunch(NTT_<false, algo, mode>, dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst, stream.ptr(), 
                         getGlobals(), ptr.data, PARTITION(id, i), auxptr.data + i, nullptr, *level);
 
                 s.wait(stream);  // Data dependency on top_limb reaches only to here
 
-                NTT_<true, algo, mode>
-                    <<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond, s.ptr()>>>(
+                nttLaunch(NTT_<true, algo, mode>, dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond, s.ptr(), 
                         getGlobals(), auxptr.data + i, PARTITION(id, i), limbptr.data + i, nullptr, *level);
             }
         }
@@ -318,12 +314,11 @@ void LimbPartition::doubleRescaleMGPU(LimbPartition& partition) {
                         //stream[i]->wait(i ? partition.s : s);
                         uint32_t num_limbs = 1;
 
-                        INTT_<false, algo, INTT_NONE>
-                            <<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
-                               stream[i]->ptr()>>>(getGlobals(), part[i]->limbptr.data + start + i_,
+                        nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
+                               stream[i]->ptr(), getGlobals(), part[i]->limbptr.data + start + i_,
                                                    PARTITION(id, start + i_), ptraux[i]->data);
-                        INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs},
-                                                       blockDimSecond, bytesSecond, stream[i]->ptr()>>>(
+                        nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs},
+                                                       blockDimSecond, bytesSecond, stream[i]->ptr(), 
                             getGlobals(), ptraux[i]->data, PARTITION(id, start + i_), ptr[i]->data);
                     }
                     //s.wait(cc.top_limb_stream.at(id));
@@ -435,13 +430,12 @@ void LimbPartition::doubleRescaleMGPU(LimbPartition& partition) {
             for (int i = 0; i < size; i += batch) {
                 uint32_t num_limbs = std::min((uint32_t)batch, (uint32_t)(size - i));
 
-                NTT_<false, algo, mode><<<dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
-                                          stream[j]->ptr()>>>(getGlobals(), ptr[j]->data, PARTITION(part[j]->id, i),
+                nttLaunch(NTT_<false, algo, mode>, dim3{cc.N / (blockDimFirst.x * M * 2), num_limbs}, blockDimFirst, bytesFirst,
+                                          stream[j]->ptr(), getGlobals(), ptr[j]->data, PARTITION(part[j]->id, i),
                                                               part[j]->auxptr.data + i, nullptr, *part[j]->level);
                 part[j]->s.wait(*stream[j]);
-                NTT_<true, algo, mode>
-                    <<<dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond,
-                       part[j]->s.ptr()>>>(getGlobals(), part[j]->auxptr.data + i, PARTITION(part[j]->id, i),
+                nttLaunch(NTT_<true, algo, mode>, dim3{cc.N / (blockDimSecond.x * M * 2), num_limbs}, blockDimSecond, bytesSecond,
+                       part[j]->s.ptr(), getGlobals(), part[j]->auxptr.data + i, PARTITION(part[j]->id, i),
                                            part[j]->limbptr.data + i, nullptr, *part[j]->level);
             }
         }
@@ -895,7 +889,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
     s.wait(c0.s);
     s.wait(ksk_a.getS());
     s.wait(ksk_b.getS());
-    //cc.digitStream2.at(0).at(id).wait(s);  // This is for the regular limbs keySWITCH:
+    //cc.digitStream2L().at(0).at(id).wait(s);  // This is for the regular limbs keySWITCH:
 
     constexpr bool SERIAL_MGPU_PRINT = false;
     std::set<Stream*> join_at_end;
@@ -1056,13 +1050,11 @@ void LimbPartition::modup_ksk_moddown_mgpu(
             gather_offset += cc.meta.at(i).size();
         }
 
-        INTT_<false, algo, INTT_NONE>
-            <<<dim3{cc.N / (blockDimFirst.x * M * 2), (uint32_t)limb_size}, blockDimFirst, bytesFirst, s.ptr()>>>(
+        nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), (uint32_t)limb_size}, blockDimFirst, bytesFirst, s.ptr(), 
                 getGlobals(), limbptr.data, PARTITION(id, 0), auxptr.data);
         CudaCheckErrorModNoSync;
-        INTT_<true, algo, INTT_NONE>
-            <<<dim3{cc.N / (blockDimSecond.x * M * 2), (uint32_t)limb_size}, blockDimSecond, bytesSecond,
-               s.ptr()>>>(getGlobals(), auxptr.data, PARTITION(id, 0), GATHERptr.data + gather_offset);
+        nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), (uint32_t)limb_size}, blockDimSecond, bytesSecond,
+               s.ptr(), getGlobals(), auxptr.data, PARTITION(id, 0), GATHERptr.data + gather_offset);
         CudaCheckErrorModNoSync;
 
     }
@@ -1082,7 +1074,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                           << " limbs starting at limb " << start_d << std::endl;
             }
 
-        Stream& stream = cc.digitStream.at(d).at(id);
+        Stream& stream = cc.digitStreamL().at(d).at(id);
         stream.wait(s);
         if (PRINT)
             std::cout << "/** Intt */" << std::endl;
@@ -1103,13 +1095,11 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 gather_offset += cc.meta.at(i).size();
             }
 
-            INTT_<false, algo, INTT_NONE>
-                <<<dim3{cc.N / (blockDimFirst.x * M * 2), size_d}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+            nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), size_d}, blockDimFirst, bytesFirst, stream.ptr(), 
                     getGlobals(), limbptr.data + start_d, PARTITION(id, start_d), auxptr.data + start_d);
 
             CudaCheckErrorModNoSync;
-            INTT_<true, algo, INTT_NONE>
-                <<<dim3{cc.N / (blockDimSecond.x * M * 2), size_d}, blockDimSecond, bytesSecond, stream.ptr()>>>(
+            nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), size_d}, blockDimSecond, bytesSecond, stream.ptr(), 
                     getGlobals(), auxptr.data + start_d, PARTITION(id, start_d),
                     GATHERptr.data + gather_offset + start_d);
 
@@ -1359,13 +1349,13 @@ void LimbPartition::modup_ksk_moddown_mgpu(
         while (start_d + size_d < limb_size && meta[start_d + size_d].digit < d + ds)
             size_d++;
 
-        Stream& stream = cc.digitStream.at(d).at(id);
+        Stream& stream = cc.digitStreamL().at(d).at(id);
 
         if (PRINT)
             std::cout << "/** Conv */" << std::endl;
 
         for (int d_ = d; d_ < d + ds; ++d_) {
-            Stream& stream1 = cc.digitStream.at(d_).at(id);
+            Stream& stream1 = cc.digitStreamL().at(d_).at(id);
             CudaCheckErrorModNoSync;
             stream1.wait(stream);
             CudaCheckErrorModNoSync;
@@ -1397,7 +1387,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 DecompAndModUpConv<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream1.ptr()>>>(
                 DECOMPlimbptr[d_].data, *level + 1, DIGITlimbptr[d_].data, digitid[d_], getGlobals());
 
-            cc.digitStream2.at(d_).at(id).wait(stream1); /** Get dependency for limb NTTs later */
+            cc.digitStream2L().at(d_).at(id).wait(stream1); /** Get dependency for limb NTTs later */
             if (PRINT)
                 std::cout << "/** NTT special limbs */" << std::endl;
             {
@@ -1415,12 +1405,12 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                         launchNTTcluster(getGlobals(), false, DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data, (int)size,
                                          stream1.ptr());
                     } else {
-                    NTT_<false, algo, NTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst,
-                                                  bytesFirst, stream1.ptr()>>>(
+                    nttLaunch(NTT_<false, algo, NTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst,
+                                                  bytesFirst, stream1.ptr(), 
                         getGlobals(), DIGITlimbptr[d_].data, DIGIT(d_, 0), c0.DIGITlimbptr[d_].data);
 
-                    NTT_<true, algo, NTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond,
-                                                 bytesSecond, stream1.ptr()>>>(
+                    nttLaunch(NTT_<true, algo, NTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond,
+                                                 bytesSecond, stream1.ptr(), 
                         getGlobals(), c0.DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data);
                     }
 
@@ -1429,7 +1419,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
         }
     }
     for (int d = 0; d < num_d; ++d) {
-        s.wait(cc.digitStream.at(d).at(id));
+        s.wait(cc.digitStreamL().at(d).at(id));
     }
     CudaCheckErrorModNoSync;
 
@@ -1622,12 +1612,12 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 if (limbs > 0) {
                     const int j = cc.splitSpecialMeta.at(id).at(0).id - cc.specialMeta.at(id).at(0).id;
 
-                    INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), limbs}, blockDimFirst,
-                                                    bytesFirst, stream.ptr()>>>(
+                    nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), limbs}, blockDimFirst,
+                                                    bytesFirst, stream.ptr(), 
                         getGlobals(), out.SPECIALlimbptr.data + j, SPECIAL(id, j), out.SPECIALauxptr.data + j);
 
-                    INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), limbs}, blockDimSecond,
-                                                   bytesSecond, stream.ptr()>>>(
+                    nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), limbs}, blockDimSecond,
+                                                   bytesSecond, stream.ptr(), 
                         getGlobals(), out.SPECIALauxptr.data + j, SPECIAL(id, j),
                         aux_limbs.SPECIALlimbptr.data + j);
 
@@ -1844,7 +1834,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
         std::cout << "/**We delay the call of NTTs post-modup for non special limbs to here*/" << std::endl;
     for (int d = 0; d < num_d; ++d) {
 
-        Stream& stream = cc.digitStream2.at(d).at(id);
+        Stream& stream = cc.digitStream2L().at(d).at(id);
 
         if (limb_size > 0) {
             uint32_t start = cc.splitSpecialMeta.at(id).size();
@@ -1858,13 +1848,11 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 int bytesFirst = (M == 4 ? 8 : 4) * blockDimFirst.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
                 int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
-                NTT_<false, algo, NTT_NONE>
-                    <<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+                nttLaunch(NTT_<false, algo, NTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst, bytesFirst, stream.ptr(), 
                         getGlobals(), DIGITlimbptr[d].data + start, DIGIT(d, start),
                         c0.DIGITlimbptr[d].data + start);
 
-                NTT_<true, algo, NTT_NONE>
-                    <<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond, bytesSecond, stream.ptr()>>>(
+                nttLaunch(NTT_<true, algo, NTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond, bytesSecond, stream.ptr(), 
                         getGlobals(), c0.DIGITlimbptr[d].data + start, DIGIT(d, start),
                         DIGITlimbptr[d].data + start);
 
@@ -1893,9 +1881,9 @@ void LimbPartition::modup_ksk_moddown_mgpu(
         std::cout << "/** ksk remaining limbs*/" << std::endl;
 
     {
-        Stream& stream = cc.digitStream2.at(0).at(id);
+        Stream& stream = cc.digitStream2L().at(0).at(id);
         for (int d = 1; d < num_d; ++d) {
-            stream.wait(cc.digitStream2.at(d).at(id));
+            stream.wait(cc.digitStream2L().at(d).at(id));
         }
         LimbPartition& out1 = *this;
         LimbPartition& out2 = c0;
@@ -1951,20 +1939,18 @@ void LimbPartition::modup_ksk_moddown_mgpu(
                 int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
                 {
-                    NTT_<false, algo, NTT_MODDOWN>
-                        <<<dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst,
-                           stream.ptr()>>>(getGlobals(), auxLimbs.limbptr.data, PARTITION(id, 0), out.auxptr.data);
+                    nttLaunch(NTT_<false, algo, NTT_MODDOWN>, dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst,
+                           stream.ptr(), getGlobals(), auxLimbs.limbptr.data, PARTITION(id, 0), out.auxptr.data);
                     if (discardD2Flag())
                         discardLimbTable(auxLimbs.limbptr.data, limb_size,
                                          (size_t)cc.N * (cc.precom.constants[0].type == 0 ? 4 : 8), stream.ptr());
 
-                    stream.wait(cc.digitStream2.at(0).at(id));
+                    stream.wait(cc.digitStream2L().at(0).at(id));
                     if (i == 0 && discardD2Flag())
                         discardDigitLimbs(*this, stream.ptr());  // the key-switch dot is done with the digits
 
-                    NTT_<true, algo, NTT_MODDOWN>
-                        <<<dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond, bytesSecond,
-                           stream.ptr()>>>(getGlobals(), out.auxptr.data, PARTITION(id, 0), out.limbptr.data);
+                    nttLaunch(NTT_<true, algo, NTT_MODDOWN>, dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond, bytesSecond,
+                           stream.ptr(), getGlobals(), out.auxptr.data, PARTITION(id, 0), out.limbptr.data);
                 }
             }
         }
@@ -1985,7 +1971,7 @@ void LimbPartition::modup_ksk_moddown_mgpu(
             CudaCheckErrorModNoSync;
         }
     } else {
-        s.wait(cc.digitStream2.at(0).at(id));
+        s.wait(cc.digitStream2L().at(0).at(id));
         if (discardD2Flag())
             discardDigitLimbs(*this, s.ptr());
     }
@@ -2290,10 +2276,10 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
         if (nttClusterOn(cc)) {
             launchNTTcluster(getGlobals(), true, limbptr.data, PARTITION(id, 0), GATHERptr.data + gather_offset, (int)limb_size, s.ptr());
         } else {
-        INTT_<false, algo, INTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst,
-                                        s.ptr()>>>(getGlobals(), limbptr.data, PARTITION(id, 0), auxptr.data);
-        INTT_<true, algo, INTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond,
-                                       bytesSecond, s.ptr()>>>(getGlobals(), auxptr.data, PARTITION(id, 0),
+        nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst,
+                                        s.ptr(), getGlobals(), limbptr.data, PARTITION(id, 0), auxptr.data);
+        nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond,
+                                       bytesSecond, s.ptr(), getGlobals(), auxptr.data, PARTITION(id, 0),
                                                                GATHERptr.data + gather_offset);
         }
     }
@@ -2310,7 +2296,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                 std::cout << "GPU " << id << " for digits " << d << ":" << d + digits_per_it << " INTT " << size_d
                           << " limbs starting at limb " << start_d << std::endl;
             }
-        Stream& stream = cc.digitStream.at(d).at(id);
+        Stream& stream = cc.digitStreamL().at(d).at(id);
         stream.wait(s);
         if constexpr (PRINT)
             std::cout << "/** Intt */" << std::endl;
@@ -2329,11 +2315,9 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                 launchNTTcluster(getGlobals(), true, limbptr.data + start_d, PARTITION(id, start_d),
                                  GATHERptr.data + gather_offset + start_d, (int)size_d, stream.ptr());
             } else {
-            INTT_<false, algo, INTT_NONE>
-                <<<dim3{cc.N / (blockDimFirst.x * M * 2), size_d}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+            nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), size_d}, blockDimFirst, bytesFirst, stream.ptr(), 
                     getGlobals(), limbptr.data + start_d, PARTITION(id, start_d), auxptr.data + start_d);
-            INTT_<true, algo, INTT_NONE>
-                <<<dim3{cc.N / (blockDimSecond.x * M * 2), size_d}, blockDimSecond, bytesSecond, stream.ptr()>>>(
+            nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), size_d}, blockDimSecond, bytesSecond, stream.ptr(), 
                     getGlobals(), auxptr.data + start_d, PARTITION(id, start_d),
                     GATHERptr.data + gather_offset + start_d);
             }
@@ -2414,7 +2398,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                                             //                    cc.GPUid[i], sizeof(uint64_t) * size_d_i * cc.N,
                                             //                    stream_.ptr());
 
-                                            //cc.digitStream.at(d).at(j).wait(stream_);
+                                            //cc.digitStreamL().at(d).at(j).wait(stream_);
                                             stream_.record();
                                             CudaCheckErrorModNoSync;
                                         }
@@ -2530,15 +2514,15 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
         uint32_t size_d = 0;
         while (start_d + size_d < limb_size && meta[start_d + size_d].digit < d + ds)
             size_d++;
-        Stream& stream = cc.digitStream.at(d).at(id);
+        Stream& stream = cc.digitStreamL().at(d).at(id);
         if constexpr (PRINT)
             std::cout << "/** Conv */" << std::endl;
         for (int d_ = d; d_ < d + ds; ++d_) {
-            Stream& stream1 = cc.digitStream.at(d_).at(id);
+            Stream& stream1 = cc.digitStreamL().at(d_).at(id);
             stream1.wait(stream);
         }
         for (int d_ = d; d_ < d + ds; ++d_) {
-            Stream& stream1 = cc.digitStream.at(d_).at(id);
+            Stream& stream1 = cc.digitStreamL().at(d_).at(id);
             int start = 0;
             for (int j = 0; j < d_; ++j)
                 start += DECOMPlimb.at(j).size();
@@ -2568,7 +2552,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             else
                 DecompAndModUpConv<ALGO_SHOUP><<<gridSize, blockSize, shared_bytes, stream1.ptr()>>>(
                 DECOMPlimbptr[d_].data, *level + 1, DIGITlimbptr[d_].data, digitid[d_], getGlobals());
-            cc.digitStream2.at(d_).at(id).wait(stream1); /** Get dependency for limb NTTs later */
+            cc.digitStream2L().at(d_).at(id).wait(stream1); /** Get dependency for limb NTTs later */
             if constexpr (PRINT)
                 std::cout << "/** NTT special limbs */" << std::endl;
             {
@@ -2584,11 +2568,11 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                         launchNTTcluster(getGlobals(), false, DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data, (int)size,
                                          stream1.ptr());
                     } else {
-                    NTT_<false, algo, NTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst,
-                                                  bytesFirst, stream1.ptr()>>>(
+                    nttLaunch(NTT_<false, algo, NTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst,
+                                                  bytesFirst, stream1.ptr(), 
                         getGlobals(), DIGITlimbptr[d_].data, DIGIT(d_, 0), c0.DIGITlimbptr[d_].data);
-                    NTT_<true, algo, NTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond,
-                                                 bytesSecond, stream1.ptr()>>>(
+                    nttLaunch(NTT_<true, algo, NTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond,
+                                                 bytesSecond, stream1.ptr(), 
                         getGlobals(), c0.DIGITlimbptr[d_].data, DIGIT(d_, 0), DIGITlimbptr[d_].data);
                     }
 
@@ -2667,20 +2651,20 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
             if (nttClusterOn(cc)) {
                 launchNTTcluster(getGlobals(), false, d_dat, DIGIT(0, 0), d_dat, (int)rows, s.ptr());
             } else {
-            NTT_<false, algo, NTT_NONE><<<dim3{cc.N / (blockDimFirst.x * M * 2), rows}, blockDimFirst, bytesFirst,
-                                          s.ptr()>>>(getGlobals(), d_dat, DIGIT(0, 0), d_aux);
-            NTT_<true, algo, NTT_NONE><<<dim3{cc.N / (blockDimSecond.x * M * 2), rows}, blockDimSecond, bytesSecond,
-                                         s.ptr()>>>(getGlobals(), d_aux, DIGIT(0, 0), d_dat);
+            nttLaunch(NTT_<false, algo, NTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), rows}, blockDimFirst, bytesFirst,
+                                          s.ptr(), getGlobals(), d_dat, DIGIT(0, 0), d_aux);
+            nttLaunch(NTT_<true, algo, NTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), rows}, blockDimSecond, bytesSecond,
+                                         s.ptr(), getGlobals(), d_aux, DIGIT(0, 0), d_dat);
             }
         }
         cudaFreeAsync(dbuf, s.ptr());
         for (int d = 0; d < ndig; ++d) {
-            cc.digitStream.at(d).at(id).wait(s);
-            cc.digitStream2.at(d).at(id).wait(s);
+            cc.digitStreamL().at(d).at(id).wait(s);
+            cc.digitStream2L().at(d).at(id).wait(s);
         }
     }
     for (int d = 0; d < num_d; ++d) {
-        s.wait(cc.digitStream.at(d).at(id));
+        s.wait(cc.digitStreamL().at(d).at(id));
     }
     if constexpr (PRINT) {
         if (SELECT) {
@@ -2701,7 +2685,7 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
     if constexpr (PRINT)
         std::cout << "/** We delay the call of NTTs post-modup for non special limbs to here*/" << std::endl;
     for (int d = 0; d < num_d; ++d) {
-        Stream& stream = cc.digitStream2.at(d).at(id);
+        Stream& stream = cc.digitStream2L().at(d).at(id);
         if (limb_size > 0 && modup_merge < 2) {  // level 2 did every digit above
             uint32_t start = modup_merge ? 0 : cc.splitSpecialMeta.at(id).size();  // merged: specials too
             uint32_t size = cc.precom.constants[id].num_primeid_digit_to[d][*level] - start;
@@ -2716,12 +2700,10 @@ void LimbPartition::modupMGPU(LimbPartition& aux, const std::vector<uint64_t*>& 
                     launchNTTcluster(getGlobals(), false, DIGITlimbptr[d].data + start, DIGIT(d, start), DIGITlimbptr[d].data + start,
                                      (int)size, stream.ptr());
                 } else {
-                NTT_<false, algo, NTT_NONE>
-                    <<<dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+                nttLaunch(NTT_<false, algo, NTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), size}, blockDimFirst, bytesFirst, stream.ptr(), 
                         getGlobals(), DIGITlimbptr[d].data + start, DIGIT(d, start),
                         c0.DIGITlimbptr[d].data + start);
-                NTT_<true, algo, NTT_NONE>
-                    <<<dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond, bytesSecond, stream.ptr()>>>(
+                nttLaunch(NTT_<true, algo, NTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), size}, blockDimSecond, bytesSecond, stream.ptr(), 
                         getGlobals(), c0.DIGITlimbptr[d].data + start, DIGIT(d, start),
                         DIGITlimbptr[d].data + start);
                 }
@@ -2868,7 +2850,7 @@ void LimbPartition::moddownMGPU(LimbPartition& auxLimbs, bool ntt, bool free_spe
 
         CudaCheckErrorModNoSync;
 
-        Stream& stream = cc.digitStream2.at(0).at(id);
+        Stream& stream = cc.digitStream2L().at(0).at(id);
         stream.wait(s);
         stream.wait(auxLimbs.s);
         LimbPartition& out = c1;
@@ -2887,12 +2869,10 @@ void LimbPartition::moddownMGPU(LimbPartition& auxLimbs, bool ntt, bool free_spe
 
                 const int i = cc.splitSpecialMeta.at(id).at(0).id - cc.specialMeta.at(id).at(0).id;
 
-                INTT_<false, algo, INTT_NONE>
-                    <<<dim3{cc.N / (blockDimFirst.x * M * 2), limbs}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+                nttLaunch(INTT_<false, algo, INTT_NONE>, dim3{cc.N / (blockDimFirst.x * M * 2), limbs}, blockDimFirst, bytesFirst, stream.ptr(), 
                         getGlobals(), out.SPECIALlimbptr.data + i, SPECIAL(id, i), out.SPECIALauxptr.data + i);
                 CudaCheckErrorModNoSync;
-                INTT_<true, algo, INTT_NONE>
-                    <<<dim3{cc.N / (blockDimSecond.x * M * 2), limbs}, blockDimSecond, bytesSecond, stream.ptr()>>>(
+                nttLaunch(INTT_<true, algo, INTT_NONE>, dim3{cc.N / (blockDimSecond.x * M * 2), limbs}, blockDimSecond, bytesSecond, stream.ptr(), 
                         getGlobals(), out.SPECIALauxptr.data + i, SPECIAL(id, i),
                         auxLimbs.SPECIALlimbptr.data + i);
                 CudaCheckErrorModNoSync;
@@ -3007,7 +2987,7 @@ void LimbPartition::moddownMGPU(LimbPartition& auxLimbs, bool ntt, bool free_spe
     }
 
     if (limb_size > 0) {
-        Stream& stream = cc.digitStream2.at(0).at(id);
+        Stream& stream = cc.digitStream2L().at(0).at(id);
         LimbPartition& out = *this;
         if constexpr (PRINT)
             std::cout << "/** Conv */" << std::endl;
@@ -3044,7 +3024,7 @@ void LimbPartition::moddownMGPU(LimbPartition& auxLimbs, bool ntt, bool free_spe
     {
         if constexpr (PRINT)
             std::cout << "/** Last NTT step for moddown*/" << std::endl;
-        Stream& stream = cc.digitStream2.at(0).at(id);
+        Stream& stream = cc.digitStream2L().at(0).at(id);
         LimbPartition& out = *this;
 
         if (limb_size > 0) {
@@ -3057,13 +3037,11 @@ void LimbPartition::moddownMGPU(LimbPartition& auxLimbs, bool ntt, bool free_spe
             int bytesSecond = (M == 4 ? 8 : 4) * blockDimSecond.x * (2 * M + 1 + (algo == 2 || algo == 3 ? 1 : 0));
 
             {
-                NTT_<false, algo, NTT_MODDOWN>
-                    <<<dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst, stream.ptr()>>>(
+                nttLaunch(NTT_<false, algo, NTT_MODDOWN>, dim3{cc.N / (blockDimFirst.x * M * 2), limb_size}, blockDimFirst, bytesFirst, stream.ptr(), 
                         getGlobals(), auxLimbs.limbptr.data, PARTITION(id, 0), out.auxptr.data);
                 CudaCheckErrorModNoSync;
 
-                NTT_<true, algo, NTT_MODDOWN>
-                    <<<dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond, bytesSecond, stream.ptr()>>>(
+                nttLaunch(NTT_<true, algo, NTT_MODDOWN>, dim3{cc.N / (blockDimSecond.x * M * 2), limb_size}, blockDimSecond, bytesSecond, stream.ptr(), 
                         getGlobals(), out.auxptr.data, PARTITION(id, 0), out.limbptr.data);
                 CudaCheckErrorModNoSync;
             }

@@ -8,6 +8,7 @@
 #include "CKKS/DeviceEncode.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CKKS/RNSPoly.cuh"
+#include "CudaUtils.cuh"
 
 namespace FIDESlib::CKKS {
 
@@ -206,6 +207,41 @@ cudaStream_t encodeFromScratch(Scratch& s, Plaintext& pt, int limbs, double scal
 }
 }  // namespace
 
+namespace {
+// FIDESLIB_ENCODE_PINNED_RING=n: the values uploaded from n pinned host slots in turn (a slot is reused once its copy has
+// run) instead of the caller's pageable vector, whose copy blocks the host while the driver's staging is busy -- i.e.
+// whenever the encode stream sits behind a deep queue (it waits on the plaintext's stream, the legacy one)
+struct PinnedRing {
+    std::vector<void*> slot;
+    std::vector<cudaEvent_t> done;
+    size_t bytes = 0, next = 0;
+};
+int pinnedRingSlots() {
+    static const int n = [] { const char* e = std::getenv("FIDESLIB_ENCODE_PINNED_RING"); return e ? std::max(0, std::atoi(e)) : 0; }();
+    return n;
+}
+const void* pinnedStage(PinnedRing& r, const void* src, size_t bytes, cudaStream_t E) {
+    const int n = pinnedRingSlots();
+    if (r.slot.empty()) {
+        r.slot.assign(n, nullptr);
+        r.done.assign(n, nullptr);
+        for (int i = 0; i < n; ++i) cudaEventCreateWithFlags(&r.done[i], cudaEventDisableTiming);
+    }
+    const size_t i = r.next++ % r.slot.size();
+    cudaEventSynchronize(r.done[i]);   // this slot's previous upload has run (never recorded: returns at once)
+    if (r.bytes < bytes) {             // every slot grows together, on first use or a larger ring
+        for (auto& p : r.slot) {
+            if (p) FIDESlib::pinnedHostFree(p);
+            p = FIDESlib::pinnedHostAlloc(bytes);
+        }
+        r.bytes = bytes;
+    }
+    std::memcpy(r.slot[i], src, bytes);
+    return r.slot[i];
+}
+PinnedRing g_ring;
+}  // namespace
+
 cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double>>& values, int limbs, double scale,
                             int deg, double* cmaxPinned) {
     ContextData& C = pt.cc;
@@ -215,7 +251,16 @@ cudaStream_t encodeOnDevice(Plaintext& pt, const std::vector<std::complex<double
     ensure(s, C);
     const cudaStream_t E = s.stream;
     cudaMemsetAsync(s.v, 0, sizeof(double2) * N / 2, E);
-    cudaMemcpyAsync(s.v, values.data(), sizeof(double2) * values.size(), cudaMemcpyHostToDevice, E);
+    const size_t bytes = sizeof(double2) * values.size();
+    if (pinnedRingSlots() > 0) {
+        if (g_ring.bytes < bytes && !g_ring.slot.empty())   // growing frees slots: their uploads must be done
+            cudaStreamSynchronize(E);
+        const void* src = pinnedStage(g_ring, values.data(), bytes, E);
+        cudaMemcpyAsync(s.v, src, bytes, cudaMemcpyHostToDevice, E);
+        cudaEventRecord(g_ring.done[(g_ring.next - 1) % g_ring.slot.size()], E);
+    } else {
+        cudaMemcpyAsync(s.v, values.data(), bytes, cudaMemcpyHostToDevice, E);
+    }
     return encodeFromScratch(s, pt, limbs, scale, deg, cmaxPinned);
 }
 
@@ -234,8 +279,8 @@ std::vector<cudaStream_t> encodeRowsOnDevice(const std::vector<Plaintext*>& pts,
     // the previous call's upload has to be done before the staging is overwritten
     cudaStreamSynchronize(E);
     if (s.pinnedBytes < bytes) {
-        if (s.pinned) cudaFreeHost(s.pinned);
-        cudaMallocHost(&s.pinned, bytes);
+        if (s.pinned) FIDESlib::pinnedHostFree(s.pinned);
+        s.pinned = FIDESlib::pinnedHostAlloc(bytes);
         s.pinnedBytes = bytes;
     }
     if (s.rawBytes < bytes) {

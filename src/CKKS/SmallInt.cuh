@@ -63,7 +63,8 @@ void relevelSync();
 /// A fresh plaintext `shift` composite levels above pt, encoding factor * (its values) (exact small-integer lift of
 /// its first 4 limbs combined with the real rescale sf(old) / (factor sf(new)): one rounding of <= 0.5 at scale). Bootstrap plaintexts are
 /// constant-allocated and cannot be grown in place, hence the copy.
-Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor = 1.0);
+Plaintext relevelPlaintext(Context& cc_, ContextData& cc, const Plaintext& pt, int shift, double factor = 1.0,
+                           bool sync = true);
 /// Value-preserving re-level to limb `newL` at scale `newNF`, on or off the composite grid: the integers are divided
 /// by pt.NoiseFactor / newNF with exact rounding.
 Plaintext relevelPlaintextNF(Context& cc_, ContextData& cc, const Plaintext& pt, int newL, double newNF);

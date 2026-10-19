@@ -1,3 +1,5 @@
+#include <set>
+#include <cstdio>
 //
 // Created by carlosad on 4/12/24.
 //
@@ -246,12 +248,33 @@ void FIDESlib::CKKS::BootstrapCPUraise(
 
 namespace FIDESlib::CKKS {
 
+// FIDESLIB_BTS_RAISE_NOSTC: a raise variant built without StC tables serves the staged StC-first finishes only; any
+// path about to read its StC fails here instead of running a bootstrap without its SlotsToCoeffs
+static void requireStC(const BootstrapPrecomputation& pre, const char* where) {
+    if (pre.StC.empty())
+        throw std::runtime_error(std::string(where) + ": the bootstrap precomputation in scope (raise drop " +
+                                 std::to_string(pre.raise_drop) +
+                                 ") has no StC tables (FIDESLIB_BTS_RAISE_NOSTC: StC-first finishes only)");
+}
+
 // StC-first last-stage cache entries (FIDESLIB_STC_LAST_CACHE, default 24): ~0.2 GB sparse, 1-2 GB dense each.
 // FIDESLIB_STC_CACHE_ASYNC=1: cache misses re-level and evict under GPU-side barriers instead of device syncs
 static bool stcCacheAsync() {
     static const bool v = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_ASYNC"); return e && std::atoi(e) > 0; }();
     return v;
 }
+// FIDESLIB_STC_CACHE_STATS=1: hit / miss / evict counts of the StC-first and stc_high relevel caches, at exit
+struct StcCacheStats {
+    long first_hit = 0, first_miss = 0, first_evict = 0, high_hit = 0, high_miss = 0, high_evict = 0;
+    std::set<std::string> first_keys, high_keys;
+    bool on = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_STATS"); return e && *e && *e != '0'; }();
+    ~StcCacheStats() {
+        if (on)
+            std::fprintf(stderr, "[stc_cache] first: hit %ld miss %ld evict %ld keys %zu | high: hit %ld miss %ld evict %ld keys %zu\n",
+                         first_hit, first_miss, first_evict, first_keys.size(), high_hit, high_miss, high_evict, high_keys.size());
+    }
+};
+static StcCacheStats g_stcStats;
 
 static size_t lastStageCacheCap() {
     static const size_t cap = [] {
@@ -266,13 +289,18 @@ static size_t lastStageCacheCap() {
     size_t fr = 0, tot = 0;
     if (cudaMemGetInfo(&fr, &tot) != cudaSuccess)
         return cap;
-    // FIDESLIB_STC_CACHE_POOLFREE=1: idle pool blocks and the CUDA pool's unused reserve count as free
-    static const bool poolFree = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_POOLFREE"); return e && std::atoi(e) > 0; }();
-    if (poolFree && fr < floor_gb * (1ull << 30)) {
+    // FIDESLIB_STC_FREE_COUNTS_POOL=1: idle memory held by the allocators (FIDESlib's slabs and the stream-ordered pool,
+    // which the cache's plaintexts draw from) counts as free, so the per-block pool trim is not needed to keep entries
+    static const bool countPool = [] {   // FIDESLIB_STC_CACHE_POOLFREE: dev's name
+        const char* e = std::getenv("FIDESLIB_STC_FREE_COUNTS_POOL");
+        if (!(e && *e)) e = std::getenv("FIDESLIB_STC_CACHE_POOLFREE");
+        return e && std::atoi(e) > 0;
+    }();
+    if (countPool && fr < floor_gb * (1ull << 30)) {
         int dev = 0;
         cudaGetDevice(&dev);
-        const FIDESlib::GPUpoolStats ps = FIDESlib::GPUpoolStatsOf(dev);
-        fr += ps.idle + (ps.cuda_reserved > ps.cuda_used ? ps.cuda_reserved - ps.cuda_used : 0);
+        const FIDESlib::GPUpoolStats st = FIDESlib::GPUpoolStatsOf(dev);
+        fr += st.idle + (st.cuda_reserved > st.cuda_used ? st.cuda_reserved - st.cuda_used : 0);
     }
     if (fr < floor_gb * (1ull << 30))
         return 1;
@@ -280,11 +308,398 @@ static size_t lastStageCacheCap() {
 }
 
 
+// FIDESLIB_STC_CACHE_RELEASE=1: the StC-first / stc_high cache entries drop their NTT scratch once built (read-only from
+// then on, as bootstrapImpl's entries already do): about half of each entry's device memory
+// FIDESLIB_RELEVEL_NOSYNC=1: a cache miss relevels its stage without a device fence per plaintext (one after the batch)
+// FIDESLIB_RELEVEL_NOSYNC=1: each cache-miss relevel skips its own fence (the miss path fences once after the batch)
+static bool relevelEachSync() {
+    static const bool nosync = [] { const char* e = std::getenv("FIDESLIB_RELEVEL_NOSYNC"); return e && std::atoi(e) > 0; }();
+    return !nosync;
+}
+static bool stcHighPow2() {
+    static const bool on = [] { const char* e = std::getenv("FIDESLIB_STC_HIGH_POW2"); return e && std::atoi(e) > 0; }();
+    return on;
+}
+static bool stcPow2Key() {
+    static const bool on = [] { const char* e = std::getenv("FIDESLIB_STC_POW2_KEY"); return e && std::atoi(e) > 0; }();
+    return on;
+}
+static bool stcCacheRelease() {
+    static const bool on = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_RELEASE"); return e && std::atoi(e) > 0; }();
+    return on;
+}
+// FIDESLIB_STC_CACHE_STATS=2: one line per miss (cache, key, entries, free device memory)
+static void stcMissLog(const char* which, const std::string& key, size_t entries) {
+    static const bool on = [] { const char* e = std::getenv("FIDESLIB_STC_CACHE_STATS"); return e && std::atoi(e) >= 2; }();
+    if (!on) return;
+    size_t fr = 0, tot = 0;
+    cudaMemGetInfo(&fr, &tot);
+    std::fprintf(stderr, "[stc_miss] %s key %s entries %zu free %.2f GB\n", which, key.c_str(), entries, fr / 1073741824.0);
+}
+
+namespace {
+// A LIVE ciphertext polynomial's data put in the buffers the host calls `v` (readers of Limb::v.data, e.g. the PCMM
+// ring switch, need it there; after an odd number of out-of-place passes it may sit in `aux`, which only the device
+// tables follow): copy where limbptr points at aux, then limbptr = v and auxptr = aux. The scratch stays allocated.
+// RNSPoly::releaseAux is for read-only plaintexts: on a ciphertext it left auxptr pointing at freed memory, which the
+// next out-of-place pass wrote into and swapped in, so the ciphertext shared memory with later allocations (StC-first
+// cache entries among them): wrong results on every path after the first alternative-StC call.
+struct LiveFix {
+    void* v[MAXP];
+    void* aux[MAXP];
+    uint32_t words[MAXP];
+    int n;
+};
+__global__ void liveCopy_(void* const* lp, LiveFix f) {
+    const int i = blockIdx.y;
+    if (i >= f.n || f.aux[i] == nullptr || lp[i] != f.aux[i])
+        return;
+    uint32_t* dst = static_cast<uint32_t*>(f.v[i]);
+    const uint32_t* src = static_cast<const uint32_t*>(f.aux[i]);
+    for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < f.words[i]; k += (size_t)gridDim.x * blockDim.x)
+        dst[k] = src[k];
+}
+__global__ void liveTables_(void** lp, void** ap, LiveFix f) {
+    const int i = threadIdx.x;
+    if (i >= f.n || f.aux[i] == nullptr || (lp[i] != f.v[i] && lp[i] != f.aux[i]))
+        return;
+    lp[i] = f.v[i];
+    if (ap)
+        ap[i] = f.aux[i];
+}
+void liveInV(RNSPoly& p) {
+    for (auto& part : p.GPU) {
+        cudaSetDevice(part.device);
+        auto each = [&](auto&& fn) {
+            for (auto& l : part.limb)
+                std::visit(fn, l);
+            for (auto& l : part.SPECIALlimb)
+                std::visit(fn, l);
+        };
+        each([&](auto& x) { part.s.wait(x.stream); });
+        auto fix = [&](std::vector<LimbImpl>& limbs, VectorGPU<void*>& lp, VectorGPU<void*>& ap) {
+            const int n = (int)limbs.size();
+            if (n == 0 || n > MAXP || lp.data == nullptr || lp.size < n)
+                return;
+            LiveFix f{};
+            f.n = n;
+            for (int i = 0; i < n; ++i)
+                std::visit(
+                    [&](auto& x) {
+                        f.v[i] = (void*)x.v.data;
+                        f.aux[i] = x.auxReleased ? nullptr : (void*)x.aux.data;
+                        f.words[i] = (uint32_t)((size_t)x.v.size * sizeof(*x.v.data) / sizeof(uint32_t));
+                    },
+                    limbs[i]);
+            liveCopy_<<<dim3(32, n), 256, 0, part.s.ptr()>>>(lp.data, f);
+            liveTables_<<<1, MAXP, 0, part.s.ptr()>>>(lp.data, (ap.data != nullptr && ap.size >= n) ? ap.data : nullptr, f);
+        };
+        fix(part.limb, part.limbptr, part.auxptr);
+        fix(part.SPECIALlimb, part.SPECIALlimbptr, part.SPECIALauxptr);
+        each([&](auto& x) { x.stream.wait(part.s); });
+    }
+}
+// FIDESLIB_STC_ALT_SYNC=bits (diagnostic, default 0): fences in the alternative branch. Host fences (device
+// synchronize): 1 after its first stages, 2 after its last stage, 4 at its end. GPU-only barriers (an empty kernel on
+// the legacy stream, which every blocking FIDESlib stream orders against both ways; the host does not wait): 8 after
+// its first stages, 16 after its last stage. Bisects the missing dependency between back-to-back StC-first inputs.
+int stcAltSync() {
+    static const int v = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_SYNC"); return e && *e ? std::atoi(e) : 0; }();
+    return v;
+}
+__global__ void legacyBarrier_() {}
+// FIDESLIB_STC_ALT_SYNC bits 32 / 64 / 128 (diagnostic): targeted event edges between this ciphertext and the shared
+// key-switch machinery, no host wait and no legacy-stream barrier. 32 (tail): the shared digit streams wait on this
+// call; 64 (tail): the key-switch scratch polynomials' streams wait on this call; 128 (entry): this call waits on both.
+void sharedStreams(ContextData& cc, int g, const std::function<void(Stream&)>& fn, bool digits, bool aux,
+                   bool auxS = true, bool auxLimbs = true) {
+    if (digits)
+        for (auto* dsv : {&cc.digitStreamL(), &cc.digitStream2L()})
+            for (auto& per : *dsv)
+                if (g < (int)per.size())
+                    fn(per[g]);
+    if (aux)
+        for (RNSPoly* a : {&cc.getKeySwitchAux(), &cc.getKeySwitchAux2()}) {
+            if (g >= (int)a->GPU.size())
+                continue;
+            auto& P = a->GPU[g];
+            if (auxS)
+                fn(P.s);
+            if (!auxLimbs)
+                continue;
+            for (auto& l : P.limb)
+                std::visit([&](auto& x) { fn(x.stream); }, l);
+            for (auto& l : P.SPECIALlimb)
+                std::visit([&](auto& x) { fn(x.stream); }, l);
+        }
+}
+void joinCt(Ciphertext& ct) {   // every limb stream of the ciphertext joins its partition streams
+    for (RNSPoly* p : {&ct.c0, &ct.c1})
+        for (auto& part : p->GPU) {
+            for (auto& l : part.limb)
+                std::visit([&](auto& x) { part.s.wait(x.stream); }, l);
+            for (auto& l : part.SPECIALlimb)
+                std::visit([&](auto& x) { part.s.wait(x.stream); }, l);
+        }
+}
+void forkCt(Ciphertext& ct) {
+    for (RNSPoly* p : {&ct.c0, &ct.c1})
+        for (auto& part : p->GPU) {
+            for (auto& l : part.limb)
+                std::visit([&](auto& x) { x.stream.wait(part.s); }, l);
+            for (auto& l : part.SPECIALlimb)
+                std::visit([&](auto& x) { x.stream.wait(part.s); }, l);
+        }
+}
+void stcAltEdgeTail(Ciphertext& ct) {
+    const int b = stcAltSync();
+    if (!(b & (32 | 64)))
+        return;
+    joinCt(ct);
+    for (int g = 0; g < (int)ct.c0.GPU.size(); ++g) {
+        cudaSetDevice(ct.c0.GPU[g].device);
+        Stream& s0 = ct.c0.GPU[g].s;
+        Stream& s1 = ct.c1.GPU[g].s;
+        sharedStreams(ct.cc, g, [&](Stream& x) { x.wait(s0); x.wait(s1); }, b & 32, b & 64);
+    }
+}
+// bits 256 / 512 / 1024 (entry, subsets of 128): wait on the digit streams only / the scratch polys' partition streams
+// only / the scratch polys' limb and special-limb streams only
+void stcAltEdgeEntry(Ciphertext& ct) {
+    const int b = stcAltSync();
+    if (!(b & (128 | 256 | 512 | 1024)))
+        return;
+    const bool all = b & 128;
+    for (int g = 0; g < (int)ct.c0.GPU.size(); ++g) {
+        cudaSetDevice(ct.c0.GPU[g].device);
+        Stream& s0 = ct.c0.GPU[g].s;
+        Stream& s1 = ct.c1.GPU[g].s;
+        sharedStreams(ct.cc, g, [&](Stream& x) { s0.wait(x); s1.wait(x); }, all || (b & 256), all || (b & (512 | 1024)),
+                      all || (b & 512), all || (b & 1024));
+    }
+    forkCt(ct);
+}
+void stcAltFence(int hostBit, int gpuBit) {
+    if (stcAltSync() & hostBit)
+        cudaDeviceSynchronize();
+    if (stcAltSync() & gpuBit)
+        legacyBarrier_<<<1, 1, 0, cudaStreamLegacy>>>();
+}
+// FIDESLIB_STC_ALT_PROBE=n (diagnostic): for the first n StC-first inputs, after a device fence, which buffer each
+// limb's device tables name: limbptr / auxptr vs the host v / aux ('v', 'a', '?'), per polynomial and step
+void probeLive(const char* step, Ciphertext& ct, bool alt) {
+    static int left = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_PROBE"); return e && *e ? std::atoi(e) : 0; }();
+    if (left <= 0)
+        return;
+    cudaDeviceSynchronize();
+    std::string out = std::string("[stc_probe] ") + (alt ? "alt " : "ship ") + step + " lvl " + std::to_string(ct.getLevel());
+    for (RNSPoly* p : {&ct.c0, &ct.c1}) {
+        auto& part = p->GPU.at(0);
+        const int n = (int)part.limb.size();
+        std::vector<void*> lp(n, nullptr), ap(n, nullptr);
+        if (part.limbptr.data && part.limbptr.size >= n)
+            cudaMemcpy(lp.data(), part.limbptr.data, n * sizeof(void*), cudaMemcpyDeviceToHost);
+        if (part.auxptr.data && part.auxptr.size >= n)
+            cudaMemcpy(ap.data(), part.auxptr.data, n * sizeof(void*), cudaMemcpyDeviceToHost);
+        out += " |";
+        for (int i = 0; i < n; ++i)
+            std::visit(
+                [&](auto& x) {
+                    auto code = [&](void* t) { return t == (void*)x.v.data ? 'v' : t == (void*)x.aux.data ? 'a' : '?'; };
+                    out += ' ';
+                    out += code(lp[i]);
+                    out += code(ap[i]);
+                },
+                part.limb[i]);
+    }
+    std::cerr << out << "\n";
+    if (std::string(step) == "end")
+        --left;
+}
+}  // namespace
+
 static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescaled, const bool allowStcFirst);
 
 std::function<void(Ciphertext&, int, bool)> g_bootstrapOverride;
 
+// FIDESLIB_BTS_GRAPH=1: every bootstrap shape (input level/degree/scale, slots, key, the per-call context state) is
+// run eagerly once (it warms the plaintext caches and the scratch buffers), captured as a CUDA graph of the staged
+// bootstrap the second time, and replayed from then on: input copied into the graph's own ciphertext, a legacy-stream
+// barrier on each side (shared scratch buffers are ordered across the boundary), output copied back. The s = 1
+// route stays with the runtime's override (SPRU). FIDESLIB_BTS_GRAPH_LOG=1 reports captures and fallbacks.
+namespace {
+bool btsGraphOn() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_BTS_GRAPH"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+bool btsGraphLog() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_BTS_GRAPH_LOG"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+uint64_t bitsOf(double d) {
+    uint64_t u;
+    std::memcpy(&u, &d, sizeof u);
+    return u;
+}
+struct BtsGraphKey {
+    int slots, prescaled, ctSlots, l0, l1, deg, modUp, raiseDrop, real, cfOverride, rescaleOne;
+    uint64_t nf, preScale;
+    std::string keyID;
+    auto tie() const {
+        return std::tie(slots, prescaled, ctSlots, l0, l1, deg, modUp, raiseDrop, real, cfOverride, rescaleOne, nf,
+                        preScale, keyID);
+    }
+    bool operator<(const BtsGraphKey& o) const { return tie() < o.tie(); }
+};
+struct BtsGraph {
+    int seen = 0;
+    bool failed = false;
+    cudaGraphExec_t exec = nullptr;
+    FIDESlib::CaptureRegion* region = nullptr;   // the pinned snapshots its H2D nodes read
+    // the output's metadata (the shared output ciphertext's level is re-seated before every copy-out)
+    int outLevel = 0, outDeg = 1, outSlots = 0;
+    double outNF = 0;
+    KeyHash outKey;
+};
+// One input and one output ciphertext for all graphs, grown to the top level once: their limb addresses are what the
+// graphs read and write, and they never move (dropToLevel only lowers the level, grow only appends).
+struct BtsGraphIO {
+    std::unique_ptr<Ciphertext> in, out;
+    FIDESlib::Stream origin;
+    cudaEvent_t pre = nullptr, post = nullptr;
+};
+std::map<BtsGraphKey, BtsGraph>& btsGraphs() {
+    static auto* m = new std::map<BtsGraphKey, BtsGraph>;   // never destroyed: graph memory is never released
+    return *m;
+}
+BtsGraphIO& btsGraphIO(Context& cc_) {
+    static auto* io = [&] {
+        auto* p = new BtsGraphIO;
+        p->in = std::make_unique<Ciphertext>(cc_);
+        p->out = std::make_unique<Ciphertext>(cc_);
+        for (RNSPoly* q : {&p->in->c0, &p->in->c1, &p->out->c0, &p->out->c1})
+            q->grow(cc_->L);
+        p->origin.init();
+        cudaEventCreateWithFlags(&p->pre, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&p->post, cudaEventDisableTiming);
+        cudaDeviceSynchronize();
+        return p;
+    }();
+    return *io;
+}
+__global__ void btsGraphFence() {}
+
+bool btsGraphCaptureFn(BtsGraph& e, Ciphertext& ctxt, const std::function<void(Ciphertext&)>& body);
+bool btsGraphCapture(BtsGraph& e, Ciphertext& ctxt, const int slots, const bool prescaled) {
+    return btsGraphCaptureFn(e, ctxt, [&](Ciphertext& w) { BootstrapStaged(w, slots, prescaled); });
+}
+bool btsGraphCaptureFn(BtsGraph& e, Ciphertext& ctxt, const std::function<void(Ciphertext&)>& body) {
+    Context& cc_ = ctxt.cc_;
+    BtsGraphIO& io = btsGraphIO(cc_);
+    io.in->copy(ctxt);
+    cudaDeviceSynchronize();
+    e.region = FIDESlib::captureRegionNew();
+    cudaStream_t o = io.origin.ptr();
+    if (!FIDESlib::captureBegin(o, e.region)) {
+        FIDESlib::captureRegionFree(e.region);
+        e.region = nullptr;
+        return false;
+    }
+    try {
+        Ciphertext w(cc_);   // from the graph pool
+        w.copy(*io.in);
+        body(w);
+        io.out->copy(w);
+    } catch (const std::exception& ex) {
+        FIDESlib::captureInvalidate("exception during capture");
+        if (btsGraphLog()) std::cerr << "[bts_graph] exception during capture: " << ex.what() << "\n";
+    }
+    cudaGraph_t g = FIDESlib::captureEnd();
+    if (!g) {
+        if (btsGraphLog())
+            std::cerr << "[bts_graph] capture failed (in level " << ctxt.getLevel() << "): "
+                      << (FIDESlib::g_cap.why ? FIDESlib::g_cap.why : "?") << "\n";
+        FIDESlib::captureRegionFree(e.region);
+        e.region = nullptr;
+        return false;
+    }
+    size_t nodes = 0;
+    cudaGraphGetNodes(g, nullptr, &nodes);
+    const cudaError_t err = cudaGraphInstantiateWithFlags(&e.exec, g, 0);
+    cudaGraphDestroy(g);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        e.exec = nullptr;
+        if (btsGraphLog()) std::cerr << "[bts_graph] instantiate failed: " << cudaGetErrorString(err) << "\n";
+        FIDESlib::captureRegionFree(e.region);
+        e.region = nullptr;
+        return false;
+    }
+    Ciphertext& out = *io.out;
+    e.outLevel = out.getLevel();
+    e.outDeg = out.NoiseLevel;
+    e.outSlots = out.slots;
+    e.outNF = out.NoiseFactor;
+    e.outKey = out.keyID;
+    if (btsGraphLog())
+        std::cerr << "[bts_graph] captured in level " << ctxt.getLevel() << " deg "
+                  << ctxt.NoiseLevel << " -> out level " << e.outLevel << " deg " << e.outDeg << ", " << nodes
+                  << " nodes (" << btsGraphs().size() << " shapes)\n";
+    return true;
+}
+
+void btsGraphReplay(BtsGraph& e, Ciphertext& ctxt) {
+    BtsGraphIO& io = btsGraphIO(ctxt.cc_);
+    io.in->copy(ctxt);
+    cudaStream_t o = io.origin.ptr();
+    btsGraphFence<<<1, 1, 0, 0>>>();   // legacy stream: after every earlier op on the (blocking) streams
+    cudaEventRecord(io.pre, 0);
+    cudaStreamWaitEvent(o, io.pre, 0);
+    cudaGraphLaunch(e.exec, o);
+    cudaEventRecord(io.post, o);
+    cudaStreamWaitEvent(0, io.post, 0);
+    btsGraphFence<<<1, 1, 0, 0>>>();   // every later op on the blocking streams waits for the graph
+    Ciphertext& out = *io.out;
+    for (RNSPoly* p : {&out.c0, &out.c1}) {
+        p->dropToLevel(e.outLevel);
+        p->grow(e.outLevel);
+        for (auto& part : p->GPU)
+            cudaStreamWaitEvent(part.s.ptr(), io.post, 0);
+    }
+    out.NoiseLevel = e.outDeg;
+    out.slots = e.outSlots;
+    out.NoiseFactor = e.outNF;
+    out.keyID = e.outKey;
+    ctxt.copy(out);
+}
+
+bool btsGraphRun(Ciphertext& ctxt, const int slots, const bool prescaled) {
+    ContextData& cc = ctxt.cc;
+    if (slots == 1 || cc.GPUid.size() != 1)
+        return false;
+    const BtsGraphKey k{slots, prescaled, ctxt.slots, ctxt.c0.getLevel(), ctxt.c1.getLevel(), ctxt.NoiseLevel,
+                        (int)ctxt.c0.isModUp() + 2 * (int)ctxt.c1.isModUp(), cc.btsRaiseDropEffective(),
+                        (int)cc.getBtsRealPayload(), cc.getCorrectionFactorOverride(), (int)g_rescaleOnePrime,
+                        bitsOf(ctxt.NoiseFactor), bitsOf(cc.getBtsPreScale()), ctxt.keyID};
+    BtsGraph& e = btsGraphs()[k];
+    if (e.failed)
+        return false;
+    if (!e.exec) {
+        if (e.seen++ < 1)
+            return false;
+        if (!btsGraphCapture(e, ctxt, slots, prescaled)) {
+            e.failed = true;
+            return false;
+        }
+    }
+    btsGraphReplay(e, ctxt);
+    return true;
+}
+}  // namespace
+
 void Bootstrap(Ciphertext& ctxt, const int slots, const bool prescaled) {
+    if (btsGraphOn() && !FIDESlib::g_cap.active && btsGraphRun(ctxt, slots, prescaled))
+        return;
     static thread_local bool inOverride = false;
     if (g_bootstrapOverride && !inOverride) {
         inOverride = true;
@@ -480,6 +895,7 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
                         while (pre.stc_first_last.size() >= kLastStageCache)
                             pre.stc_first_last.erase(pre.stc_first_last.begin());
                     }
+                    requireStC(pre, "stc_first");
                     auto& st = pre.StC.back();
                     BootstrapPrecomputation::LTstep o;
                     o.slots = st.slots; o.bStep = st.bStep; o.gStep = st.gStep; o.rotIn = st.rotIn; o.rotOut = st.rotOut;
@@ -698,6 +1114,8 @@ static void bootstrapImpl(Ciphertext& ctxt, const int slots, const bool prescale
 
     // A ciphertext above the StC plaintexts' level (FIDESLIB_BTS_SHIFT with FIDESLIB_BTS_SHIFT_STC=0) is dropped to
     // it first: an exact LevelReduce, instead of the plaintext-above-ciphertext adjust path.
+    if (!isLT && !sparseB)
+        requireStC(cc.GetBootPrecomputation(slots), "bootstrap");
     if (!isLT && !sparseB && !cc.GetBootPrecomputation(slots).StC.empty()) {
         const int stcL = cc.GetBootPrecomputation(slots).StC.at(0).A.at(0).c0.getLevel();
         if (ctxt.getLevel() > stcL) {
@@ -1340,6 +1758,8 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
             throw std::runtime_error("real-payload bootstrap without its StC variant (FIDESLIB_BTS_REAL)");
         st.correction += 1;
     }
+    if (!st.stcFirst && !st.isLT && !st.sparseB)
+        requireStC(pre, "bootstrap");
     st.nCtS = (st.isLT || st.sparseB) ? 1 : (int)pre.CtS.size();
     st.nStC = (st.isLT || st.sparseB) ? 1 : (int)pre.StC.size();
     // FIDESLIB_EVALROUND=1: dense full-StC bootstraps only (the sparse routes fold between the raise and CtS)
@@ -1356,9 +1776,14 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
     ContextData& cc = ctxt.cc;
     const int slots = st.slots;
     auto& pre = cc.GetBootPrecomputation(slots);
+    const int inLevel0 = ctxt.getLevel(), inNL0 = ctxt.NoiseLevel;
     if (ctxt.NoiseLevel == 2)
         ctxt.rescale();
-    const int entry = pre.stc_first_entry;
+    // FIDESLIB_STC_ALT_BUDGET: the alternative (cheaper, deeper-entered) StC when the input has its entry level
+    const bool alt = st.stcFolded && !st.isLT && pre.stc_alt_entry >= 0 && ctxt.getLevel() >= pre.stc_alt_entry;
+    const int entry = alt ? pre.stc_alt_entry : pre.stc_first_entry;
+    auto& firstStages = alt ? pre.StC_alt_first : pre.StC_first;
+    auto& lastCache = alt ? pre.stc_alt_last : pre.stc_first_last;
     if (ctxt.getLevel() < entry)
         throw std::runtime_error("[stc_first] bootstrap input at limb index " + std::to_string(ctxt.getLevel()) +
                                  " is below the StC-first entry level " + std::to_string(entry));
@@ -1387,11 +1812,12 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
         multIntScalar(ctxt, uint64_t{1} << (cfStage - cf));
     const double factor = std::ldexp(1.0, -cfStage) * (targetSF / cc.sfAtLimb(d - 1)) * ratio;
     const std::pair<int, long long> key{cfStage, std::llround(std::log2(nfIn) * 1e6)};
-    const size_t kLastStageCache = lastStageCacheCap();
+    // the cache cap (a cudaMemGetInfo under memory pressure) is read on a miss only
     if (st.isLT) {
         auto it = pre.lt_first_last.find(key);
         if (it == pre.lt_first_last.end()) {
             RelevelAsyncScope async(stcCacheAsync());
+            const size_t kLastStageCache = lastStageCacheCap();
             if (pre.lt_first_last.size() >= kLastStageCache) {
                 relevelSync();
                 while (pre.lt_first_last.size() >= kLastStageCache)
@@ -1405,27 +1831,127 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
         }
         EvalLinearTransformPts(ctxt, slots, pre.LT.bStep, it->second);
     } else {
-        if (!pre.StC_first.empty())
-            EvalLTStages(ctxt, pre.StC_first, "StC1-stage-");
-        auto it = pre.stc_first_last.find(key);
-        if (it == pre.stc_first_last.end()) {
-            RelevelAsyncScope async(stcCacheAsync());
-            if (pre.stc_first_last.size() >= kLastStageCache) {
-                relevelSync();
-                while (pre.stc_first_last.size() >= kLastStageCache)
-                    pre.stc_first_last.erase(pre.stc_first_last.begin());
+        const double nfBefore = ctxt.NoiseFactor;
+        // FIDESLIB_STC_ALT_NORM (diagnostic, default 1): the alternative stages read a normalized input (a rescale
+        // just before them may leave the live data in the aux buffers)
+        static const bool altNorm = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_NORM"); return !(e && *e == '0'); }();
+        if (alt && altNorm) {
+            liveInV(ctxt.c0);
+            liveInV(ctxt.c1);
+        }
+        if (alt)
+            stcAltEdgeEntry(ctxt);
+        probeLive("in", ctxt, alt);
+        if (!firstStages.empty())
+            EvalLTStages(ctxt, firstStages, "StC1-stage-");
+        probeLive("first", ctxt, alt);
+        if (alt)
+            stcAltFence(1, 8);
+        if (static int dbg = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_DEBUG"); return e && *e ? std::atoi(e) : 0; }(); dbg > 0) {
+            --dbg;
+            std::cerr << "[stc_alt_dbg] alt=" << alt << " entry=" << entry << " nfIn=" << nfIn << " nfBefore=" << nfBefore
+                      << " nfAfterFirst=" << ctxt.NoiseFactor << " level=" << ctxt.getLevel() << " NL=" << ctxt.NoiseLevel
+                      << " sf(entry)=" << cc.sfAtLimb(entry) << " sf(level)=" << cc.sfAtLimb(ctxt.getLevel())
+                      << " ratio=" << ratio << " actual=" << cc.sfAtLimb(ctxt.getLevel()) / ctxt.NoiseFactor << "\n";
+        }
+        // FIDESLIB_STC_POW2_KEY=1: input scales that differ by a power of two share one entry, built for the largest
+        // exponent seen (per CF and fractional part of log2 nfIn); a smaller one is first multiplied by the exact integer
+        // 2^(E - Ein), which the entry's factor undoes (the same mechanism as the 2^(cfStage - cf) above). A larger
+        // exponent rebuilds the entry. Its plaintext precision is that of the block with the largest scale today.
+        std::pair<int, long long> lkey = key;
+        double lfactor = factor;
+        int shiftK = 0;
+        if (stcPow2Key()) {
+            const double l2 = std::log2(nfIn);
+            const long long ein = (long long)std::floor(l2 + 1e-9);
+            const long long fk = std::llround((l2 - (double)ein) * 1e6);
+            // FIDESLIB_STC_POW2_MAXK=k: exponents bucketed by ein / (k + 1), one entry per bucket, so an entry serves gaps
+            // of at most k (each bit of gap is a bit of last-stage plaintext precision); default 63 (one bucket in practice)
+            static const long long maxK = [] { const char* e = std::getenv("FIDESLIB_STC_POW2_MAXK"); return (long long)((e && *e) ? std::max(0, std::atoi(e)) : 63); }();
+            const long long bucket = ein >= 0 ? ein / (maxK + 1) : -((-ein + maxK) / (maxK + 1));
+            const long long sub = fk + (bucket + 1024) * (1LL << 24);
+            lkey = {cfStage, sub + (1LL << 40)};
+            static std::map<std::tuple<const void*, int, long long>, long long> eOf;
+            auto eit = eOf.find({&lastCache, cfStage, sub});
+            auto cur = lastCache.find(lkey);
+            // FIDESLIB_STC_POW2_KEEP=1: an entry flushed under memory pressure is rebuilt at the largest exponent seen
+            // so far, not the current one, so the next (larger) input scales hit instead of rebuilding once each
+            static const bool keep = [] { const char* e = std::getenv("FIDESLIB_STC_POW2_KEEP"); return e && *e && *e != '0'; }();
+            if ((cur != lastCache.end() || keep) && eit != eOf.end() && eit->second >= ein) {
+                shiftK = (int)(eit->second - ein);
+            } else {
+                if (cur != lastCache.end()) {
+                    cudaDeviceSynchronize();  // its plaintexts may still be read by the previous call's kernels
+                    lastCache.erase(cur);
+                }
+                eOf[{&lastCache, cfStage, sub}] = ein;
             }
-            auto& s0 = pre.StC.back();
+            lfactor = std::ldexp(factor, -shiftK);
+        }
+        auto it = lastCache.find(lkey);
+        if (g_stcStats.on) {
+            g_stcStats.first_keys.insert(std::to_string(lkey.first) + ":" + std::to_string(lkey.second) + ":" +
+                                         std::to_string(pre.raise_drop));
+            if (it != lastCache.end()) ++g_stcStats.first_hit; else ++g_stcStats.first_miss;
+        }
+        if (it == lastCache.end()) {
+            RelevelAsyncScope async(stcCacheAsync());
+            const size_t kLastStageCache = lastStageCacheCap();
+            if (lastCache.size() >= kLastStageCache) {
+                relevelSync();
+                while (lastCache.size() >= kLastStageCache) {
+                    lastCache.erase(lastCache.begin());
+                    ++g_stcStats.first_evict;
+                }
+            }
+            stcMissLog("first", std::to_string(lkey.first) + ":" + std::to_string(key.second) + ":" +
+                                    std::to_string(pre.raise_drop) + " factor 2^" + std::to_string(std::log2(lfactor)),
+                       lastCache.size());
+            if (!alt)
+                requireStC(pre, "stc_first_input");
+            auto& s0 = alt ? pre.stc_alt_lastSrc[0] : pre.StC.back();
             BootstrapPrecomputation::LTstep o;
             o.slots = s0.slots; o.bStep = s0.bStep; o.gStep = s0.gStep; o.rotIn = s0.rotIn; o.rotOut = s0.rotOut;
             for (auto& pt : s0.A)
-                o.A.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, factor));
+                o.A.push_back(relevelPlaintext(cc_, cc, pt, (lastL - pt.c0.getLevel()) / d, lfactor, relevelEachSync()));
             std::vector<BootstrapPrecomputation::LTstep> v;
             v.push_back(std::move(o));
             relevelSync();
-            it = pre.stc_first_last.emplace(key, std::move(v)).first;
+            if (stcCacheRelease())
+                for (auto& stp : v)
+                    for (auto& pt : stp.A)
+                        pt.c0.releaseAux();   // read-only from here on
+            it = lastCache.emplace(lkey, std::move(v)).first;
         }
+        if (static int dbg2 = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_DEBUG"); return e && *e ? std::atoi(e) : 0; }(); dbg2 > 0) {
+            --dbg2;
+            std::cerr << "[stc_alt_dbg2] alt=" << alt << " cf=" << cf << " cfStage=" << cfStage << " nfIn=" << nfIn
+                      << " ein-key=" << lkey.second << " shiftK=" << shiftK << " factor=" << factor << " lfactor=" << lfactor
+                      << " entries=" << lastCache.size() << " lvl=" << ctxt.getLevel() << " in=" << inLevel0 << "/" << inNL0 << "\n";
+        }
+        if (shiftK)
+            multIntScalar(ctxt, uint64_t{1} << shiftK);
         EvalLTStages(ctxt, it->second, "StC1-last-");
+        probeLive("last", ctxt, alt);
+        if (alt) {
+            stcAltFence(2, 16);
+            stcAltEdgeTail(ctxt);
+        }
+        // the alternative stages leave the shipped path's coefficients under a scale record larger by
+        // sf(shipped entry) / sf(alternative entry) (the last stage's factor is keyed to the entry): restore it
+        if (alt) {
+            ctxt.NoiseFactor *= cc.sfAtLimb(pre.stc_alt_entry) / cc.sfAtLimb(pre.stc_first_entry);
+            // one more stage than the shipped path flips the aux-swap parity: readers of a limb's own buffer (the
+            // PCMM ring switch) must find the live data there
+            liveInV(ctxt.c0);
+            liveInV(ctxt.c1);
+        }
+    }
+    if (st.stcFolded && !st.isLT) {
+        probeLive("end", ctxt, alt);
+        if (st.stcFolded && pre.stc_alt_entry >= 0 && (stcAltSync() & 4) && ctxt.NoiseFactor > 0 &&
+            entry == pre.stc_alt_entry)
+            cudaDeviceSynchronize();
     }
     if (ctxt.getLevel() != lastL || ctxt.NoiseLevel != 2)
         throw std::runtime_error("[stc_first] folded last stage left the ciphertext at limb index " +
@@ -1459,13 +1985,46 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
         factor *= nfRef / ctxt.NoiseFactor;
     ctxt.slots = slots;
     static std::map<std::tuple<int, int, int, long long>, std::vector<BootstrapPrecomputation::LTstep>> cache;
-    const auto key = std::make_tuple(slots, outLimb, skipMask, std::llround(std::log2(factor) * 1e6));
+    // FIDESLIB_STC_HIGH_POW2=1: factors that differ by a power of two share one entry, built for the smallest exponent
+    // seen (per slots / outLimb / skipMask and fractional part of log2 factor); a larger one first multiplies the
+    // ciphertext by the exact integer 2^(e - e_entry) (the last stage's factor is linear in it). A smaller exponent
+    // rebuilds the entry. Plaintext precision: that of the smallest factor in use today.
+    long long k3 = std::llround(std::log2(factor) * 1e6);
+    double lfactor = factor;
+    int shiftK = 0;
+    if (stcHighPow2()) {
+        const double l2 = std::log2(factor);
+        const long long ef = (long long)std::floor(l2 + 1e-9);
+        const long long fk = std::llround((l2 - (double)ef) * 1e6);
+        k3 = fk + (1LL << 40);
+        static std::map<std::tuple<int, int, int, long long>, long long> eMin;
+        const auto ek = std::make_tuple(slots, outLimb, skipMask, fk);
+        auto eit = eMin.find(ek);
+        auto cur = cache.find(std::make_tuple(slots, outLimb, skipMask, k3));
+        if (cur != cache.end() && eit != eMin.end() && eit->second <= ef && ef - eit->second <= 16) {
+            shiftK = (int)(ef - eit->second);
+        } else {
+            if (cur != cache.end()) {
+                cudaDeviceSynchronize();  // its plaintexts may still be read by the previous call's kernels
+                cache.erase(cur);
+            }
+            eMin[ek] = ef;
+        }
+        lfactor = std::ldexp(factor, -shiftK);
+    }
+    const auto key = std::make_tuple(slots, outLimb, skipMask, k3);
     auto it = cache.find(key);
+    if (g_stcStats.on) {
+        g_stcStats.high_keys.insert(std::to_string(outLimb) + ":" + std::to_string(skipMask) + ":" +
+                                    std::to_string(std::get<3>(key)));
+        if (it != cache.end()) ++g_stcStats.high_hit; else ++g_stcStats.high_miss;
+    }
     if (it == cache.end()) {
         RelevelAsyncScope async(stcCacheAsync());
         if (cache.size() >= lastStageCacheCap()) {
             relevelSync();
             cache.erase(cache.begin());
+            ++g_stcStats.high_evict;
         }
         std::vector<BootstrapPrecomputation::LTstep> v;
         for (int ki = 0; ki < nS; ++ki) {
@@ -1473,25 +2032,31 @@ void btsStcHigh(Ciphertext& ctxt, int slots, int outLimb, double factor, int ski
             BootstrapPrecomputation::LTstep o;
             o.slots = s0.slots; o.bStep = s0.bStep; o.gStep = s0.gStep; o.rotIn = s0.rotIn; o.rotOut = s0.rotOut;
             const int lv = entry - ki * d;
-            const double fac = ki == nS - 1 ? factor : 1.0;
+            const double fac = ki == nS - 1 ? lfactor : 1.0;
             for (auto& pt : s0.A)
-                o.A.push_back(relevelPlaintext(cc_, cc, pt, (lv - pt.c0.getLevel()) / d, fac));
+                o.A.push_back(relevelPlaintext(cc_, cc, pt, (lv - pt.c0.getLevel()) / d, fac, relevelEachSync()));
             v.push_back(std::move(o));
         }
         relevelSync();
+        if (stcCacheRelease())
+            for (auto& stp : v)
+                for (auto& pt : stp.A)
+                    pt.c0.releaseAux();   // read-only from here on
+        stcMissLog("high", std::to_string(outLimb) + ":" + std::to_string(skipMask) + " factor 2^" +
+                               std::to_string(std::log2(lfactor)), cache.size());
         it = cache.emplace(key, std::move(v)).first;
     }
+    if (shiftK)
+        multIntScalar(ctxt, uint64_t{1} << shiftK);
     EvalLTStages(ctxt, it->second, "StCH-stage-");
     if (ctxt.NoiseLevel == 2)
         ctxt.rescale();
     if (ctxt.getLevel() != outLimb)
         throw std::runtime_error("[stc_high] output at limb index " + std::to_string(ctxt.getLevel()) + ", expected " +
                                  std::to_string(outLimb));
-    // FIDESLIB_STC_HIGH_ASYNC=1: a GPU-side barrier instead
-    static const bool async = [] { const char* e = std::getenv("FIDESLIB_STC_HIGH_ASYNC"); return e && std::atoi(e) > 0; }();
-    if (async)
-        gpuBarrier();
-    else
+    // FIDESLIB_STC_HIGH_SYNC=1: the old trailing device fence; the output is stream-ordered for every consumer
+    static const bool fence = [] { const char* e = std::getenv("FIDESLIB_STC_HIGH_SYNC"); return e && *e && *e != '0'; }();
+    if (fence)
         cudaDeviceSynchronize();
 }
 
@@ -1715,6 +2280,55 @@ void btsStCStage(Ciphertext& ctxt, const BtsState& st, int k) {
     const int fuseModeS = [] { const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE"); return e && *e ? std::atoi(e) : 1; }();
     LtFuseScope fuseScope(k != (int)pre.StC.size() - 1 && k >= pre.stc_single && fuseModeS != 2);
     ltStep(ctxt, pre.StC.at(k), k == 0 && st.real ? &pre.stcRealA0 : nullptr);
+}
+
+// FIDESLIB_FINISH_GRAPH=1: btsFinishStcFirst (the PCMM / CCMM output refresh) replayed from a CUDA graph per shape: the
+// first sighting runs eagerly (it warms the tables and scratch), the second is captured, later ones replay (input copied
+// into the graph's ciphertext, legacy-stream fences on both sides, output copied back). The key covers the input's
+// shape and scale, the route scope (raise drop, real payload, CF override) and every plain field of the state.
+static bool finishGraphOn() {
+    static const bool v = [] { const char* e = std::getenv("FIDESLIB_FINISH_GRAPH"); return e && std::atoi(e) > 0; }();
+    return v;
+}
+
+void btsFinishStcFirst(Ciphertext& ctxt, BtsState& st, uint64_t mul) {
+    auto body = [&st, mul](Ciphertext& c) {
+        btsModRaise(c, st);
+        btsFold(c, st);
+        for (int k = 0; k < st.nCtS; ++k)
+            btsCtSStage(c, st, k);
+        btsEvalMod(c, st);
+        btsStcFirstOutput(c, st);
+        if (mul > 1)
+            multIntScalar(c, mul);
+    };
+    ContextData& cc = ctxt.cc;
+    if (finishGraphOn() && !FIDESlib::g_cap.active && cc.GPUid.size() == 1 && st.stcFirst && !st.evalRound) {
+        static auto* graphs = new std::map<std::string, BtsGraph>;   // never destroyed: graph memory is never released
+        std::string k;
+        auto put = [&k](const void* p, size_t n) { k.append(static_cast<const char*>(p), n); };
+        auto pi = [&put](long long v) { put(&v, sizeof v); };
+        auto pd = [&pi](double v) { pi((long long)bitsOf(v)); };
+        pi(ctxt.c0.getLevel()); pi(ctxt.c1.getLevel()); pi(ctxt.NoiseLevel); pi(ctxt.slots); pd(ctxt.NoiseFactor);
+        pi((int)ctxt.c0.isModUp() + 2 * (int)ctxt.c1.isModUp()); pi(cc.btsRaiseDropEffective());
+        pi((int)cc.getBtsRealPayload()); pi(cc.getCorrectionFactorOverride()); pi((int)g_rescaleOnePrime);
+        pd(cc.getBtsPreScale()); pi((long long)mul);
+        pi(st.slots); pi(st.oldSlots); pi(st.prescaled); pi(st.isLT); pi(st.mixedChain); pi(st.sparseEncaps);
+        pi(st.sparseB); pi(st.stcFirst); pi(st.stcFolded); pi(st.exactOnly); pi(st.exactConst); pi(st.aksOn);
+        pi(st.shiftedFlow); pi(st.real); pi(st.correction); pi((long long)st.scalar); pi((long long)st.corFactor);
+        pd(st.constantEvalMult); pd(st.baked); pi(st.nCtS); pi(st.nStC);
+        k += ctxt.keyID;
+        BtsGraph& e = (*graphs)[k];
+        if (!e.failed) {
+            if (!e.exec && e.seen++ >= 1 && !btsGraphCaptureFn(e, ctxt, body))
+                e.failed = true;
+            if (e.exec) {
+                btsGraphReplay(e, ctxt);
+                return;
+            }
+        }
+    }
+    body(ctxt);
 }
 
 void btsFinish(Ciphertext& ctxt, const BtsState& st) {
