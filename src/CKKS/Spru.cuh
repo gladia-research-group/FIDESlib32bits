@@ -18,8 +18,28 @@ namespace FIDESlib::CKKS {
 
 struct SpruKey;
 
-/// Build the SPRU material for the s = 1 route: the block key, the dense -> block switching key, the 4 bootstrapping
-/// key ciphertexts at the top level, and the rotation keys (trace, product, recombination). `h` = blocks (power of 2).
+/// The SPRU material a server needs, with no secret in it: the dense -> block switching key (bottom limbs only) and
+/// the 2n bootstrapping key ciphertexts at the top level. The block positions of s' stay with the key owner.
+struct SpruMaterial {
+    int h = 0;
+    lbcrypto::EvalKey<lbcrypto::DCRTPoly> atob;
+    std::vector<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>> cs;
+};
+
+/// Host only, no GPU: draw the block key s' and build the material from the secret key. `h` = blocks (power of 2).
+SpruMaterial spruKeyGen(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+                        const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys, int h);
+
+/// The rotation indices SPRU needs on ring dimension N with h blocks (trace, product, recombination).
+std::vector<int> spruRotationIndices(int N, int h);
+
+/// Load the material onto the GPU. Missing rotation keys are made from `keys` when given and are an error otherwise:
+/// a server without the secret key must find them in its bundle.
+std::shared_ptr<SpruKey> spruLoad(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, Context& GPUcc,
+                                  const SpruMaterial& m, const lbcrypto::KeyPair<lbcrypto::DCRTPoly>* keys = nullptr);
+
+/// spruKeyGen then spruLoad, in a process that holds the secret key: the block key, the dense -> block switching key,
+/// the 4 bootstrapping key ciphertexts, and any missing rotation keys. `h` = blocks (power of 2).
 std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
                                    const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys, Context& GPUcc, int h);
 

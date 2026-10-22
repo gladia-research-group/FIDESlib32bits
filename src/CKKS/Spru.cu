@@ -5,6 +5,8 @@
 #include <complex>
 #include <iostream>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <map>
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/Ciphertext.cuh"
@@ -25,8 +27,7 @@
 namespace FIDESlib::CKKS {
 
 struct SpruKey {
-    int h = 64, n = 2, N = 0, B = 0;
-    std::vector<int> pos;  // the 1 of block b sits at b*B + pos[b]; pos[0] = 0 (s'_0 = 1)
+    int h = 64, n = 2, N = 0, B = 0;  // the block positions of s' are not kept: the material is public
     std::unique_ptr<KeySwitchingKey> atob;
     std::vector<std::unique_ptr<Ciphertext>> cs;  // 2n bootstrapping key ciphertexts (top level)
     int accBStep = 4;
@@ -131,23 +132,16 @@ static double ms_since(std::chrono::steady_clock::time_point& t0) {
     return r;
 }
 
-std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
-                                   const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys, Context& GPUcc_, int h) {
-    ContextData& GPUcc = *GPUcc_;
-    auto K = std::make_shared<SpruKey>();
-    K->h = h;
-    K->N = (int)cc->GetRingDimension();
-    K->B = K->N / h;
-    const int N = K->N, B = K->B, n = K->n;
+SpruMaterial spruKeyGen(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+                        const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys, int h) {
+    SpruMaterial m;
+    m.h = h;
+    const int N = (int)cc->GetRingDimension(), B = N / h, n = SpruKey{}.n;
     // ---- block key s' (binary, one 1 per block, s'_0 = 1). Positions come from OpenFHE's CSPRNG, the one its own
     // secret keys are drawn from: a generator seeded with one 32-bit word would leave the key 2^32 candidates.
     std::uniform_int_distribution<int> pick(0, B - 1);
-    K->pos.resize(h);
     std::vector<int64_t> sv(N, 0);
-    for (int b = 0; b < h; ++b) {
-        K->pos[b] = b == 0 ? 0 : pick(lbcrypto::PseudoRandomNumberGenerator::GetPRNG());
-        sv[b * B + K->pos[b]] = 1;
-    }
+    for (int b = 0; b < h; ++b) sv[b * B + (b == 0 ? 0 : pick(lbcrypto::PseudoRandomNumberGenerator::GetPRNG()))] = 1;
     auto params = cc->GetElementParams();
     lbcrypto::DCRTPoly sp(params, Format::COEFFICIENT, true);
     sp = sv;  // signed integer coefficients on every tower
@@ -161,11 +155,7 @@ std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& 
     KeepBottomLimbs(atob, cc->GetElementParams()->GetParams().size(),
                     std::dynamic_pointer_cast<lbcrypto::CryptoParametersCKKSRNS>(cc->GetCryptoParameters())
                         ->GetCompositeDegree());
-    K->atob = std::make_unique<KeySwitchingKey>(GPUcc_);
-    {
-        RawKeySwitchKey raw = GetKeySwitchKey(atob);
-        K->atob->Initialize(raw);
-    }
+    m.atob = atob;
     // ---- bootstrapping key: cs_u = Enc(S_u), S_u slots k*h*n + b*n + a = s'_{b*B + u*B/(2n) + k}
     const int sub = B / (2 * n);
     for (int u = 0; u < 2 * n; ++u) {
@@ -175,18 +165,46 @@ std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& 
                 for (int a = 0; a < n; ++a)
                     S[k * h * n + b * n + a] = (double)sv[b * B + u * sub + k];
         auto pt = cc->MakeCKKSPackedPlaintext(S, 1, 0, nullptr, N / 2);
-        auto ct = cc->Encrypt(keys.publicKey, pt);
+        m.cs.push_back(cc->Encrypt(keys.publicKey, pt));
+    }
+    return m;
+}
+
+std::vector<int> spruRotationIndices(int N, int h) {
+    // trace (Accumulate over stride h*n), product (n * 2^i), recombination (1); the conjugation key exists
+    const int n = SpruKey{}.n;
+    std::vector<int> idx = GetAccumulateRotationIndices(SpruKey{}.accBStep, h * n, N / 2 / (h * n));
+    for (int s = n; s < h * n; s <<= 1) idx.push_back(s);
+    idx.push_back(1);
+    return idx;
+}
+
+std::shared_ptr<SpruKey> spruLoad(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc, Context& GPUcc_,
+                                  const SpruMaterial& m, const lbcrypto::KeyPair<lbcrypto::DCRTPoly>* keys) {
+    ContextData& GPUcc = *GPUcc_;
+    auto K = std::make_shared<SpruKey>();
+    K->h = m.h;
+    K->N = (int)cc->GetRingDimension();
+    K->B = K->N / m.h;
+    const int N = K->N, h = K->h, B = K->B, n = K->n;
+    if ((int)m.cs.size() != 2 * n) throw std::runtime_error("[spru] load: expected 4 key ciphertexts");
+    K->atob = std::make_unique<KeySwitchingKey>(GPUcc_);
+    {
+        RawKeySwitchKey raw = GetKeySwitchKey(
+            std::dynamic_pointer_cast<lbcrypto::EvalKeyRelinImpl<lbcrypto::DCRTPoly>>(m.atob));
+        K->atob->Initialize(raw);
+    }
+    for (const auto& ct : m.cs) {
         auto raw = GetRawCipherText(cc, ct);
         K->cs.push_back(std::make_unique<Ciphertext>(GPUcc_, raw));
     }
-    // ---- rotation keys: trace (Accumulate over stride h*n), product (n * 2^i), recombination (1), conjugation exists
-    std::vector<int> idx = GetAccumulateRotationIndices(K->accBStep, h * n, N / 2 / (h * n));
-    for (int s = n; s < h * n; s <<= 1) idx.push_back(s);
-    idx.push_back(1);
     std::vector<int> need;
-    for (int i : idx)
+    for (int i : spruRotationIndices(N, h))
         if (!GPUcc.HasRotationKey(i, K->cs[0]->keyID)) need.push_back(i);
-    if (!need.empty()) GenAndAddRotationKeys(cc, keys, GPUcc_, need);
+    if (!need.empty() && !keys)
+        throw std::runtime_error("[spru] load: " + std::to_string(need.size()) +
+                                 " SPRU rotation keys are missing and there is no secret key to make them");
+    if (!need.empty()) GenAndAddRotationKeys(cc, *keys, GPUcc_, need);
     cudaDeviceSynchronize();
     {   // FFT positions: slot j <-> zeta^{t}, t = 5^j mod 2N, w index u = (t-1)/2; conjugate at t' = 2N - t
         std::vector<int> up(N / 2), un(N / 2);
@@ -207,6 +225,11 @@ std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& 
     std::cerr << "[spru] setup: N=" << N << " h=" << h << " B=" << B << " n=" << n << " key cts=" << K->cs.size()
               << " at limb index " << K->cs[0]->getLevel() << ", rotation keys added " << need.size() << "\n";
     return K;
+}
+
+std::shared_ptr<SpruKey> spruSetup(lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
+                                   const lbcrypto::KeyPair<lbcrypto::DCRTPoly>& keys, Context& GPUcc, int h) {
+    return spruLoad(cc, GPUcc, spruKeyGen(cc, keys, h), &keys);
 }
 
 void spruBootstrap(Ciphertext& ct, SpruKey& K, uint32_t correction, lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc,
