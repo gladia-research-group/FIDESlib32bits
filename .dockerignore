@@ -1,0 +1,5 @@
+.git
+build*/
+cmake-build-*/
+deps/openfhe-src
+deps/openfhe-install

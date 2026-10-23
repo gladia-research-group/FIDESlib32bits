@@ -1,0 +1,34 @@
+# FIDESlib32bits for FHERMA: OpenFHE (NATIVE_SIZE=32, deps/openfhe-n32) and FIDESlib32bits,
+# both under /opt/fherma, the layout of the fherma/fideslib image: a bare find_package finds
+# OpenFHE and fideslib, and fideslib carries its own static OpenFHE. The toolkit stays in the
+# image because answers are compiled in it. Build from the repository root:
+#
+#   docker build -f docker/Dockerfile.fherma -t fideslib32bits .
+
+# nvidia/cuda:12.9.1-devel-ubuntu24.04: CUDA 12.9.1, gcc 13, NCCL 2.27.3.
+FROM nvidia/cuda:12.9.1-devel-ubuntu24.04@sha256:020bc241a628776338f4d4053fed4c38f6f7f3d7eb5919fecb8de313bb8ba47c
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       build-essential ca-certificates cmake git libomp-dev libtbb-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG FIDESLIB_ARCH="89-real;120-real"
+ARG JOBS=""
+ARG REVISION=""
+
+COPY . /src/fideslib32bits
+RUN FIDESLIB_ARCH="$FIDESLIB_ARCH" JOBS="${JOBS:-$(nproc)}" FIDESLIB_REVISION="${REVISION:-unknown}" \
+        /src/fideslib32bits/docker/build-fherma.sh /opt/fherma \
+    && rm -rf /src/fideslib32bits
+
+ENV CMAKE_PREFIX_PATH=/opt/fherma \
+    LD_LIBRARY_PATH=/opt/fherma/lib:/usr/local/cuda/lib64
+
+LABEL org.opencontainers.image.title="FIDESlib32bits" \
+      org.opencontainers.image.description="FIDESlib32bits (CKKS on NVIDIA GPUs, 32-bit composite chain) on OpenFHE NATIVE_SIZE=32, CUDA 12.9, sm_89 and sm_120" \
+      org.opencontainers.image.source="https://github.com/gladia-research-group/FIDESlib32bits" \
+      org.opencontainers.image.revision="$REVISION" \
+      org.opencontainers.image.licenses="MIT AND BSD-2-Clause"
+
+WORKDIR /workspace

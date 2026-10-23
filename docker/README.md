@@ -4,6 +4,9 @@ This directory contains Docker images that enable compiling and using FIDESlib w
 
 This directory contains the following Dockerfiles:
 * **Dockerfile.NVIDIA**: Use if your system have NVIDIA devices.
+* **Dockerfile.fherma**: the 32-bit stack, built and installed: OpenFHE (`NATIVE_SIZE=32`, the
+  `deps/openfhe-n32` series) and FIDESlib32bits under `/opt/fherma`, CUDA 12.9, sm_89 and sm_120.
+  It is the image proposed to FHERMA; `build-fherma.sh` is its build, and runs on a host too.
 
 ## Image building
 
