@@ -1726,7 +1726,9 @@ BtsState btsBegin(Ciphertext& ctxt, int slots, bool prescaled, bool allowStcFirs
     const int inLimb = (int)ctxt.getLevel() - (ctxt.NoiseLevel == 2 ? cc.compositeDegree() : 0);
     st.stcFirst = pre.stc_first_mode > 0 && !st.sparseB && allowStcFirst && !cc.stcFirstForbid && inLimb >= pre.stc_first_entry;
     st.stcFolded = pre.stc_first_mode == 2;
-    if (static const bool dbg = [] { const char* e = std::getenv("FIDESLIB_BTS_DEBUG_STC"); return e && std::atoi(e) > 0; }(); dbg && pre.stc_first_mode > 0)
+    // Not `if (static ...; ...)`: nvcc 12.9's front end asserts on a static in an if-initializer.
+    static const bool dbg = [] { const char* e = std::getenv("FIDESLIB_BTS_DEBUG_STC"); return e && std::atoi(e) > 0; }();
+    if (dbg && pre.stc_first_mode > 0)
         std::cerr << "[stc_dbg] begin slots=" << slots << " inLimb=" << inLimb << " entry=" << pre.stc_first_entry
                   << " allow=" << allowStcFirst << " forbid=" << cc.stcFirstForbid << " cc=" << (void*)&cc
                   << " real=" << cc.getBtsRealPayload() << " cf=" << effCorrectionFactor(cc, slots)
@@ -1847,7 +1849,8 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
         probeLive("first", ctxt, alt);
         if (alt)
             stcAltFence(1, 8);
-        if (static int dbg = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_DEBUG"); return e && *e ? std::atoi(e) : 0; }(); dbg > 0) {
+        static int dbg = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_DEBUG"); return e && *e ? std::atoi(e) : 0; }();
+        if (dbg > 0) {
             --dbg;
             std::cerr << "[stc_alt_dbg] alt=" << alt << " entry=" << entry << " nfIn=" << nfIn << " nfBefore=" << nfBefore
                       << " nfAfterFirst=" << ctxt.NoiseFactor << " level=" << ctxt.getLevel() << " NL=" << ctxt.NoiseLevel
@@ -1923,7 +1926,8 @@ void btsStcFirstInput(Ciphertext& ctxt, const BtsState& st, bool ownCf) {
                         pt.c0.releaseAux();   // read-only from here on
             it = lastCache.emplace(lkey, std::move(v)).first;
         }
-        if (static int dbg2 = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_DEBUG"); return e && *e ? std::atoi(e) : 0; }(); dbg2 > 0) {
+        static int dbg2 = [] { const char* e = std::getenv("FIDESLIB_STC_ALT_DEBUG"); return e && *e ? std::atoi(e) : 0; }();
+        if (dbg2 > 0) {
             --dbg2;
             std::cerr << "[stc_alt_dbg2] alt=" << alt << " cf=" << cf << " cfStage=" << cfStage << " nfIn=" << nfIn
                       << " ein-key=" << lkey.second << " shiftK=" << shiftK << " factor=" << factor << " lfactor=" << lfactor
