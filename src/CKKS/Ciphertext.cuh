@@ -6,6 +6,7 @@
 #define FIDESLIB_CKKS_CIPHERTEXT_CUH
 
 #include <source_location>
+#include <functional>
 #include "RNSPoly.cuh"
 #include "forwardDefs.cuh"
 #include "openfhe-interface/RawCiphertext.cuh"
@@ -19,6 +20,14 @@ namespace FIDESlib::CKKS {
  * implementation and the fused hoisted‑rotation variant.
  */
 extern bool hoistRotateFused;
+
+/// One-prime rescale (FIDESLIB_STC_SINGLE): while set, Ciphertext::rescale() drops one prime, not compositeDegree().
+extern thread_local bool g_rescaleOnePrime;
+struct RescaleOneScope {
+    bool old;
+    explicit RescaleOneScope(bool a) : old(g_rescaleOnePrime) { g_rescaleOnePrime = a; }
+    ~RescaleOneScope() { g_rescaleOnePrime = old; }
+};
 
 /**
  * @brief Pinned-arena offload descriptor for one ciphertext (async KV-cache swap).
@@ -333,6 +342,9 @@ class Ciphertext {
      * Σ relin(d2_j) == relin(Σ d2_j). No rescale, mirroring serial mult(rescale=false).
      */
     void multAccumulateBatch(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b);
+    /** this (a deg-2 seed at the products' level and scale) += sum_j a_j * b_j with ONE key switch; false (nothing done)
+     *  when a pair does not land at this level with this scale. */
+    bool multAccumulateChecked(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b);
 
     /**
      * @brief Multiplies both polynomial components by a scalar without pre‑checks.
@@ -415,6 +427,24 @@ class Ciphertext {
      * @param index Number of slots to rotate.
      */
     void rotate(const Ciphertext& c, const int index);
+    /// rotate(index) of `c` into this (c != this) without first copying c: the hoisted path reads c.c0 in place.
+    void rotateFrom(const Ciphertext& c, const int index);
+    /// Write-once out-of-place ops for the API wrappers (FIDESLIB_NOCLONE=2): this <- b * c, a + b, c * pt without first
+    /// cloning an operand. Each runs only when the in-place op would make no level / scale adjustment (same level, both
+    /// at noise level 1 for products, equal noise levels for the sum) and returns false otherwise, writing nothing.
+    bool multInto(const Ciphertext& b, const Ciphertext& c);
+    bool addInto(const Ciphertext& a, const Ciphertext& b);
+    bool multPtInto(const Ciphertext& c, const Plaintext& pt);
+    /// FIDESLIB_NOCLONE=3: this <- a - b, c * scalar, c + scalar, written once from the sources under the same
+    /// conditions (no level / scale adjustment needed; products from noise level 1); false = nothing written.
+    bool subInto(const Ciphertext& a, const Ciphertext& b);
+    bool multScalarInto(const Ciphertext& c, double scalar);
+    bool addScalarInto(const Ciphertext& c, double scalar);
+    /// LIN_PT_DOT: this <- sum_i cs[i] * pts[i] (a BSGS baby-step inner sum) written once by one kernel; the same
+    /// result and metadata as multPtInto(cs[0], pts[0]) followed by add(cs[i] * pts[i]) for each further term. Runs
+    /// under multPtInto's conditions for every term (all at one level, noise level 1) and returns false otherwise,
+    /// writing nothing.
+    bool multPtSumInto(const std::vector<const Ciphertext*>& cs, const std::vector<const Plaintext*>& pts);
 
     /**
      * @brief Computes the complex conjugate of ciphertext `c` and stores it in *this*.
@@ -435,11 +465,17 @@ class Ciphertext {
      * @param free If true, frees intermediate buffers after conversion.
      */
     void modDown(bool free = false);
+    /// Lever A: ModDown of both components fused with the composite rescale (level -2, NoiseLevel -1).
+    void modDownRescale();
+    /// Lever E2: *this = src * P with zeroed special limbs (== copy(src); extend()), one pass per limb.
+    void copyExtend(const Ciphertext& src);
 
     /** @brief Increases the modulus level of the ciphertext (level up). */
     void modUp();
 
-    /** @brief Rescales the ciphertext to the next level, adjusting scaling factor. */
+    /** @brief Rescales the ciphertext to the next level, adjusting scaling factor.
+     *  Under a RescaleOneScope it drops ONE prime instead of compositeDegree() (the ciphertext then
+     *  sits off the composite level grid until a matching one-prime drop brings it back). */
     void rescale();
 
     /**
@@ -509,6 +545,17 @@ class Ciphertext {
      * @param ext     If true, extends ciphertexts before rotation.
      */
     void rotate_hoisted(const std::vector<int>& indexes, std::vector<Ciphertext*> results, bool ext);
+    /// this += sum_i rot(this, indexes[i]): one hoisted ModUp, one key dot per index, the rotations summed in the
+    /// extended basis Q u P and ONE ModDown for the group (a radix group of a rotate-and-sum ladder; the ModDown
+    /// rounds once instead of once per rotation).
+    void rotateSumHoisted(const std::vector<int>& indexes);
+    /// Chunked form for LinearTransform (fused single-GPU path, ext = true only): one ModUp,
+    /// then the hoisted key-switch dot is launched per limb range and `on_chunk(part, begin,
+    /// count)` runs right after each range (part 1 = special limbs, 0 = regular limbs), so the
+    /// consumer reads the rotated limbs while they are still L2-resident. The consumer must
+    /// order itself after `cc.getKeySwitchAux()`'s stream.
+    void rotate_hoisted_chunked(const std::vector<int>& indexes, std::vector<Ciphertext*> results, int chunk,
+                                const std::function<void(int part, int begin, int count)>& on_chunk);
 
     /**
      * @brief Evaluates a linear weighted sum (mutable version) over `n` ciphertexts.

@@ -1,6 +1,10 @@
+#include "CKKS/PtCompact.cuh"
+#include <functional>
 //
 // Created by carlosad on 2/05/24.
 //
+#include "CKKS/ElemenwiseBatchKernels.cuh"
+#include "NTTtc.cuh"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -15,6 +19,7 @@
 #include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/BootstrapStages.cuh"
 
 #include "../parallel_for.hpp"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -101,6 +106,8 @@ ContextData::ContextData(const Parameters& param_, const std::vector<int>& devs,
         uint64_t threshold = UINT64_MAX;  //5l * 1024l * 1024l * 1024l;  // One Gigabyte of memory
         cudaMemPoolSetAttribute(mp, cudaMemPoolAttrReleaseThreshold, &threshold);
         CudaCheckErrorModNoSync;
+        // a full device first frees the recycled polynomials (their limbs are idle, kept for reuse)
+        GPUpoolSetReclaimHook(dev, [this] { return releaseAuxilarPolys(); });
     }
 
     OK = true;
@@ -363,8 +370,13 @@ std::vector<std::vector<int>> ContextData::generateGPUdigits(const int dnum, con
  * make_unique from two threads corrupts the heap); the hot path only pays a null check. */
 static std::mutex ks_aux_init_mtx;
 
+int& ContextData::ksLane() {
+    static thread_local int lane = 0;
+    return lane;
+}
+
 RNSPoly& ContextData::getKeySwitchAux() {
-    auto& p = key_switch_aux;
+    auto& p = ksLane() ? key_switch_aux_ln[ksLane() % kKsLanes] : key_switch_aux;
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
         if (p == nullptr)
@@ -377,7 +389,7 @@ RNSPoly& ContextData::getKeySwitchAux() {
 }
 
 RNSPoly& ContextData::getKeySwitchAux2() {
-    auto& p = key_switch_aux2;
+    auto& p = ksLane() ? key_switch_aux2_ln[ksLane() % kKsLanes] : key_switch_aux2;
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
         if (p == nullptr)
@@ -389,7 +401,7 @@ RNSPoly& ContextData::getKeySwitchAux2() {
 }
 
 RNSPoly& ContextData::getModdownAux(const int num) {
-    auto& p = moddown_aux[num & 1];
+    auto& p = (ksLane() ? moddown_aux_ln[ksLane() % kKsLanes] : moddown_aux)[num & 1];
     if (p == nullptr) {
         std::lock_guard<std::mutex> g(ks_aux_init_mtx);
         if (p == nullptr)
@@ -637,16 +649,25 @@ int ContextData::GetBootK() {
     return param.raw ? param.raw->bootK : 1;
 }
 
+void ContextData::RemoveBootPrecomputation(int slots) {
+    cudaDeviceSynchronize();
+    precom.boot.erase(slots);
+}
+
 bool ContextData::HasBootPrecomputation(int slots) {
 
     return precom.boot.contains(slots);
 }
-BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
+void ContextData::setBtsRealPayload(bool on) { btsRealPayload = on; }
+bool ContextData::getBtsRealPayload() const { return btsRealPayload; }
+void ContextData::setStcFirstForbid(bool on) { stcFirstForbid = on; }
+bool ContextData::getStcFirstForbid() const { return stcFirstForbid; }
+void ContextData::setBtsRaiseDrop(int drop) { btsRaiseDrop = drop; }
+int ContextData::getBtsRaiseDrop() const { return btsRaiseDrop; }
+int ContextData::btsRaiseDropEffective() const { return btsRaiseDrop > 0 ? btsRaiseDrop : 0; }
+
+BootstrapPrecomputation& ContextData::GetBootPrecomputationBase(int slots) {
     if (!precom.boot.contains(slots)) {
-        // was assert(...) — a NO-OP in release, so a missing slot silently
-        // default-constructed an empty precomp and Bootstrap deref'd null ->
-        // segfault. Throw with the requested slot count so the miss is visible
-        // (diagnoses the complex+dual-precomp block-0 crash).
         std::string have;
         for (const auto& [s, _] : precom.boot) have += " " + std::to_string(s);
         throw std::runtime_error(
@@ -654,6 +675,108 @@ BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
             " (have:" + have + ")");
     }
     return precom.boot[slots];
+}
+
+size_t ContextData::ReleaseScratchOf(BootstrapPrecomputation& top) {
+    const char* e = std::getenv("FIDESLIB_PT_SCRATCH");
+    if (e && e[0] == '0')
+        return 0;
+    cudaDeviceSynchronize();
+    size_t n = 0;
+    auto rel = [&](Plaintext& pt) {
+        pt.c0.releaseAux();
+        ++n;
+    };
+    auto rel_v = [&](std::vector<Plaintext>& v) {
+        for (auto& pt : v)
+            rel(pt);
+    };
+    auto rel_steps = [&](std::vector<BootstrapPrecomputation::LTstep>& v) {
+        for (auto& st : v)
+            rel_v(st.A);
+    };
+    std::function<void(BootstrapPrecomputation&)> visit = [&](BootstrapPrecomputation& p) {
+        rel_v(p.LT.A);
+        rel_v(p.LT.invA);
+        rel_steps(p.StC);
+        rel_steps(p.CtS);
+        rel_steps(p.CtS_alt);           // FIDESLIB_CTS_ALT_BUDGET
+        rel_steps(p.CtS_orig);
+        rel_steps(p.StC_orig);
+        rel_steps(p.StC_first);
+        rel_steps(p.StC_alt_first);     // FIDESLIB_STC_ALT_BUDGET
+        rel_steps(p.stc_alt_lastSrc);
+        rel_v(p.stcRealA0);
+        rel_v(p.LT_first);
+        if (p.stc_first_mask)
+            rel(*p.stc_first_mask);
+        if (p.sparseB) {
+            rel_v(p.sparseB->P);
+            rel_v(p.sparseB->Q);
+        }
+        for (auto& [drop, v] : p.raise_variants)
+            if (v)
+                visit(*v);
+    };
+    visit(top);
+    cudaDeviceSynchronize();
+    // after releaseAux (live data in `v`): stage tables stored compact (FIDESLIB_PT_COMPACT=0: full)
+    const auto [nc, freed] = compactStages(top);
+    if (nc)
+        std::cerr << "[pt_compact] " << nc << " stage plaintexts stored compact, " << (freed >> 20) << " MiB freed\n";
+    return n;
+}
+
+size_t ContextData::BootReleaseScratch() {
+    size_t n = 0;
+    for (auto& [slots, p] : precom.boot)
+        n += ReleaseScratchOf(p);
+    return n;
+}
+
+size_t ContextData::BootCacheEntries(bool clear) {
+    size_t n = 0;
+    auto visit = [&](BootstrapPrecomputation& p) {
+        n += p.stc_first_last.size() + p.lt_first_last.size();
+        if (clear) {
+            p.stc_first_last.clear();
+            p.lt_first_last.clear();
+        }
+    };
+    if (clear)
+        cudaDeviceSynchronize();  // the cached plaintexts may still be read by a bootstrap in flight
+    for (auto& [slots, p] : precom.boot) {
+        visit(p);
+        for (auto& [drop, v] : p.raise_variants)
+            if (v)
+                visit(*v);
+    }
+    return n;
+}
+
+BootstrapPrecomputation& ContextData::GetBootPrecomputation(int slots) {
+    BootstrapPrecomputation& base = GetBootPrecomputationBase(slots);
+    const int drop = btsRaiseDropEffective();
+    if (drop <= base.raise_drop)
+        return base;
+    auto it = base.raise_variants.find(drop);
+    // FIDESLIB_BTS_RAISE_STC_ONUSE=1 (default 0): a staged-only StC-first route builds a missing variant at its first use
+    // like the other routes, so a pass's first sites of a drop land as planned, not at the top until another site built it
+    static const bool stc_onuse = [] { const char* e = std::getenv("FIDESLIB_BTS_RAISE_STC_ONUSE"); return e && std::atoi(e) > 0; }();
+    if (it == base.raise_variants.end() && base.stc_first_mode > 0 &&
+        !(stcFirstStagedOnly() && (stcFirstRaiseScope() || stc_onuse)))
+        return base;  // a StC-first route keeps no variants: the raise goes to the top and lands shallower than planned
+    if (it == base.raise_variants.end() && raiseVariantBuilder && raiseDropsAllowed.count(drop)) {
+        static std::mutex build_mu;
+        std::lock_guard<std::mutex> g(build_mu);
+        raiseVariantBuilder(slots, drop);   // first use: build it from the base (synchronizes the device)
+        it = base.raise_variants.find(drop);
+    }
+    if (it == base.raise_variants.end())
+        throw std::runtime_error("GetBootPrecomputation: no raise variant for drop " + std::to_string(drop) +
+                                 " at slots=" + std::to_string(slots) +
+                                 " (build it: FIDESLIB_BTS_RAISE_DROPS=k,.. or SetBootstrapRaiseDrops before LoadContext)");
+    return *it->second;
 }
 
 KeySwitchingKey& ContextData::GetRotationKey(int index, const KeyHash& keyID, int slots) {
@@ -801,6 +924,10 @@ double ContextData::modReduceProduct(const int limbTop) const {
     return factor;
 }
 
+double ContextData::modReduceFactorAt(const int limb) const {
+    return param.ModReduceFactor[limb];
+}
+
 void ContextData::PrepareNCCLCommunication() {
 
     if (GPUid.size() > 1) {
@@ -931,6 +1058,25 @@ void ContextData::PrepareNCCLCommunication() {
             digitStream2[i][j].init();
         }
     }
+    for (int l = 1; l < kKsLanes; ++l) {
+        digitStreamLn[l].resize(dnum);
+        digitStream2Ln[l].resize(dnum);
+        for (int i = 0; i < dnum; ++i) {
+            digitStreamLn[l][i].resize(GPUid.size());
+            digitStream2Ln[l][i].resize(GPUid.size());
+            for (size_t j = 0; j < GPUid.size(); ++j) {
+                cudaSetDevice(GPUid[j]);
+                digitStreamLn[l][i][j].init(100);
+                digitStream2Ln[l][i][j].init();
+            }
+        }
+    }
+    for (size_t j = 0; j < GPUid.size(); ++j) {
+        cudaSetDevice(GPUid[j]);
+        FIDESlib::setDiscardScratch(FIDESlib::discardScratchEnv());
+        FIDESlib::CKKS::setAblateKb(FIDESlib::CKKS::ablateKbEnv());
+        FIDESlib::buildTcNttTables(precom.globals->globals[j], GPUid[j]);
+    }
 }
 
 const std::vector<int> ContextData::generateDigitGPUid(std::vector<std::vector<LimbRecord>>& meta, const int L,
@@ -963,6 +1109,8 @@ std::vector<std::vector<LimbRecord>> ContextData::generateSplitSpecialMeta(std::
 }
 
 ContextData::~ContextData() {
+    for (int dev : GPUid)
+        GPUpoolSetReclaimHook(dev, {});
     CudaCheckErrorMod;
     key_switch_aux.reset(nullptr);
     //   CudaCheckErrorMod;
@@ -970,6 +1118,12 @@ ContextData::~ContextData() {
     //   CudaCheckErrorMod;
     for (auto& i : moddown_aux) {
         i.reset(nullptr);
+    }
+    for (int l = 0; l < kKsLanes; ++l) {
+        key_switch_aux_ln[l].reset(nullptr);
+        key_switch_aux2_ln[l].reset(nullptr);
+        for (auto& i : moddown_aux_ln[l])
+            i.reset(nullptr);
     }
     //   CudaCheckErrorMod;
     precom.auxPoly.clear();
@@ -1029,20 +1183,72 @@ bool ContextData::hasAuxilarPoly() const {
 // an unlocked pop/push double-move RNSPolys. Cold path, plain mutex.
 static std::mutex aux_poly_mtx;
 
+// FIDESLIB_BTS_GRAPH: inside a capture the temporaries come from a separate pool. A graph replays into the buffers
+// it was captured with, so a poly used by a capture must never again hold live data of the eager code: it stays in
+// the graph pool (shared by all graphs: replays are serialized and their temporaries are dead after each one).
+static std::vector<RNSPoly>& graphAuxPool() {
+    static auto* v = new std::vector<RNSPoly>;   // never destroyed (graph memory is never released)
+    return *v;
+}
+
 RNSPoly ContextData::getAuxilarPoly() {
-    std::lock_guard<std::mutex> g(aux_poly_mtx);
-    if (precom.auxPoly.empty()) {
-        return RNSPoly(*this);
-    } else {
-        RNSPoly res(std::move(precom.auxPoly.back()));
-        precom.auxPoly.pop_back();
-        return res;
+    {
+        std::lock_guard<std::mutex> g(aux_poly_mtx);
+        auto& pool = FIDESlib::g_cap.active ? graphAuxPool() : precom.auxPoly;
+        if (!pool.empty()) {
+            RNSPoly res(std::move(pool.back()));
+            pool.pop_back();
+            return res;
+        }
+        if (FIDESlib::g_cap.active) {   // inside a capture: a graph-owned poly (never back to the eager pool)
+            RNSPoly res(*this);
+            res.graphOwned = true;
+            return res;
+        }
     }
+    // allocate outside the lock: a device-full allocation's reclaim hook (releaseAuxilarPolys) takes it
+    return RNSPoly(*this);
 }
 
 void ContextData::returnAuxilarPoly(RNSPoly&& c) {
+    // FIDESLIB_AUX_POLY_MAX=n: keep at most n recycled polynomials (each keeps its limbs: a new ciphertext re-grows
+    // into them without allocating); past it the polynomial is freed. Unset: unbounded (the device-full reclaim
+    // hook still frees them).
+    static const size_t cap = [] {
+        const char* e = std::getenv("FIDESLIB_AUX_POLY_MAX");
+        return (e && *e) ? (size_t)std::strtoull(e, nullptr, 10) : SIZE_MAX;
+    }();
     std::lock_guard<std::mutex> g(aux_poly_mtx);
+    if (FIDESlib::g_cap.active)
+        c.graphOwned = true;
+    if (c.graphOwned) {
+        graphAuxPool().emplace_back(std::move(c));
+        return;
+    }
+    if (precom.auxPoly.size() >= cap)
+        return;   // not taken: the caller (Ciphertext::~Ciphertext) destroys it with its members
     precom.auxPoly.emplace_back(std::move(c));
+}
+
+size_t ContextData::releaseAuxilarPolys() {
+    std::vector<RNSPoly> drop;
+    {
+        std::lock_guard<std::mutex> g(aux_poly_mtx);
+        drop.swap(precom.auxPoly);
+    }
+    // queued kernels may still read a recycled polynomial: sync before its limbs go back (device-full only)
+    if (!drop.empty()) cudaDeviceSynchronize();
+    return drop.size();   // destroyed here, outside the lock: their limbs go back to the pool
+}
+
+std::pair<size_t, size_t> ContextData::auxilarPolyStats() {
+    std::lock_guard<std::mutex> g(aux_poly_mtx);
+    size_t bytes = 0;
+    for (auto& p : precom.auxPoly)
+        for (auto& part : p.GPU)
+            for (auto& l : part.limb)
+                std::visit([&](auto& x) { bytes += (size_t)x.v.alloc * sizeof(x.v.data[0]) * (x.aux.data ? 2 : 1); }, l);
+    return {precom.auxPoly.size(), bytes};
 }
 
 void ContextData::trimAuxilarPoly(size_t size) {

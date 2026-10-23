@@ -227,9 +227,50 @@ __global__ void ModDown2(void** __restrict__ a, const __grid_constant__ int n, v
 
 #undef YY
 
+// Fused ModDown + composite rescale (lever A): base B = P u {q_b, q_a} (K+2 coefficient-domain limbs:
+// `spec` = the K special limbs, `tops[0]` = q_b limb, `tops[1]` = q_a limb) converted to the Q limbs below
+// q_b; the NTT_MODDOWNR second pass then computes (x_j - conv_j) * B^{-1}. u32 chains, Shoup, lazy accumulate
+// (K+2 <= 16 products of < 2^28 x < 2^28 fit a u64).
+__global__ void ModDownRescale2(void** __restrict__ out, const __grid_constant__ int n, void** __restrict__ spec,
+                                void** __restrict__ tops, const __grid_constant__ int top,
+                                const __grid_constant__ int primeid_init, const Global::Globals* Globals) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tid = threadIdx.x;
+    extern __shared__ char shared_mem[];
+    uint32_t* buff32 = (uint32_t*)shared_mem;
+    const int K = C_.K, NB = K + 2;
+    for (int i = threadIdx.y; i < NB; i += blockDim.y) {
+        const int primeid = i < K ? C_.L + i : (i == K ? top - 1 : top);
+        const uint32_t* src = (const uint32_t*)(i < K ? spec[i] : tops[i - K]);
+        buff32[tid + blockDim.x * i] = modmult<ALGO_SHOUP>(src[idx], (uint32_t)G_->FMD_pre[top * 16 + i], primeid,
+                                                           (uint32_t)G_->FMD_pre_shoup[top * 16 + i]);
+    }
+    __syncthreads();
+    // exact conversion with the floating-point overflow estimate of Halevi, Polyakov & Shoup, "An Improved RNS Variant
+    // of the BFV Homomorphic Encryption Scheme" (CT-RSA 2019): sum_i y_i B/b_i = x + u B with x = c mod B; the floating
+    // estimate sum_i y_i / b_i = u + x/B,
+    // rounded, removes u AND centres x in [-B/2, B/2), so the following (c - x) B^-1 is the correctly rounded division
+    // (the approximate conversion left up to NB units of error AFTER the rescale's division)
+    double v = 0.0;
+    for (int i = 0; i < NB; ++i)
+        v += (double)buff32[i * blockDim.x + tid] * G_->FMD_rb[top * 16 + i];
+    const uint64_t ur = (uint64_t)floor(v + 0.5);
+    for (int j = threadIdx.y; j < n; j += blockDim.y) {
+        const int primeid = C_.primeid_flattened[primeid_init + j];
+        uint64_t acc = 0;
+        for (int i = 0; i < NB; ++i)
+            acc += (uint64_t)buff32[i * blockDim.x + tid] * (uint64_t)G_->FMD_matrix32[(top * 16 + i) * MAXP + primeid];
+        // Barrett (modreduce_lazy: exact canonical residue for any a < 2^64) instead of 64-bit `%`
+        const uint32_t q = (uint32_t)C_.primes[primeid];
+        const uint32_t x = modreduce_lazy(acc, primeid);
+        const uint32_t sub = modreduce_lazy(ur * (uint64_t)G_->FMD_Bmod32[(size_t)top * MAXP + primeid], primeid);
+        ((uint32_t*)out[j])[idx] = x >= sub ? x - sub : x + q - sub;
+    }
+}
+
 template <ALGO algo>
-__global__ void DecompAndModUpConv(void** __restrict__ a, const int __grid_constant__ n, void** __restrict__ b,
-                                   const int __grid_constant__ d, const Global::Globals* Globals) {
+__device__ __forceinline__ void DecompAndModUpConvBody(void** __restrict__ a, const int n, void** __restrict__ b,
+                                                       const int d, const Global::Globals* Globals) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int tid = threadIdx.x;
     extern __shared__ char shared_mem[];
@@ -426,10 +467,28 @@ __global__ void DecompAndModUpConv(void** __restrict__ a, const int __grid_const
     }
 }
 
+template <ALGO algo>
+__global__ void DecompAndModUpConv(void** __restrict__ a, const int __grid_constant__ n, void** __restrict__ b,
+                                   const int __grid_constant__ d, const Global::Globals* Globals) {
+    DecompAndModUpConvBody<algo>(a, n, b, d, Globals);
+}
+
+// Lever B1-2: every digit's base conversion in ONE launch (blockIdx.y = digit; the per-digit launch ran at
+// 0.45 waves/SM). atabs/btabs/dids are device arrays of the per-digit tables.
+template <ALGO algo>
+__global__ void DecompAndModUpConvMulti(void*** __restrict__ atabs, const int __grid_constant__ n,
+                                        void*** __restrict__ btabs, const int* __restrict__ dids,
+                                        const Global::Globals* Globals) {
+    DecompAndModUpConvBody<algo>(atabs[blockIdx.y], n, btabs[blockIdx.y], dids[blockIdx.y], Globals);
+}
+
 #define YY(algo)                                                                                            \
     template __global__ void DecompAndModUpConv<algo>(void** __restrict__ a, const int __grid_constant__ n, \
                                                       void** __restrict__ b, const int __grid_constant__ d, \
-                                                      const Global::Globals* Globals);
+                                                      const Global::Globals* Globals);                      \
+    template __global__ void DecompAndModUpConvMulti<algo>(void*** __restrict__ atabs, const int __grid_constant__ n, \
+                                                           void*** __restrict__ btabs, const int* __restrict__ dids, \
+                                                           const Global::Globals* Globals);
 #include "ntt_types.inc"
 
 #undef YY

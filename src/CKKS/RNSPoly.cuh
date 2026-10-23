@@ -20,6 +20,7 @@ class RNSPoly {
 
    public:
     std::vector<LimbPartition> GPU;
+    bool graphOwned = false;   // used inside a graph capture: lives in the graph pool, never back in the eager one
 
     explicit RNSPoly(ContextData& context, int level = -1, bool single_malloc = false, bool def_stream = false);
     explicit RNSPoly(ContextData& context, const std::vector<std::vector<uint64_t>>& data);
@@ -29,6 +30,11 @@ class RNSPoly {
      *  LimbPartition objects travel wholesale with their uid/stream/buffers; the only
      *  per-poly back-pointer, `level`, is re-seated on both sides. */
     void swap(RNSPoly& other) noexcept;
+
+    /** Release the scratch (aux) buffers of every limb (Limb::releaseAux), ordered on each partition's stream: for a
+     *  polynomial that is only read from now on (a finished plaintext). */
+    void releaseAux();
+    bool auxReleased() const;
 
     void grow(int level, bool single_malloc = false, bool constant = false);
 
@@ -47,16 +53,26 @@ class RNSPoly {
     void add(const RNSPoly& a, const RNSPoly& b);
 
     void sub(const RNSPoly& p);
+    /// FIDESLIB_NOCLONE=3 write-once ops (NoClone3.cu), over this poly's current limbs: this <- a - b,
+    /// src * elem, src + elem (elem: one scalar per prime, as multScalar / addScalar take).
+    void subFrom(const RNSPoly& a, const RNSPoly& b);
+    void multScalarFrom(const RNSPoly& src, const std::vector<uint64_t>& elem);
+    void addScalarFrom(const RNSPoly& src, const std::vector<uint64_t>& elem);
+    /// LIN_PT_DOT (PtDot.cu): this <- sum_i x0[i] * pts[i], out1 <- sum_i x1[i] * pts[i], one launch per partition.
+    void ptDotFrom(RNSPoly& out1, const std::vector<const RNSPoly*>& x0, const std::vector<const RNSPoly*>& x1,
+                   const std::vector<const RNSPoly*>& pts);
 
     void multPt(const RNSPoly& p, bool rescale);
 
     void modup();
 
     template <ALGO algo = ALGO_SHOUP>
-    void moddown(bool ntt = true, bool free = true, int aux_num = 0);
+    void moddown(bool ntt = true, bool free = true, int aux_num = 0, bool rescale2 = false);
     int automorph_index_precomp(int idx) const;
 
     void rescale();
+    /// Drop ONE prime (the top limb) whatever the composite degree; single GPU (RescaleOneScope).
+    void rescaleOne();
 
     void sync();
 
@@ -96,7 +112,7 @@ class RNSPoly {
 
     void hoistedRotationFused(std::vector<int> indexes, std::vector<RNSPoly*>& c0, std::vector<RNSPoly*>& c1,
                               const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
-                              const RNSPoly& src_c0, const RNSPoly& src_c1);
+                              const RNSPoly& src_c0, const RNSPoly& src_c1, int y_begin = 0, int y_count = -1);
 
     /** Change the polynomial level only superficially, be very careful as this should only be used for lower
      * level optimizations.
@@ -157,9 +173,10 @@ class RNSPoly {
     // prescale_log2 (MarkCoeffStaged): host values were encoded ÷2^k to fit the centered-lift
     // bound; after the lift every limb is multiplied back by (2^k mod q_i) — exact integer
     // un-prescale, no scale/level change.
+    // `native`: the source limbs are at native limb width (a storeStaged dump), not u64.
     void loadCoeffExpand(const uint8_t* arena, const std::vector<size_t>& off,
                          const std::vector<size_t>& len, int src_limbs, int target_limbs,
-                         cudaStream_t stream, int prescale_log2 = 0);
+                         cudaStream_t stream, int prescale_log2 = 0, bool native = false);
     void rotateModupDotKSK(RNSPoly& poly, RNSPoly& poly1, const KeySwitchingKey& key);
     void squareModupDotKSK(RNSPoly& c0, RNSPoly& c1, const KeySwitchingKey& key);
     void generatePartialSpecialLimbs();
@@ -180,6 +197,11 @@ class RNSPoly {
     void multNoModdownEnd(RNSPoly& c0, const RNSPoly& bc0, const RNSPoly& bc1, const RNSPoly& in, const RNSPoly& aux);
 
     void binomialMult(RNSPoly& c1, RNSPoly& in, const RNSPoly& d0, const RNSPoly& d1, bool moddown, bool square);
+    /// Lever E1: out-of-place (this, c1, in) = (a0, a1) x (d0, d1); this/c1 are (re)sized to a0's level.
+    void binomialMultFrom(RNSPoly& c1, RNSPoly& in, const RNSPoly& a0, const RNSPoly& a1, const RNSPoly& d0,
+                          const RNSPoly& d1, bool square);
+    /// Lever E2: this = src * P with zeroed special limbs (ModUp form), one pass.
+    void copyScaledByP(const RNSPoly& src);
 
     static void multScalarBatchManyToOne(std::vector<RNSPoly*>& polya,
                                          const std::vector<std::vector<unsigned long int>>& vector,
@@ -195,7 +217,7 @@ class RNSPoly {
 
     static void LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                     const std::vector<RNSPoly*>& pt, int bStep, int gStep, int stride, double usage,
-                                    bool ext);
+                                    bool ext, int part = -1, int limb_begin = 0, int limb_count = -1);
     static void fusedHoistedRotateBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                         const std::vector<RNSPoly*>& ksk_a, const std::vector<RNSPoly*>& ksk_b,
                                         const std::vector<int>& indexes, int stride, double usage, bool c0_modup);

@@ -1,7 +1,9 @@
+#include <new>
 //
 // Created by carlosad on 25/03/24.
 //
 
+#include "NTTconfig.cuh"
 #include <cstdlib>
 #include "AddSub.cuh"
 #include "CKKS/Context.cuh"
@@ -15,7 +17,21 @@ namespace FIDESlib::CKKS {
 
 template <typename T>
 Limb<T>::Limb(Limb<T>&& l) noexcept
-    : cc(l.cc), primeid(l.primeid), stream(l.stream), v(std::move(l.v)), aux(std::move(l.aux)), id(l.id), raw(l.raw) {}
+    : cc(l.cc), primeid(l.primeid), stream(l.stream), v(std::move(l.v)), aux(std::move(l.aux)), auxReleased(l.auxReleased),
+      id(l.id), raw(l.raw) {}
+
+template <typename T>
+void Limb<T>::releaseAux(Stream& s) {
+    if (!auxReleased && aux.release(s))
+        auxReleased = true;
+}
+
+template <typename T>
+void Limb<T>::replaceStorage(VectorGPU<T>&& nv, Stream& s) {
+    v.free(s);
+    v.~VectorGPU<T>();
+    new (&v) VectorGPU<T>(std::move(nv));
+}
 
 template <typename T>
 Limb<T>::~Limb() noexcept {
@@ -411,7 +427,7 @@ template <typename T>
 template <ALGO algo>
 void Limb<T>::INTT() {
     assert(primeid >= 0);
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     if constexpr (1) {
         dim3 blockDim = 1 << ((cc.logN) / 2 - 1);
@@ -434,7 +450,7 @@ void Limb<T>::NTT() {
 
     if constexpr (0) {
         assert(primeid >= 0);
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         constexpr int K = 1;
 
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1)), K};
@@ -454,7 +470,7 @@ void Limb<T>::NTT() {
 
         run_in_graph<false>(exec[primeid], stream, [&]() {
             assert(primeid >= 0);
-            constexpr int M = sizeof(T) == 8 ? 4 : 8;
+            constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1 + (cc.logN > 13 ? 0 : 0)) / 2 - 1))};
             dim3 gridDim{v.size / blockDim.x / 2 / M};
@@ -481,7 +497,7 @@ void Limb<uint64_t>::NTT_rescale_fused(const Limb<uint64_t>& l) {
 
     constexpr ALGO algo = ALGO_SHOUP;
     using T = uint64_t;
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     assert(primeid >= 0);
     assert(l.primeid >= 0);
@@ -536,7 +552,7 @@ void Limb<uint64_t>::NTT_moddown_fused(const LimbImpl& _l) {
 
         constexpr ALGO algo = ALGO_SHOUP;
         using T = uint64_t;
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -562,7 +578,7 @@ void Limb<uint32_t>::NTT_moddown_fused(const LimbImpl& _l) {
         const Limb<T>& l = std::get<U32>(_l);
 
         constexpr ALGO algo = ALGO_SHOUP;
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -594,7 +610,7 @@ void Limb<uint64_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
 
         constexpr ALGO algo = ALGO_SHOUP;
         using T = uint64_t;
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -622,7 +638,7 @@ void Limb<uint32_t>::NTT_multpt_fused(const LimbImpl& _l, const LimbImpl& _pt) {
 
     constexpr ALGO algo = ALGO_SHOUP;
     using T = uint32_t;
-    constexpr int M = sizeof(T) == 8 ? 4 : 8;
+    constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
     assert(primeid >= 0);
     dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -695,7 +711,7 @@ void Limb<uint64_t>::INTT_from(LimbImpl& _l) {
     {
         const Limb<uint64_t>& l = std::get<U64>(_l);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
 
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -720,7 +736,7 @@ void Limb<uint32_t>::INTT_from(LimbImpl& _l) {
     {
         const Limb<T>& l = std::get<U32>(_l);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
         dim3 gridDim{v.size / blockDim.x / 2 / M};
@@ -783,7 +799,7 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
         const Limb<T>& c0 = std::get<U64>(c0_);
         const Limb<T>& c0tilde = std::get<U64>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -812,7 +828,7 @@ void Limb<T>::INTT_from_mult(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& c
         const Limb<T>& c0 = std::get<U32>(c0_);
         const Limb<T>& c0tilde = std::get<U32>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -850,7 +866,7 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
         const Limb<T>& c0 = std::get<U64>(c0_);
         const Limb<T>& c0tilde = std::get<U64>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -879,7 +895,7 @@ void Limb<T>::INTT_from_mult_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbImp
         const Limb<T>& c0 = std::get<U32>(c0_);
         const Limb<T>& c0tilde = std::get<U32>(c0tilde_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -911,7 +927,7 @@ void Limb<T>::NTT_and_ksk_dot(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& 
         const Limb<T>& kska = std::get<U64>(kska_);
         const Limb<T>& kskb = std::get<U64>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -935,7 +951,7 @@ void Limb<T>::NTT_and_ksk_dot(LimbImpl& res0_, LimbImpl& res1_, const LimbImpl& 
         const Limb<T>& kska = std::get<U32>(kska_);
         const Limb<T>& kskb = std::get<U32>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -966,7 +982,7 @@ void Limb<T>::NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbIm
         const Limb<T>& kska = std::get<U64>(kska_);
         const Limb<T>& kskb = std::get<U64>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -990,7 +1006,7 @@ void Limb<T>::NTT_and_ksk_dot_acc(LimbImpl& res0_, LimbImpl& res1_, const LimbIm
         const Limb<T>& kska = std::get<U32>(kska_);
         const Limb<T>& kskb = std::get<U32>(kskb_);
 
-        constexpr int M = sizeof(T) == 8 ? 4 : 8;
+        constexpr int M = sizeof(T) == 8 ? 4 : FIDES_NTT_M32;
         assert(primeid >= 0);
         {
             dim3 blockDim{(uint32_t)(1 << ((cc.logN + 1) / 2 - 1))};
@@ -1035,4 +1051,43 @@ void Limb<T>::automorph(const int index, const int br) {
 
 #undef X
 
+}  // namespace FIDESlib::CKKS
+
+namespace FIDESlib::CKKS {
+namespace {
+struct AuxFix {
+    void* v[MAXP];
+    void* aux[MAXP];
+    uint32_t words[MAXP];
+    int n;
+};
+__global__ void auxNormalizeCopy_(void* const* table, AuxFix f) {
+    const int i = blockIdx.y;
+    if (i >= f.n || f.aux[i] == nullptr || table[i] != f.aux[i])
+        return;
+    uint32_t* dst = static_cast<uint32_t*>(f.v[i]);
+    const uint32_t* src = static_cast<const uint32_t*>(f.aux[i]);
+    for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < f.words[i]; k += (size_t)gridDim.x * blockDim.x)
+        dst[k] = src[k];
+}
+__global__ void auxNormalizeTable_(void** table, AuxFix f) {
+    const int i = threadIdx.x;
+    if (i < f.n && f.aux[i] != nullptr && table[i] == f.aux[i])
+        table[i] = f.v[i];
+}
+}  // namespace
+
+void auxNormalizeAsync(void** table, void* const* v, void* const* aux, const size_t* bytes, int n, cudaStream_t s) {
+    if (n <= 0 || n > MAXP || table == nullptr)
+        return;
+    AuxFix f{};
+    f.n = n;
+    for (int i = 0; i < n; ++i) {
+        f.v[i] = v[i];
+        f.aux[i] = aux[i];
+        f.words[i] = (uint32_t)(bytes[i] / sizeof(uint32_t));
+    }
+    auxNormalizeCopy_<<<dim3(32, n), 256, 0, s>>>(table, f);
+    auxNormalizeTable_<<<1, MAXP, 0, s>>>(table, f);
+}
 }  // namespace FIDESlib::CKKS

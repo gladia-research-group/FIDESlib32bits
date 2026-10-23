@@ -2,11 +2,20 @@
 // Created by carlosad on 7/05/25.
 //
 
+#include "CKKS/BootstrapPrecomputation.cuh"
+#include <iostream>
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/Discard.cuh"
+#include "CKKS/KeySwitchingKey.cuh"
+#include "CKKS/LimbPartition.cuh"
 #include "CKKS/LinearTransform.cuh"
 #include "CKKS/Plaintext.cuh"
 #include "CudaUtils.cuh"
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <cstdlib>
 
 #if defined(__clang__)
 #include <experimental/source_location>
@@ -126,9 +135,76 @@ void MultPtBatch(std::vector<std::shared_ptr<Ciphertext>>& results, Ciphertext& 
 }
 }  // namespace FIDESlib::CKKS
 
+
+namespace FIDESlib::CKKS {
+// FIDESLIB_LT_FUSED_DEBUG=n: for the first n fused stage ends, compare the fused ModDown+rescale against plain ModDown +
+// rescale on a copy: max |coefficient difference| of limb 0 (centered mod q_0) for c0 and c1, plus level and scale.
+int ltFusedDebugEnv() {
+    const char* e = std::getenv("FIDESLIB_LT_FUSED_DEBUG");
+    return e ? std::atoi(e) : 0;
+}
+void ltFusedDebug(Ciphertext& x) {
+    static int seen = 0;
+    if (seen >= ltFusedDebugEnv()) return;
+    ++seen;
+    Context& cc_ = x.cc_;
+    ContextData& cc = x.cc;
+    Ciphertext a(cc_), b(cc_);
+    a.copy(x);
+    b.copy(x);
+    const int lvIn = x.getLevel();
+    const double nfIn = x.NoiseFactor;
+    a.modDown(false);
+    a.rescale();
+    b.modDownRescale();
+    cudaDeviceSynchronize();
+    auto coeffLimb0 = [&](RNSPoly& p) {
+        std::vector<std::vector<uint64_t>> l;
+        RNSPoly t(cc, p.getLevel());
+        t.copy(p);
+        t.INTT(cc.batch, true);
+        cudaDeviceSynchronize();
+        t.store(l);
+        return l;
+    };
+    const uint64_t q0 = cc.prime[0].p;
+    for (int comp = 0; comp < 2; ++comp) {
+        auto la = coeffLimb0(comp == 0 ? a.c0 : a.c1);
+        auto lb = coeffLimb0(comp == 0 ? b.c0 : b.c1);
+        int64_t maxd = 0, maxa = 0;
+        size_t nbig = 0;
+        for (size_t i = 0; i < la[0].size(); ++i) {
+            int64_t d = (int64_t)((la[0][i] + q0 - lb[0][i]) % q0);
+            if (d > (int64_t)(q0 / 2)) d -= (int64_t)q0;
+            int64_t v = (int64_t)la[0][i];
+            if (v > (int64_t)(q0 / 2)) v -= (int64_t)q0;
+            maxd = std::max<int64_t>(maxd, std::llabs(d));
+            maxa = std::max<int64_t>(maxa, std::llabs(v));
+            nbig += std::llabs(d) > 64;
+        }
+        std::cerr << "[lt_fused_dbg] #" << seen << " level " << lvIn << "->" << a.getLevel() << "/" << b.getLevel()
+                  << " NF " << nfIn << "->" << a.NoiseFactor << "/" << b.NoiseFactor << (comp == 0 ? " c0" : " c1")
+                  << ": max|diff| " << maxd << " (coeffs with |diff|>64: " << nbig << "), max|coef mod q0| " << maxa << "\n";
+    }
+}
+
+}  // namespace FIDESlib::CKKS
+using FIDESlib::CKKS::ltFusedDebugEnv;
+using FIDESlib::CKKS::ltFusedDebug;
+bool FIDESlib::CKKS::g_ltFuseAllowed = false;
+static bool ltFusedRescaleEnv() {  // read per call so an in-process A/B can toggle it
+    const char* e = std::getenv("FIDESLIB_LT_FUSED_RESCALE");
+    return !(e && *e) || std::atoi(e) > 0;  // default ON (exact); FIDESLIB_LT_FUSED_RESCALE=0 restores plain ModDown
+}
+static int ltChunkEnv() {
+    const char* e = std::getenv("FIDESLIB_LT_CHUNK");
+    return e ? std::atoi(e) : 0;
+}
+
 void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, const std::vector<Plaintext*>& pts,
                                      int stride, int offset) {
     CudaNvtxRange r(std::string{sc::current().function_name()});
+    const int LT_CHUNK = ltChunkEnv();  // read per call so an in-process A/B can toggle it
     assert(pts.size() >= rowSize);
     for (auto i : pts) {
         assert(i != nullptr);
@@ -154,8 +230,8 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
             std::vector<Ciphertext*> fastRotationPtr;
 
             bool ext = true;
+            std::vector<int> indexes;
             {
-                std::vector<int> indexes;
                 for (int i = 0; i < bStep; ++i) {
                     fastRotationPtr.push_back(&fastRotation[i]);
                     indexes.push_back(i * stride);
@@ -169,12 +245,17 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                     }
                 }
 
-                ctxt.rotate_hoisted(indexes, fastRotationPtr, ext);
+                if (!(ext && LT_CHUNK > 0 && gStep <= 8 && cc.GPUid.size() == 1))
+                    ctxt.rotate_hoisted(indexes, fastRotationPtr, ext);
             }
 
             constexpr bool MODDOWN_HOIST = true;
             constexpr bool ONLY_C1 = true;
             constexpr bool FUSED = true;
+            // FIDESLIB_LT_CHUNK=<limbs>: interleave the hoisted key-switch dot and the LT dot per
+            // limb range so the bStep rotated ciphertexts (Q+P, ~0.5 GB per CtS stage) are read
+            // back from L2 instead of DRAM. 0 (default) = the original two whole-ciphertext passes.
+            const bool chunked = ext && LT_CHUNK > 0 && gStep <= 8 && cc.GPUid.size() == 1;
             if constexpr (FUSED) {
                 assert(rowSize == pts.size());
                 std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
@@ -213,8 +294,53 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                         }
                     }
                 }
-                DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep,
-                                                              MODDOWN_HOIST && ext);
+                if (chunked) {
+                    std::vector<RNSPoly*> cts, ptsp, res;
+                    for (auto& i : fastRotationPtr) {
+                        cts.push_back(&i->c0);
+                        cts.push_back(&i->c1);
+                    }
+                    for (auto& i : results) {
+                        res.push_back(&i->c0);
+                        res.push_back(&i->c1);
+                    }
+                    for (auto& i : Aptr)
+                        ptsp.push_back(i ? &i->c0 : nullptr);
+                    RNSPoly& in = cc.getKeySwitchAux();
+                    Stream& lt_s = fastRotationPtr[0]->c0.GPU[0].s;  // LTdotProductPtBatch launches here
+                    // the index-0 copy + extend ran on fastRotation[0]'s own streams
+                    lt_s.wait(fastRotationPtr[0]->c1.GPU[0].s);
+                    const size_t limb_bytes = (size_t)cc.N * (cc.precom.constants[0].type == 0 ? 4 : 8);
+                    std::vector<void**> rot_tables, rot_special_tables;
+                    for (auto& i : fastRotationPtr)
+                        for (auto* poly : {&i->c0, &i->c1}) {
+                            rot_tables.push_back(poly->GPU[0].limbptr.data);
+                            rot_special_tables.push_back(poly->GPU[0].SPECIALlimbptr.data);
+                        }
+                    ctxt.rotate_hoisted_chunked(indexes, fastRotationPtr, LT_CHUNK, [&](int part, int b, int n) {
+                        results[0]->c0.GPU[0].s.wait(in.GPU[0].s);  // this chunk's rotated limbs are written
+                        RNSPoly::LTdotProductPtBatch(res, cts, ptsp, bStep, gStep, 1, 1.0, true, part, b, n);
+                        // the rotated limbs of this chunk are dead after the dot: drop them from L2
+                        // without the DRAM write-back (the dot ran on lt_s, so this is ordered after it)
+                        discardLimbTables(part == 1 ? rot_special_tables : rot_tables, b, n, limb_bytes, lt_s.ptr());
+                    });
+                    // the dot read every rotated ciphertext on lt_s: order their streams (and
+                    // their scope-end frees) after it
+                    for (auto& i : fastRotationPtr) {
+                        i->c0.GPU[0].s.wait(lt_s);
+                        i->c1.GPU[0].s.wait(lt_s);
+                    }
+                    for (size_t i = 0; i < results.size(); ++i) {
+                        results[i]->multMetadata(*fastRotationPtr[0], *Aptr[i * bStep]);
+                        for (int j = 1; j < bStep; ++j)
+                            if (Aptr[i * bStep + j])
+                                results[i]->slots = std::max({results[i]->slots, fastRotationPtr[j]->slots,
+                                                              Aptr[i * bStep + j]->slots});
+                    }
+                } else {
+                    DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep,
+                                                                  MODDOWN_HOIST && ext);
+                }
 
                 // todo: for correctness, fastRotationPtr ciphertexts should not be modified until this point
 
@@ -251,8 +377,20 @@ void FIDESlib::CKKS::LinearTransform(Ciphertext& ctxt, int rowSize, int bStep, c
                                 results[j]->modDown(false);
                         results[j]->rotate(offset, true);
                     } else {
-                        if (results[j]->c1.isModUp())
-                            results[j]->modDown(false);
+                        if (results[j]->c1.isModUp()) {
+                            // FIDESLIB_LT_FUSED_RESCALE: the stage output is deg-2 and the next stage (or EvalMod)
+                            // rescales it first; fold that rescale into this ModDown (lever A's ModDownRescale2),
+                            // skipping the rescale's INTT + re-expansion NTTs. Approximate like lever A (bits gate).
+                            if (g_ltFuseAllowed && ltFusedRescaleEnv() && results[j]->NoiseLevel == 2 && cc.compositeDegree() == 2 &&
+                                cc.GPUid.size() == 1 && results[j]->c0.isModUp()) {
+                                if (ltFusedDebugEnv()) ltFusedDebug(*results[j]);
+                                results[j]->modDownRescale();
+                                static bool logged = false;
+                                if (!logged) { logged = true; std::cerr << "[lt_fused_rescale] stage-end ModDown+rescale fused\n"; }
+                            } else {
+                                results[j]->modDown(false);
+                            }
+                        }
                     }
                 }
 
@@ -737,6 +875,219 @@ std::vector<int> FIDESlib::CKKS::GetConvolutionTransformRotationIndices(int rowS
 	}
 
 	return res;
+}
+
+namespace FIDESlib::CKKS {
+// key-switch aux of batch member c (c > 0: extra ones kept per context)
+static RNSPoly& batchKsAux(ContextData& cc, int c) {
+    if (c == 0)
+        return cc.getKeySwitchAux();
+    static std::map<ContextData*, std::vector<std::unique_ptr<RNSPoly>>> pool;
+    auto& v = pool[&cc];
+    while ((int)v.size() < c)
+        v.push_back(std::make_unique<RNSPoly>(cc, cc.L, false));
+    RNSPoly& p = *v[c - 1];
+    p.generateDecompAndDigit(false);
+    p.generateSpecialLimbs(false, false);
+    return p;
+}
+
+// rotate_hoisted's fused path on K ciphertexts, rot[c * bStep + i] = rotation indexes[i] of cts[c]; false: none done
+static bool hoistRotateBatch(const std::vector<Ciphertext*>& cts, std::vector<Ciphertext*>& rot,
+                             const std::vector<int>& indexes_, int bStep, bool ext) {
+    const int K = (int)cts.size();
+    Ciphertext& x0 = *cts[0];
+    ContextData& cc = x0.cc;
+    if (!hoistRotateFused || cc.GPUid.size() != 1 || K < 2 || K > 4)
+        return false;
+    for (auto* c : cts)
+        if (c->getLevel() != x0.getLevel() || c->keyID != x0.keyID || c->slots != x0.slots ||
+            c->c0.isModUp() != x0.c0.isModUp())
+            return false;
+    std::vector<int> indexes;
+    for (auto i : indexes_)
+        indexes.push_back(x0.normalyzeIndex(i));
+    std::vector<int> kidx;
+    std::vector<LimbPartition*> ka, kb;
+    for (int i = 0; i < bStep; ++i)
+        if (indexes[i] != 0) {
+            auto& ksk = cc.GetRotationKey(indexes[i], x0.keyID, x0.slots);
+            ka.push_back(&ksk.a.GPU[0]);
+            kb.push_back(&ksk.b.GPU[0]);
+            kidx.push_back(indexes[i] == 2 * cc.N - 1 ? 2 * cc.N - 1 : x0.c0.automorph_index_precomp(indexes[i]));
+        }
+    const int n = (int)kidx.size();
+    std::vector<std::vector<LimbPartition*>> c0p(K), c1p(K);
+    std::vector<LimbPartition*> srcs;
+    std::vector<const LimbPartition*> s0, s1;
+    for (int c = 0; c < K; ++c) {
+        Ciphertext& x = *cts[c];
+        for (int i = 0; i < bStep; ++i) {
+            Ciphertext* r = rot[c * bStep + i];
+            r->growToLevel(cc.L);
+            r->dropToLevel(x.c0.getLevel());
+            if (ext) {
+                r->c0.generateSpecialLimbs(false, false);
+                r->c1.generateSpecialLimbs(false, false);
+            }
+        }
+        RNSPoly& in = batchKsAux(cc, c);
+        in.setLevel(x.c1.getLevel());
+        x.c1.modupInto(in);
+        for (int i = 0; i < bStep; ++i) {
+            Ciphertext* r = rot[c * bStep + i];
+            if (indexes[i] == 0) {
+                if (ext && pwFuseFlag()) {
+                    r->copyExtend(x);
+                } else {
+                    r->copy(x);
+                    if (ext)
+                        r->extend();
+                }
+            } else {
+                r->c0.generateSpecialLimbs(false, false);
+                r->c1.generateSpecialLimbs(false, false);
+                c0p[c].push_back(&r->c0.GPU[0]);
+                c1p[c].push_back(&r->c1.GPU[0]);
+                r->copyMetadata(x);
+            }
+        }
+        srcs.push_back(&in.GPU[0]);
+        s0.push_back(&x.c0.GPU[0]);
+        s1.push_back(&x.c1.GPU[0]);
+    }
+    if (!LimbPartition::fusedHoistRotateK(n, kidx, c0p, c1p, ka, kb, srcs, s0, s1, x0.c0.isModUp())) {
+        cudaDeviceSynchronize();
+        return false;
+    }
+    for (int c = 0; c < K; ++c)
+        for (int i = 0; i < bStep; ++i)
+            if (indexes[i] != 0) {
+                Ciphertext* r = rot[c * bStep + i];
+                r->c0.SetModUp(true);
+                r->c1.SetModUp(true);
+                if (!ext)
+                    r->modDown();
+            }
+    return true;
+}
+}  // namespace FIDESlib::CKKS
+
+void FIDESlib::CKKS::LinearTransformBatch(const std::vector<Ciphertext*>& cts, int rowSize, int bStep,
+                                          const std::vector<Plaintext*>& pts, int stride, int offset) {
+    CudaNvtxRange r(std::string{sc::current().function_name()});
+    const int K = (int)cts.size();
+    Context& cc_ = cts[0]->cc_;
+    ContextData& cc = cts[0]->cc;
+    const uint32_t gStep = ceil(static_cast<double>(rowSize) / bStep);
+    if (K == 1 || K > 4 || ltChunkEnv() > 0 || cc.GPUid.size() != 1 ||
+        !(gStep == 1 || gStep == 2 || gStep == 4 || gStep == 8)) {
+        for (auto* c : cts)
+            LinearTransform(*c, rowSize, bStep, pts, stride, offset);
+        return;
+    }
+    assert(rowSize == (int)pts.size());
+    bool ext = bStep != 1;
+    for (auto& i : pts)
+        if (!i->c0.isModUp())
+            ext = false;
+    std::vector<int> indexes;
+    for (int i = 0; i < bStep; ++i)
+        indexes.push_back(i * stride);
+
+    std::vector<std::vector<Ciphertext>> fastRotation(K);
+    std::vector<Ciphertext*> allRot;
+    for (int c = 0; c < K; ++c) {
+        Ciphertext& ctxt = *cts[c];
+        if (ctxt.NoiseLevel == 2)
+            ctxt.rescale();
+        fastRotation[c].reserve(bStep);
+        for (int i = 0; i < bStep; ++i) {
+            fastRotation[c].emplace_back(cc_);
+            fastRotation[c].back().growToLevel(ctxt.getLevel());
+            fastRotation[c].back().dropToLevel(ctxt.getLevel());
+            fastRotation[c].back().extend(false);
+        }
+        for (int i = 0; i < bStep; ++i)
+            allRot.push_back(&fastRotation[c][i]);
+    }
+    if (!hoistRotateBatch(cts, allRot, indexes, bStep, ext)) {
+        // the key-switch aux is shared: each rotation completes before the next starts
+        for (int c = 0; c < K; ++c) {
+            std::vector<Ciphertext*> ptrs(allRot.begin() + c * bStep, allRot.begin() + (c + 1) * bStep);
+            cts[c]->rotate_hoisted(indexes, ptrs, ext);
+            cudaDeviceSynchronize();
+        }
+    }
+
+    std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
+    for (uint32_t j = 0; j < gStep; ++j)
+        for (int i = 0; i < bStep; ++i)
+            if (bStep * (int)j + i < rowSize)
+                Aptr[bStep * j + i] = pts[bStep * j + i];
+    std::vector<Plaintext*> AptrK;
+    for (int c = 0; c < K; ++c)
+        AptrK.insert(AptrK.end(), Aptr.begin(), Aptr.end());
+
+    std::vector<std::shared_ptr<Ciphertext>> results;
+    for (int c = 0; c < K; ++c)
+        for (uint32_t g = 0; g < gStep; ++g) {
+            results.emplace_back(std::make_shared<Ciphertext>(cc_));
+            results.back()->growToLevel(cts[c]->getLevel());
+            results.back()->dropToLevel(cts[c]->getLevel());
+            results.back()->extend(false);
+        }
+    Stream& hub = results[0]->c0.GPU[0].s;
+    for (auto& i : results) {
+        hub.wait(i->c0.GPU[0].s);
+        hub.wait(i->c1.GPU[0].s);
+    }
+    for (auto* i : allRot) {
+        hub.wait(i->c0.GPU[0].s);
+        hub.wait(i->c1.GPU[0].s);
+    }
+    {
+        LtShareScope share(K);
+        DotProductPtInternal<Ciphertext*, Plaintext*>(results, allRot, AptrK, bStep, 1, gStep, ext);
+    }
+    for (auto& i : results) {
+        i->c0.GPU[0].s.wait(hub);
+        i->c1.GPU[0].s.wait(hub);
+    }
+    for (auto* i : allRot) {
+        i->c0.GPU[0].s.wait(hub);
+        i->c1.GPU[0].s.wait(hub);
+    }
+
+    for (int c = 0; c < K; ++c) {
+        std::vector<std::shared_ptr<Ciphertext>> res(results.begin() + c * gStep, results.begin() + (c + 1) * gStep);
+        for (uint32_t j = gStep - 1; j < gStep; --j) {
+            if (j != gStep - 1) {
+                if (res[j + 1]->c1.isModUp())
+                    res[j]->extend();
+                res[j]->add(*res[j + 1]);
+                res.pop_back();
+            }
+            if (j > 0) {
+                if ((bStep * stride) % (cc.N / 2) != 0) {
+                    if (res[j]->c1.isModUp())
+                        res[j]->c1.moddown(true, false);
+                    res[j]->rotate((int)bStep * stride, false);
+                }
+            } else if (offset != 0) {
+                if (res[j]->c1.isModUp())
+                    res[j]->c1.moddown(true, false);
+                res[j]->rotate(offset, true);
+            } else if (res[j]->c1.isModUp()) {
+                if (g_ltFuseAllowed && ltFusedRescaleEnv() && res[j]->NoiseLevel == 2 && cc.compositeDegree() == 2 &&
+                    res[j]->c0.isModUp())
+                    res[j]->modDownRescale();
+                else
+                    res[j]->modDown(false);
+            }
+        }
+        cts[c]->takeFrom(*res[0]);
+    }
 }
 
 namespace FIDESlib::CKKS {
@@ -1240,4 +1591,107 @@ void FIDESlib::CKKS::LinearTransformSpecialPt(FIDESlib::CKKS::Ciphertext& ctxt1,
     }
 
     ctxt1.copy(result);
+}
+
+
+// Triple-hoisted BSGS (Akherati & Zhang, arXiv 2605.17222) price gate: the baby step i = i1 + b1*i2 is split into two
+// hoisted layers — rot_{i1}(ct) for i1 < b1 (one decompose of ct, b1-1 keys, moddown), then rot_{b1*i2} of each of those
+// (one decompose per i1, b2-1 SHARED keys) — so only (b1-1)+(b2-1) distinct baby keys are streamed per stage. Same key
+// switch count as the shipped hoisted step, plus b1-1 decomposes and moddowns. Without a fused multi-input key-dot the
+// shared keys are re-streamed per i1; this measures the extra-pass cost. Giant step and dot are the shipped ones.
+void FIDESlib::CKKS::LinearTransformTH(Ciphertext& ctxt, int rowSize, int bStep, int b1, const std::vector<Plaintext*>& pts,
+                                       int stride, int offset) {
+    CudaNvtxRange r(std::string{sc::current().function_name()});
+    Context& cc_ = ctxt.cc_;
+    ContextData& cc = ctxt.cc;
+    if (bStep % b1 != 0)
+        throw std::runtime_error("LinearTransformTH: b1 must divide bStep");
+    const int b2 = bStep / b1;
+    const uint32_t gStep = ceil(static_cast<double>(rowSize) / bStep);
+    if (ctxt.NoiseLevel == 2)
+        ctxt.rescale();
+    // layer 1: R1[i1] = rot_{i1 * stride}(ct), moddowned
+    std::vector<Ciphertext> R1;
+    R1.reserve(b1);
+    std::vector<Ciphertext*> R1p;
+    std::vector<int> idx1;
+    for (int i = 0; i < b1; ++i) {
+        R1.emplace_back(cc_);
+        R1.back().growToLevel(ctxt.getLevel());
+        R1.back().dropToLevel(ctxt.getLevel());
+        R1p.push_back(&R1.back());
+        idx1.push_back(i * stride);
+    }
+    ctxt.rotate_hoisted(idx1, R1p, false);
+    // layer 2: F[i1 + b1*i2] = rot_{b1*i2*stride}(R1[i1]), left in Q+P for the hoisted dot
+    std::vector<Ciphertext> F;
+    F.reserve(bStep);
+    for (int i = 0; i < bStep; ++i) {
+        F.emplace_back(cc_);
+        F.back().growToLevel(ctxt.getLevel());
+        F.back().dropToLevel(ctxt.getLevel());
+        F.back().extend(false);
+    }
+    std::vector<int> idx2;
+    for (int i2 = 0; i2 < b2; ++i2)
+        idx2.push_back(b1 * i2 * stride);
+    for (int i1 = 0; i1 < b1; ++i1) {
+        std::vector<Ciphertext*> out;
+        for (int i2 = 0; i2 < b2; ++i2)
+            out.push_back(&F[i1 + b1 * i2]);
+        R1[i1].rotate_hoisted(idx2, out, true);
+    }
+    std::vector<Ciphertext*> fastRotationPtr;
+    for (auto& f : F)
+        fastRotationPtr.push_back(&f);
+    std::vector<Plaintext*> Aptr(bStep * gStep, nullptr);
+    for (uint32_t j = 0; j < gStep; ++j)
+        for (int i = 0; i < bStep; ++i)
+            if (bStep * (int)j + i < rowSize)
+                Aptr[bStep * j + i] = pts[bStep * j + i];
+    std::vector<std::shared_ptr<Ciphertext>> results;
+    for (uint32_t i = 0; i < gStep; ++i) {
+        results.emplace_back(std::make_shared<Ciphertext>(cc_));
+        results.back()->growToLevel(ctxt.getLevel());
+        results.back()->dropToLevel(ctxt.getLevel());
+        results.back()->extend(false);
+    }
+    for (auto& i : results)
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+            results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+        }
+    for (auto& i : fastRotationPtr)
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            results[0]->c0.GPU[j].s.wait(i->c0.GPU[j].s);
+            results[0]->c0.GPU[j].s.wait(i->c1.GPU[j].s);
+        }
+    DotProductPtInternal<Ciphertext*, Plaintext*>(results, fastRotationPtr, Aptr, bStep, 1, gStep, true);
+    for (auto& i : results)
+        for (size_t j = 0; j < i->c0.GPU.size(); ++j) {
+            i->c0.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+            i->c1.GPU[j].s.wait(results[0]->c0.GPU[j].s);
+        }
+    for (uint32_t j = gStep - 1; j < gStep; --j) {
+        if (j != gStep - 1) {
+            if (results[j + 1]->c1.isModUp())
+                results[j]->extend();
+            results[j]->add(*results[j + 1]);
+            results.pop_back();
+        }
+        if (j > 0) {
+            if ((bStep * stride) % (cc.N / 2) != 0) {
+                if (results[j]->c1.isModUp())
+                    results[j]->c1.moddown(true, false);
+                results[j]->rotate((int)bStep * stride, false);
+            }
+        } else if (offset != 0) {
+            if (results[j]->c1.isModUp())
+                results[j]->c1.moddown(true, false);
+            results[j]->rotate(offset, true);
+        } else if (results[j]->c1.isModUp()) {
+            results[j]->modDown(false);
+        }
+    }
+    ctxt.takeFrom(*results[0]);
 }

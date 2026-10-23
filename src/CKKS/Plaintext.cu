@@ -1,3 +1,4 @@
+#include <stdexcept>
 //
 // Created by carlosad on 25/04/24.
 //
@@ -58,6 +59,14 @@ Plaintext::Plaintext(Context& cc)
     CudaNvtxStop();
 }
 
+Plaintext::Plaintext(Context& cc, bool def_stream)
+    : my_range(loc, LIFETIME),
+      cc_((assert(cc != nullptr), CudaNvtxStart(std::string{sc::current().function_name()}.substr()), cc)),
+      cc(*cc_),
+      c0(this->cc, -1, false, def_stream) {
+    CudaNvtxStop();
+}
+
 Plaintext::Plaintext(Context& cc, const RawPlainText& raw)
     : my_range(loc, LIFETIME),
       cc_((assert(cc != nullptr), CudaNvtxStart(std::string{sc::current().function_name()}.substr()), cc)),
@@ -113,10 +122,10 @@ void Plaintext::loadStaged(const RawPlainText& meta, const uint8_t* arena_base,
 void Plaintext::loadCoeffExpand(const RawPlainText& meta, const uint8_t* arena,
                                 const std::vector<size_t>& off, const std::vector<size_t>& len,
                                 int src_limbs, int target_limbs, cudaStream_t stream,
-                                int prescale_log2) {
+                                int prescale_log2, bool native) {
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
-    c0.loadCoeffExpand(arena, off, len, src_limbs, target_limbs, stream, prescale_log2);
+    c0.loadCoeffExpand(arena, off, len, src_limbs, target_limbs, stream, prescale_log2, native);
 
     NoiseFactor = meta.Noise;   // the TARGET level's scaling factor (set by the encoder)
     NoiseLevel = meta.NoiseLevel;
@@ -141,12 +150,18 @@ void Plaintext::store(RawPlainText& raw) {
 }
 
 void Plaintext::moddown() {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
     c0.moddown(true, true);
 }
 
 bool Plaintext::adjustPlaintextToCiphertext(const Plaintext& p, const Ciphertext& c) {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
     constexpr bool PRINT = false;
@@ -263,12 +278,18 @@ bool Plaintext::adjustPlaintextToCiphertext(const Plaintext& p, const Ciphertext
     return false;
 }
 void Plaintext::copy(const Plaintext& p) {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
     this->c0.copy(p.c0);
     this->copyMetadata(p);
 }
 void Plaintext::multScalar(double c, bool rescale) {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
     if (cc.rescaleTechnique == RESCALE_TECHNIQUE::FLEXIBLEAUTO ||
@@ -324,6 +345,9 @@ void Plaintext::rotate_hoisted(const std::vector<int>& indexes, std::vector<Plai
 
 #if 1
 void Plaintext::multPt(const Plaintext& b, bool rescale) {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
 
     if (cc.rescaleTechnique == FIXEDAUTO || cc.rescaleTechnique == FLEXIBLEAUTO ||
@@ -361,6 +385,9 @@ void Plaintext::multPt(const Plaintext& b, bool rescale) {
 }
 
 void Plaintext::addPt(const Plaintext& c) {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
 
     // assert(NoiseLevel == b.NoiseLevel);
@@ -370,6 +397,9 @@ void Plaintext::addPt(const Plaintext& c) {
 #endif
 
 void Plaintext::rescale() {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
 
@@ -390,6 +420,9 @@ void Plaintext::rescale() {
 }
 
 void Plaintext::automorph(const int index) {
+    if (c0.auxReleased())
+        throw std::runtime_error("Plaintext: mutating a read-only plaintext (its scratch was released)");
+
     CudaNvtxRange r(std::string{sc::current().function_name()}.substr());
     CKKS::SetCurrentContext(cc_);
     /*

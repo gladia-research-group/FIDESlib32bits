@@ -2,6 +2,14 @@
 // Created by carlosad on 12/11/24.
 //
 
+#include <immintrin.h>
+#include <atomic>
+#include "CKKS/Lockstep.cuh"
+#include <exception>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include "CKKS/Discard.cuh"  // fusedRescaleFlag (lever A)
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
@@ -81,7 +89,56 @@ static void applyArcsineCorrection(Ciphertext& y) {
 	(void)logged;
 }
 
-void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey, uint64_t post) {
+// ---- FIDESLIB_EVALMOD_LOCKSTEP (CKKS/Lockstep.cuh) -------------------------------------------------------------------
+namespace {
+struct Lockstep {
+	// spin handoff: a condition-variable wake costs ~20 us per turn (52 turns per bootstrap), more than the L2 gain
+	std::atomic<int> turn{0};  // 0 = the Re thread may issue, 1 = the Im thread
+	std::atomic<bool> done[2] = {false, false};
+	void pass(int to) { turn.store(to, std::memory_order_release); }
+	void wait(int me) {
+		while (turn.load(std::memory_order_acquire) != me && !done[1 - me].load(std::memory_order_acquire))
+			_mm_pause();
+	}
+	void finish(int me) {
+		done[me].store(true, std::memory_order_release);
+		turn.store(1 - me, std::memory_order_release);
+	}
+};
+thread_local Lockstep* tlLock = nullptr;
+thread_local int tlSide = 0;
+bool lockstepEnabled() {  // read per call: a test toggles it in-process for the bit-exact gate
+	const char* e = std::getenv("FIDESLIB_EVALMOD_LOCKSTEP");
+	return e && std::atoi(e) > 0;
+}
+}  // namespace
+namespace {
+thread_local int tlDepth = 0;  // nested relinearizing ops (mult -> adjust -> mult) count once
+}
+FIDESlib::CKKS::LockstepGuard::LockstepGuard() {
+	if (tlDepth++ == 0)
+		lockstepBeforeKeySwitch();
+}
+FIDESlib::CKKS::LockstepGuard::~LockstepGuard() {
+	if (--tlDepth == 0)
+		lockstepAfterKeySwitch();
+}
+// Re thread: hand the turn to Im before each key switch and wait until Im has issued the same one.
+void FIDESlib::CKKS::lockstepBeforeKeySwitch() {
+	if (tlLock && tlSide == 0) {
+		tlLock->pass(1);
+		tlLock->wait(0);
+	}
+}
+// Im thread: right after issuing a key switch, hand the turn back so Re issues the same key switch next.
+void FIDESlib::CKKS::lockstepAfterKeySwitch() {
+	if (tlLock && tlSide == 1) {
+		tlLock->pass(0);
+		tlLock->wait(1);
+	}
+}
+
+void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEncI, const KeySwitchingKey& keySwitchingKey, uint64_t post, bool evalRound) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 
 	// cudaDeviceSynchronize();
@@ -93,6 +150,48 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 
 	emStageProbe("EM-in-Re", ctxtEnc);
 	emStageProbe("EM-in-Im", ctxtEncI);
+	// EvalRound: each half becomes K*x - EvalMod(x), the integer part ((1/2pi) sin(2pi K x) has gain K at the integers)
+	std::unique_ptr<Ciphertext> erRe, erIm;
+	if (evalRound) {
+		erRe = std::make_unique<Ciphertext>(ctxtEnc.cc_);
+		erRe->copy(ctxtEnc);
+		erIm = std::make_unique<Ciphertext>(ctxtEnc.cc_);
+		erIm->copy(ctxtEncI);
+	}
+	if (COMPLEX && lockstepEnabled() && !FIDESlib::CKKS::g_btsStageStash && !tlLock) {
+		// both halves (Chebyshev + double angle) in lockstep; identical op sequences, so the key switches pair up
+		Lockstep L;
+		const int dev = ctxtEnc.c0.GPU.at(0).device;
+		std::exception_ptr err;
+		// FIDESLIB_EVALMOD_LANES=1: the Im chain's key switches in lane 1's workspaces, so the two chains overlap on the GPU
+		static const bool lanes = [] { const char* e = std::getenv("FIDESLIB_EVALMOD_LANES"); return e && std::atoi(e) > 0; }();
+		std::thread im([&] {
+			cudaSetDevice(dev);
+			if (lanes)
+				ContextData::ksLane() = 1;
+			tlLock = &L;
+			tlSide = 1;
+			L.wait(1);
+			try {
+				evalChebyshevSeries(ctxtEncI, cc.GetCoeffsChebyshev(), -1.0, 1.0);
+				applyDoubleAngleIterations(ctxtEncI, cc.GetDoubleAngleIts(), keySwitchingKey);
+			} catch (...) {
+				err = std::current_exception();
+			}
+			tlLock = nullptr;
+			L.finish(1);
+		});
+		tlLock = &L;
+		tlSide = 0;
+		evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), -1.0, 1.0);
+		applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+		tlLock = nullptr;
+		L.finish(0);
+		im.join();
+		if (err)
+			std::rethrow_exception(err);
+		goto after_da;
+	}
 	if constexpr (COMPLEX)
 		evalChebyshevSeries(ctxtEncI, cc.GetCoeffsChebyshev(), -1.0, 1.0);
 	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), -1.0, 1.0);
@@ -117,8 +216,18 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
 	if constexpr (COMPLEX)
 		applyDoubleAngleIterations(ctxtEncI, cc.GetDoubleAngleIts(), keySwitchingKey);
+after_da:
 	emStageProbe("EM-DA-Re", ctxtEnc);
 	emStageProbe("EM-DA-Im", ctxtEncI);
+	if (evalRound) {
+		const uint64_t K = (uint64_t)cc.GetBootK();
+		multIntScalar(*erRe, K);
+		multIntScalar(*erIm, K);
+		erRe->sub(ctxtEnc);  // erRe (higher level) is adjusted down to EvalMod's
+		erIm->sub(ctxtEncI);
+		ctxtEnc.copy(*erRe);
+		ctxtEncI.copy(*erIm);
+	}
 	if (!sparseArcsineMode() && arcsineEnabled()) {
 		applyArcsineCorrection(ctxtEnc);
 		if constexpr (COMPLEX)
@@ -165,13 +274,31 @@ void FIDESlib::CKKS::approxModReduction(Ciphertext& ctxtEnc, Ciphertext& ctxtEnc
 	}
 }
 
+void FIDESlib::CKKS::approxModReductionReal(Ciphertext& ctxtEnc, const KeySwitchingKey& keySwitchingKey, uint64_t post) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() });
+	ContextData& cc = ctxtEnc.cc;
+	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), -1.0, 1.0);
+	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+	if (!sparseArcsineMode() && arcsineEnabled())
+		applyArcsineCorrection(ctxtEnc);
+	if (post != 1)
+		multIntScalar(ctxtEnc, post);
+	if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
+		ctxtEnc.rescale();
+}
+
 void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post) {
+	approxModReductionSparse(ctxtEnc, post, ctxtEnc.cc.GetCoeffsChebyshev(), ctxtEnc.cc.GetDoubleAngleIts());
+}
+
+void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post, std::vector<double>& coefficients,
+                                               int daIts) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() });
 	ContextData& cc = ctxtEnc.cc;
 
 	KeySwitchingKey& keySwitchingKey = cc.GetEvalKey(ctxtEnc.keyID);
 
-	evalChebyshevSeries(ctxtEnc, cc.GetCoeffsChebyshev(), (double)-1.0, (double)1.0);
+	evalChebyshevSeries(ctxtEnc, coefficients, (double)-1.0, (double)1.0);
 
 	if constexpr (PRINT) {
 		std::cout << "ctxtEnc res " << ctxtEnc.getLevel() << " " << ctxtEnc.NoiseLevel << std::endl;
@@ -181,7 +308,7 @@ void FIDESlib::CKKS::approxModReductionSparse(Ciphertext& ctxtEnc, uint64_t post
 		}
 		std::cout << std::endl;
 	}
-	applyDoubleAngleIterations(ctxtEnc, cc.GetDoubleAngleIts(), keySwitchingKey);
+	applyDoubleAngleIterations(ctxtEnc, daIts, keySwitchingKey);
 	// dual-slots mode: this precomp carries the +3 reservation — the
 	// correction MUST run unconditionally (reserve-without-consume is fatal)
 	if (sparseArcsineMode() || arcsineEnabled())
@@ -219,6 +346,19 @@ void FIDESlib::CKKS::multIntScalar(Ciphertext& ctxt, uint64_t op) {
 	ctxt.c1.multScalar(op_);
 }
 
+// FIDESLIB_LAZY_PS (default on; 0 = eager relinearization) (lazy-BSGS Paterson-Stockmeyer, Lee et al. EUROCRYPT 2022): the top-level product cu*qu and the
+// last product of T_{k(2^m-1)} only feed the final sum, so both are accumulated as tensors and relinearized ONCE (one
+// key switch less per series). Taken only when both products land at the seed's level and scale; otherwise eager.
+struct LazyTop {
+	Ciphertext* cu = nullptr;  // (T2[m-1] + cu), the left factor
+	Ciphertext* qu = nullptr;
+	Ciphertext* su = nullptr;
+};
+static bool lazyPsOn() {
+	static const bool v = [] { const char* e = std::getenv("FIDESLIB_LAZY_PS"); return !e || std::atoi(e) > 0; }();   // default on
+	return v;
+}
+
 void innerEvalChebyshevPS(const Ciphertext& ctxt,
   Ciphertext& out,
   const std::vector<double>& coefficients,
@@ -227,7 +367,8 @@ void innerEvalChebyshevPS(const Ciphertext& ctxt,
   const std::vector<Ciphertext*>& T,
   const std::vector<Ciphertext*>& T2,
   int level_offset = 0,
-  int max_m		   = 1000) {
+  int max_m		   = 1000,
+  LazyTop* lazy	   = nullptr) {
 	FIDESlib::CudaNvtxRange r(std::string{ sc::current().function_name() });
 	/*
 Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DCRTPoly> x,
@@ -454,6 +595,13 @@ Ciphertext<DCRTPoly> AdvancedSHECKKSRNS::InnerEvalChebyshevPS(ConstCiphertext<DC
 		}
 		if (cc.rescaleTechnique == FIXEDMANUAL && out.NoiseLevel == 2)
 			cu.rescale();
+		if (lazy && level_offset == 0 && m == (uint32_t)max_m && &cu == &out) {
+			// hand the factors back: the caller sums cu*qu with T_{k(2^m-1)}'s last product under one key switch
+			lazy->qu = new Ciphertext(std::move(qu));
+			lazy->su = new Ciphertext(std::move(su));
+			lazy->cu = &cu;
+			return;
+		}
 		cu.mult(qu, false);
 		cu.add(su); // cu aliases out
 	}
@@ -577,10 +725,10 @@ const std::vector<double>& coefficients, double a, double b) const {
 			// compute T_{2i+1}(y) = 2*T_i(y)*T_{i+1}(y) - y
 			T[i / 2]->adjustForMult(*T[i / 2 - 1]);
 			T[i / 2 - 1]->adjustForMult(*T[i / 2]);
-			T[i - 1]->mult(*T[i / 2 - 1], *T[i / 2], false);
+			T[i - 1]->mult(*T[i / 2 - 1], *T[i / 2], fusedRescaleFlag() != 0);
 			T[i - 1]->add(*T[i - 1]);
 			ctxt.adjustForAddOrSub(*T[i - 1]);
-			if (ctxt.NoiseLevel == 1)
+			if (ctxt.NoiseLevel == 1 && T[i - 1]->NoiseLevel == 2)
 				T[i - 1]->rescale();
 			T[i - 1]->sub(ctxt);
 			// if (ctxt.NoiseLevel == 2)
@@ -589,7 +737,7 @@ const std::vector<double>& coefficients, double a, double b) const {
 			// i is even
 			// compute T_{2i}(y) = 2*T_i(y)^2 - 1
 			T[i / 2 - 1]->adjustForMult(*T[i / 2 - 1]);
-			T[i - 1]->square(*T[i / 2 - 1], false);
+			T[i - 1]->square(*T[i / 2 - 1], fusedRescaleFlag() != 0);
 			T[i - 1]->add(*T[i - 1]);
 			T[i - 1]->addScalar(-1.0);
 			// T[i - 1]->rescale();
@@ -691,7 +839,7 @@ const std::vector<double>& coefficients, double a, double b) const {
 	for (uint32_t i = 1; i < m; i++) {
 		if (cc.rescaleTechnique == FIXEDMANUAL && T2[i - 1]->NoiseLevel == 2)
 			T2[i - 1]->rescale();
-		T2[i]->square(*T2[i - 1], false);
+		T2[i]->square(*T2[i - 1], fusedRescaleFlag() != 0);
 		T2[i]->add(*T2[i]);
 		T2[i]->addScalar(-1.0);
 
@@ -739,16 +887,19 @@ const std::vector<double>& coefficients, double a, double b) const {
 		// }
 	}
 
+	const bool lazy = lazyPsOn() && m >= 2;
 	for (uint32_t i = 1; i < m; i++) {
 		// compute T_{k(2*m - 1)} = 2*T_{k(2^{m-1}-1)}(y)*T_{k*2^{m-1}}(y) - T_k(y)
-		T2km1.mult(*T2[i], false);
+		if (lazy && i == m - 1)
+			break;   // its last product joins the final sum (FIDESLIB_LAZY_PS)
+		T2km1.mult(*T2[i], fusedRescaleFlag() != 0);
 		T2km1.add(T2km1);
 		// T2km1.rescale();
 		T2[0]->adjustForAddOrSub(T2km1);
-		if (T2[0]->NoiseLevel == 1)
+		if (T2[0]->NoiseLevel == 1 && T2km1.NoiseLevel == 2)
 			T2km1.rescale();
 		T2km1.sub(*T2[0]);
-		if (T2[0]->NoiseLevel == 2 && i < m - 1)
+		if (T2[0]->NoiseLevel == 2 && i < m - 1 && T2km1.NoiseLevel == 2)
 			T2km1.rescale();
 
 		if constexpr (sync)
@@ -778,13 +929,52 @@ const std::vector<double>& coefficients, double a, double b) const {
 	//  cc->LevelReduceInPlace(T2.front(), nullptr);
 	*/
 
-	if constexpr (true) {
-		Ciphertext out(cc_);
+	if (lazy) {
+		LazyTop lz;
+		innerEvalChebyshevPS(ctxt, ctxt, f2, k, m, T, T2, 0, m, &lz);
+		std::unique_ptr<Ciphertext> quP(lz.qu), suP(lz.su);
+		bool done = false;
+		if (lz.cu == &ctxt && quP && suP) {
+			// -2 X exactly (modular subtractions only), X = T_{k(2^{m-1}-1)}
+			Ciphertext negX2(cc_);
+			negX2.copy(T2km1);
+			negX2.sub(T2km1);
+			negX2.sub(T2km1);
+			negX2.sub(T2km1);
+			Ciphertext acc(cc_);
+			acc.copy(*suP);   // seed: su sits at the products' level and scale
+			if (acc.multAccumulateChecked({&ctxt, &negX2}, {quP.get(), T2[m - 1]})) {
+				// + T_k (the "- T_k" of T_{k(2^m-1)}, subtracted): same alignment as the eager path
+				T2[0]->adjustForAddOrSub(acc);
+				if (T2[0]->NoiseLevel == 1 && acc.NoiseLevel == 2)
+					acc.rescale();
+				acc.add(*T2[0]);
+				ctxt.copy(acc);
+				done = true;
+			}
+		}
+		if (!done) {   // eager fallback: finish both products the shipped way
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				std::cerr << "[lazy_ps] products not aligned: eager fallback\n";
+			}
+			if (lz.cu == &ctxt && quP && suP) {
+				ctxt.mult(*quP, false);
+				ctxt.add(*suP);
+			}
+			T2km1.mult(*T2[m - 1], fusedRescaleFlag() != 0);
+			T2km1.add(T2km1);
+			T2[0]->adjustForAddOrSub(T2km1);
+			if (T2[0]->NoiseLevel == 1 && T2km1.NoiseLevel == 2)
+				T2km1.rescale();
+			T2km1.sub(*T2[0]);
+			ctxt.sub(T2km1);
+		}
+	} else {
 		innerEvalChebyshevPS(ctxt, ctxt, f2, k, m, T, T2, 0, m);
-		// ctxt.copy(out);
+		ctxt.sub(T2km1);
 	}
-
-	ctxt.sub(T2km1);
 	/*
 
 	Ciphertext<DCRTPoly> result;
@@ -855,7 +1045,8 @@ void applyDoubleAngleIterations(Ciphertext& ctxt, int its, const KeySwitchingKey
 	for (int32_t j = 1; j < r + 1; j++) {
 		if (cc.rescaleTechnique == FIDESlib::CKKS::FIXEDMANUAL)
 			ctxt.rescale();
-		ctxt.square(false);
+		// the last square stays unfused: EvalMod's output keeps its pending rescale (deg 2), as planned
+		ctxt.square(fusedRescaleFlag() != 0 && j < r);
 		if (FIDESlib::CKKS::g_btsStageStash) {
 			cudaDeviceSynchronize();
 			auto c = std::make_shared<FIDESlib::CKKS::Ciphertext>(ctxt.cc_);

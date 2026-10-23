@@ -3,6 +3,7 @@
 #define __RAW_CIPHER_TEXT__
 
 #include <cinttypes>
+#include <functional>
 #include <vector>
 #include "CKKS/forwardDefs.cuh"
 //#include "CKKS/BootstrapPrecomputation.cuh"
@@ -99,6 +100,9 @@ struct RawKeySwitchKey {
     // (unpatched OpenFHE / OPENFHE_KSKA_SEED=0 / threshold HE) — consumers must fall back
     // to the dense `a`.
     std::vector<uint32_t> a_seed;
+    // A seeded key's `a` is left unconverted (a single GPU regenerates it from the seed); readers that do need
+    // the dense `a` call this first when r_key[0] is empty.
+    std::function<void(RawKeySwitchKey&)> fill_a;
 };
 
 std::vector<std::vector<uint64_t>> GetRawArray(const std::vector<lbcrypto::PolyImpl<lbcrypto::NativeVector>>& polys);
@@ -147,8 +151,25 @@ void AddBootstrapPlaintexts(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int 
                             FIDESlib::CKKS::BootstrapPrecomputation& result);
 
 /** Used in GenBootstrapKeys and AddBootstrapKeys */
+/** Per-site level-aware ModRaise: build the route's precomputation variant for a raise stopping `drop` composite
+ *  levels below the top (base.raise_variants[drop]; base must exist, drop > base.raise_drop). */
+void AddBootstrapRaiseVariant(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
+                              FIDESlib::CKKS::Context& GPUcc_, int drop);
+
 std::vector<int> GetBootstrapIndexes(lbcrypto::CryptoContext<lbcrypto::DCRTPoly> cc, int slots,
                                      FIDESlib::CKKS::BootstrapPrecomputation* result_);
+
+/** FIDESLIB_STC_ALT_BUDGET=k (default 0 = off): EvalBootstrapSetup also builds the dense route's OpenFHE precomputation
+ *  at StC level budget k and parks it here (slots -> precom); AddBootstrapPrecomputation turns it into the staged
+ *  StC-first input's alternative stages and GetBootstrapIndexes adds its rotations to the route's keys. */
+int stcAltBudget();
+std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& stcAltPrecoms();
+/** FIDESLIB_CTS_ALT_BUDGET=k (default 0 = off): EvalBootstrapSetup also builds the dense route's OpenFHE precomputation
+ *  at CtS level budget k (one stage more than the shipped) and parks it here; AddBootstrapPrecomputation keeps its CtS
+ *  stages (CtS_alt) and a raise variant of drop >= 1 takes them raising one composite level higher (drop - 1): same
+ *  landing, cheaper stages. GetBootstrapIndexes adds its rotations to the route's keys. */
+int ctsAltBudget();
+std::map<int, std::shared_ptr<lbcrypto::CKKSBootstrapPrecom>>& ctsAltPrecoms();
 
 /** Server-side bootstrap setup */
 void AddBootstrapPrecomputation(const lbcrypto::PublicKey<lbcrypto::DCRTPoly>& publicKey, int slots,

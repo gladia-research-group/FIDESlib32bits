@@ -47,6 +47,16 @@ class VectorGPU {
     VectorGPU(T* data, const int size, const int device, const int offset = 0);
     VectorGPU(Stream& stream, const int size, const int device, const T* src = nullptr, const int alloc_size = 0);
     void free(Stream& stream);
+    /** free() a managed buffer for good: unmanaged and null afterwards, so the destructor's free() is a no-op.
+     *  Returns whether anything was freed. */
+    bool release(Stream& stream) {
+        if (!managed || freeing || data == nullptr)
+            return false;
+        free(stream);
+        managed = false;
+        data = nullptr;
+        return true;
+    }
     ~VectorGPU();
 };
 
