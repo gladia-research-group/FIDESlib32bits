@@ -19,8 +19,9 @@ add 33 / 29, mult ct×pt 72 / 49, mult ct×ct 203 / 243, rotate 214 / 245, boots
 28770 / 36690, sparse-512 18590 / 23590, sparse-1 16100 / 19950.
 
 The 32-bit OpenFHE this fork builds against is a fixed upstream commit plus the patch series
-kept in the Perseus repository (`third_party/openfhe-n32/patches`); Perseus's
-`scripts/install_deps.sh` builds both. The `deps/` patches here are the 64-bit path.
+in `deps/openfhe-n32` (a copy of Perseus's `third_party/openfhe-n32/patches`);
+`docker/build-fherma.sh` builds it and this library into one prefix, as does Perseus's
+`scripts/install_deps.sh`. The `deps/openfhe-1.4.2*.patch` files are the 64-bit path.
 
 ## Citation
 
@@ -113,6 +114,11 @@ Check examples for projects that use FIDESlib.
 ## Docker
 
 Check docker directory to obtain instructions on running FIDESlib inside a Docker environment.
+
+`docker/Dockerfile.fherma` is the 32-bit stack as an image for [FHERMA](https://fherma.io):
+OpenFHE (`NATIVE_SIZE=32`) and FIDESlib32bits under `/opt/fherma`, CUDA 12.9, compiled for
+sm_89 and sm_120. The `fherma-image` workflow builds it on a `v*` tag and pushes it to
+`ghcr.io/gladia-research-group/fideslib32bits`.
 
 ## Credits
 
