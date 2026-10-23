@@ -30,5 +30,13 @@ __global__ void ModDown2(void** __restrict__ a, const __grid_constant__ int n, v
 template <ALGO algo = ALGO_SHOUP>
 __global__ void DecompAndModUpConv(void** __restrict__ a, const int __grid_constant__ n, void** __restrict__ b,
                                    const int __grid_constant__ d, const Global::Globals* Globals);
+__global__ void ModDownRescale2(void** __restrict__ out, const __grid_constant__ int n, void** __restrict__ spec,
+                                void** __restrict__ tops, const __grid_constant__ int top,
+                                const __grid_constant__ int primeid_init, const Global::Globals* Globals);
+
+template <ALGO algo = ALGO_SHOUP>
+__global__ void DecompAndModUpConvMulti(void*** __restrict__ atabs, const int __grid_constant__ n,
+                                        void*** __restrict__ btabs, const int* __restrict__ dids,
+                                        const Global::Globals* Globals);
 }  // namespace FIDESlib::CKKS
 #endif  //FIDESLIB_CKKS_CONV_CUH

@@ -6,6 +6,7 @@
 namespace fideslib {
 
 void PersistStagingForget(const void* key);   // CryptoContext.cpp — persist-staged entries are address-keyed
+void DeviceDumpForget(const void* key);       // CryptoContext.cpp — FIDESLIB_GPU_ENCODE pinned dumps, likewise
 
 PlaintextImpl::PlaintextImpl(const CryptoContext<DCRTPoly>&& context)
   : parent_context(context) {
@@ -16,6 +17,7 @@ PlaintextImpl::PlaintextImpl(const CryptoContext<DCRTPoly>&& context)
 
 PlaintextImpl::~PlaintextImpl() {
 	PersistStagingForget(this);
+	DeviceDumpForget(this);
 	if (this->parent_context)
 		this->parent_context->ForgetPrefetchedRaw(this);   // unconsumed worker-staged entry, if any
 	if (this->loaded && this->gpu != 0 && this->parent_context) {

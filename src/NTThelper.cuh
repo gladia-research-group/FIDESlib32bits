@@ -125,6 +125,12 @@ __device__ __forceinline__ int4 swz_perm4(int4 v, [[maybe_unused]] const int c) 
 #define FIDESLIB_NTT_TRANSPOSE_ABLATE 0
 #endif
 
+// ABLATION ONLY (cuTraNTT incomplete-NTT bound): skip the SKIP_LOW smallest-span stages — the last forward / first inverse
+// warp-shuffle stages. Results are WRONG for any value > 0; it prices what an incomplete NTT could save in the transform.
+#ifndef FIDESLIB_NTT_SKIP_LOW
+#define FIDESLIB_NTT_SKIP_LOW 0
+#endif
+
 // EXTENDED ON-THE-FLY TWIDDLES at the middle-scale site: exp = block_pos*br_j is affine in the row i,
 // so W(exp_i) = W(blockIdx.x*M*br_j) * W(br_j)^i — one base value per k plus a running modular multiply
 // replaces M scattered table lookups. Bit-identical (W is a homomorphism). 0 = per-element lookups.

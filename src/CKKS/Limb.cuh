@@ -34,6 +34,14 @@ class Limb {
    public:
     ~Limb() noexcept;
 
+    /** Free the NTT / in-place scratch buffer of a limb that is only read from now on (a finished plaintext), ordered
+     *  on `s`. A released limb must not be the target of an op that needs scratch (Plaintext's mutators check
+     *  RNSPoly::auxReleased and throw). */
+    void releaseAux(Stream& s);
+    bool auxReleased = false;
+    /** Replace the data buffer (the old one freed on `s`); the caller re-points the limb pointer table. */
+    void replaceStorage(VectorGPU<T>&& nv, Stream& s);
+
     Limb(Limb<T>&& l) noexcept;
 
     Limb(ContextData& context, const int id, Stream& stream, const int primeid = -1, bool constant = false);
@@ -146,6 +154,11 @@ class Limb {
 };
 
 using LimbImpl = std::variant<Limb<uint32_t>, Limb<uint64_t>>;
+
+/** Make every limb's primary buffer `v[i]` hold its live data: where the device pointer table `table[i]` points at
+ *  the limb's aux buffer (a batched NTT/INTT pair ping-ponged into it), copy aux into v (bytes[i] per limb), then point the table at v.
+ *  Stream-ordered on `s`, no host wait: the host's v pointers are authoritative afterwards. n <= MAXP. */
+void auxNormalizeAsync(void** table, void* const* v, void* const* aux, const size_t* bytes, int n, cudaStream_t s);
 }  // namespace FIDESlib::CKKS
 
 #endif  //FIDESLIB_LIMB_CUH

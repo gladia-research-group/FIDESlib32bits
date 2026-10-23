@@ -21,6 +21,9 @@
 #include "Serialize.hpp"
 
 namespace fideslib {
+/// Test hook: set FIDESLIB_NOCLONE (0, 1, 2) at run time.
+void SetNoCloneLevelForTest(int level);
+
 
 /// @brief Specialization of CryptoContext for the DCRTPoly representation.
 template <> class CryptoContextImpl<DCRTPoly> {
@@ -62,11 +65,29 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	/// @brief Load the context to the devices.
 	void LoadContext(const PublicKey<DCRTPoly>& publicKey);
+	/// @brief Generate the aggregated-key-switching keys of CoeffsToSlots stage 0 on the GPU from the secret key
+	/// (FIDESlib CKKS/AksKeys.cuh). Needs FIDESLIB_BTS_SHIFT >= 1 and a loaded context; keygen side only.
+	/// @brief Lever 1b: draw our own sparse encapsulation secret and regenerate the two switching keys (M-4, M-2)
+	/// from it, so the aggregated key switching can bake it into its keys. Call after EvalBootstrapKeyGen and
+	/// BEFORE LoadContext.
+	void RegenerateEncapsulationKeys(const PrivateKey<DCRTPoly>& secretKey);
+	void LoadAksKeys(const PrivateKey<DCRTPoly>& secretKey);
+	/// @brief FIDESLIB_LAR=1: generate the level-adaptive relinearization keys (FIDESlib CKKS/LevelAdaptiveKS.cuh)
+	/// from the secret key, fresh randomness. Needs a loaded context with the eval mult key; keygen side only.
+	void LoadLarKeys(const PrivateKey<DCRTPoly>& secretKey);
+	/// @brief Keep the secret key on the GPU for noise-flooding-free diagnostic decryptions (FIDESlib SmallInt.cuh).
+	void LoadDiagSecret(const PrivateKey<DCRTPoly>& secretKey);
+	/// @brief Diagnostic: FIDESlib's coefficient-domain index order. Returns pi with natural[pi[i]] = stored[i].
+	std::vector<uint32_t> CoefficientOrderProbe();
 	/// @brief Free a set of (already-loaded) rotation keys to reclaim GPU memory.
 	/// Bootstrap DFT rotation indexes are protected (never removed). Intended for
 	/// auxiliary rotation keys that are no longer needed after a phase (e.g. prefill
 	/// filling-packing keys before decode). Returns the number of keys actually freed.
 	size_t FreeRotationKeys(const std::vector<int>& steps, const PublicKey<DCRTPoly>& publicKey);
+	/// Build a sparse route after LoadContext (needs EvalBootstrapSetup / EvalBootstrapKeyGen for `slots`).
+	void AddBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots);
+	/// Drop a sparse route and the rotation keys only it uses; returns the keys freed.
+	size_t DropBootstrapRoute(const PublicKey<DCRTPoly>& publicKey, int slots);
 	/// @brief GPU-load a set of rotation keys that were deferred at LoadContext time
 	/// (their OpenFHE eval keys already exist; this is the device transfer only).
 	/// Dedups against already-resident keys. Used to lazily bring in the decode
@@ -79,6 +100,11 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	/// @param pt Plaintext to load.
 	/// @param stream CUDA stream for async H2D copies (single-GPU contexts only).
 	void LoadPlaintext(Plaintext& pt, cudaStream_t stream);
+	/// @brief Reload a dumped device-encoded plaintext ahead of its first use, on a non-blocking stream; its first
+	/// GetDevicePlaintext consumes the copy-done event (perseus PF_MASK_PREFETCH). The caller fences the device just
+	/// before a batch of these: the pool hands out blocks freed on the legacy stream without an event.
+	/// @return true if the plaintext was reloaded (false: already loaded, not device-encoded, or not dumped).
+	bool PrefetchPlaintext(Plaintext& pt);
 	/// @brief CPU-ONLY pre-extraction half of the acquire (no CUDA). Builds the host RawPlainText
 	/// (GetRawPlainText: limb copy + bit-reverse — the ~10.5 s/tok serial cost) and stashes it in
 	/// prefetched_raw, so a later LoadPlaintext uploads without re-extracting. Safe to call from a
@@ -160,6 +186,11 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void EvalBootstrapSetup(const std::vector<uint32_t>& levelBudget, std::vector<uint32_t> dim1, uint32_t slots, uint32_t correctionFactor);
 	/// @brief Generate the evaluation bootstrap keys.
 	void EvalBootstrapKeyGen(const PrivateKey<DCRTPoly>& sk, uint32_t slots);
+	/// @brief Per-site level-aware ModRaise: raise drops (composite levels below the top) to build precomputation
+	/// variants for at LoadContext, every route; FIDESLIB_BTS_RAISE_DROPS=1,2,.. adds to the list. Selection per
+	/// bootstrap: FIDESlib::CKKS::ContextData::setBtsRaiseDrop (the wrapper's RaiseScope).
+	void SetBootstrapRaiseDrops(const std::vector<int>& drops) { bts_raise_drops = drops; }
+	std::vector<int> bts_raise_drops;
 
 	// ---- Serialization ----
 	static bool SerializeEvalMultKey(std::ostream& ser, const SerType& sertype, const std::string& keyTag = "");
@@ -247,10 +278,32 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// no rescale, NoiseLevel-2 products. Requires every pt at ct1's level.
 	std::vector<Ciphertext<DCRTPoly>> EvalMultPtBatch(const Ciphertext<DCRTPoly>& ct1,
 	                                                  std::vector<Plaintext>& pts);
+	// Named-weight inner sum (LIN_PT_DOT): Σ_i cts[i] * pts[i] over already-encoded plaintexts, written once by one
+	// fused kernel (Ciphertext::multPtSumInto). Same result as EvalMult(cts[0], pts[0]) followed by EvalAddInPlace of
+	// EvalMult(cts[i], pts[i]) for each further term, which it runs instead where the fused form does not apply.
+	Ciphertext<DCRTPoly> EvalMultPtSum(const std::vector<Ciphertext<DCRTPoly>>& cts, std::vector<Plaintext>& pts);
 	// Batched ct×ct accumulate: acc += Σ_j as[j]*bs[j] with ONE relinearization (acc must be
 	// the NoiseLevel-2 lane-0 product; all as/bs NoiseLevel-1 at acc's level). GPU-only.
 	void EvalMultCtAccumBatch(Ciphertext<DCRTPoly>& acc, const std::vector<Ciphertext<DCRTPoly>>& as,
 	                          const std::vector<Ciphertext<DCRTPoly>>& bs);
+	// Streamed-weight inner sum: Σ_i cts[i] * encode(vals[i]), each row encoded ON THE DEVICE at the
+	// ciphertexts' level (full slots, NoiseScaleDeg 1, the level's scaling factor) and folded into ONE
+	// accumulator by addMultPt: no host plaintext objects, no per-product ciphertexts. Same result as
+	// EvalMult(cts[0], pt0) + ... + EvalMult(cts[n-1], pt_{n-1}) (NoiseLevel-2, no rescale). All cts
+	// NoiseLevel 1 at one level. GPU-only.
+	Ciphertext<DCRTPoly> EvalMultPtSumEncode(const std::vector<Ciphertext<DCRTPoly>>& cts,
+	                                         const std::vector<std::vector<std::complex<double>>>& vals);
+	// The same from n raw host rows of `width` values (dtype 0 float32, 1 float64, 2 complex64, 3 complex128):
+	// one pinned staging copy, one upload, widened on the device.
+	Ciphertext<DCRTPoly> EvalMultPtSumEncodeRaw(const std::vector<Ciphertext<DCRTPoly>>& cts, const void* rows,
+	                                            int dtype, size_t width);
+	// The same from plaintext COEFFICIENT rows: rows[r * rowStride + k] (float32, k < N) is plaintext r's polynomial
+	// coefficient divided by the scaling factor of the ciphertexts' level, so the device encode is a rounding and an
+	// NTT. `rows` must be device-accessible (device memory or pinned host memory). Same result metadata as above.
+	Ciphertext<DCRTPoly> EvalMultCoeffRowsSum(const std::vector<Ciphertext<DCRTPoly>>& cts, const float* rows,
+	                                          size_t rowStride);
+	// Coefficients clamped by EvalMultCoeffRowsSum since the start (nonzero: a row exceeded the int64 range).
+	unsigned long long CoeffRowsOverflows() const;
 	Ciphertext<DCRTPoly> EvalMult(const Ciphertext<DCRTPoly>& ct1, double scalar);
 	Ciphertext<DCRTPoly> EvalMult(double scalar, const Ciphertext<DCRTPoly>& ct1);
 	void EvalMultInPlace(Ciphertext<DCRTPoly>& ct1, Plaintext& pt);
@@ -258,6 +311,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void CopyCiphertextDevice(Ciphertext<DCRTPoly>& dst, const Ciphertext<DCRTPoly>& src);
 
 	Ciphertext<DCRTPoly> MakeGpuResultLike(const Ciphertext<DCRTPoly>& src);
+	Ciphertext<DCRTPoly> MakeGpuResultEmptyLike(const Ciphertext<DCRTPoly>& src);	// FIDESLIB_NOCLONE: level-matched, no limb copy
 	/// Always true: fresh GPU-op outputs carry a metadata-only CPU shadow
 	/// (CloneEmpty), never a deep copy. The FIDESLIB_LAZY_CPU_SHADOW env is no longer read.
 	static bool LazyCpuShadowEnabled();
@@ -284,6 +338,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	std::vector<Ciphertext<DCRTPoly>> EvalFastRotation(const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices, uint32_t m, const std::shared_ptr<void>& precomp);
 	std::vector<Ciphertext<DCRTPoly>>
 	EvalFastRotationExt(const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices, const std::shared_ptr<void>& digits, bool addFirst);
+	/// ct + sum_i rot(ct, indices[i]) from one hoisted decomposition, summed in the extended basis with one ModDown
+	/// (a radix group of a rotate-and-sum ladder).
+	Ciphertext<DCRTPoly> EvalRotateSumHoisted(const Ciphertext<DCRTPoly>& ct, const std::vector<int32_t>& indices);
 
 	Ciphertext<DCRTPoly> EvalChebyshevSeries(const Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b);
 	void EvalChebyshevSeriesInPlace(Ciphertext<DCRTPoly>& ct, std::vector<double>& coeffs, double a, double b);
@@ -321,6 +378,8 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
 	std::any cpu;
 	std::any gpu;
+	std::vector<std::vector<uint64_t>> aks_sparse_limbs_;  // the regenerated sparse secret (EVAL form over Q)
+	std::vector<uint64_t> aks_sparse_moduli_;
 	/// @brief Whether the context has been loaded to the devices.
 	bool loaded = false;
 	/// @brief List of devices the context is loaded on.
@@ -349,6 +408,7 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	// ---- Copy helpers ----
 
 	uint32_t CopyDeviceCiphertext(const CiphertextImpl<DCRTPoly>& ct);
+	uint32_t NewDeviceCiphertextLike(const CiphertextImpl<DCRTPoly>& ct);
 
 	// --- Map Handling ----
 
@@ -405,6 +465,10 @@ template <> class CryptoContextImpl<DCRTPoly> {
 	void Synchronize() const;
 
 	static std::vector<int> GetConvolutionTransformRotationIndices(int rowSize, int bStep, int stride, uint32_t gStep);
+
+	/// @brief FIDESLIB_GPU_ENCRYPT state (device public key, per-plaintext-shape metadata, sampler key); opaque.
+	/// Declared last so it is destroyed before the device context it holds memory of.
+	std::shared_ptr<void> gpu_encrypt_state;
 };
 
 /// @brief Kick off the pinned stage-arena allocations (2 × FHE_STAGE_ARENA_GB) on a background
@@ -412,6 +476,9 @@ template <> class CryptoContextImpl<DCRTPoly> {
 /// cudaMallocHost costs seconds; call at driver init so the pinning overlaps context setup.
 /// No-op when FHE_PIN_STAGE=0.
 void PrewarmStageArenas();
+
+/// @brief FIDESLIB_FAST_DECRYPT (default 1), settable at run time for the gate.
+void SetFastDecrypt(int on);
 
 } // namespace fideslib
 

@@ -83,7 +83,8 @@ void RNSPoly::multScalarBatchManyToOne(std::vector<RNSPoly*>& polya,
 
 void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<RNSPoly*>& in,
                                   const std::vector<RNSPoly*>& pt, int bStep, int gStep, int stride, double usage,
-                                  bool ext) {
+                                  bool ext, int part, int limb_begin, int limb_count) {
+    assert(part == -1 || gStep <= 8);  // the gStep > 8 fallback has no limb-range form
     if (gStep <= 8) {
 #pragma omp parallel for num_threads(out[0]->cc.GPUid.size())
         for (size_t i = 0; i < out[0]->cc.GPUid.size(); ++i) {
@@ -107,7 +108,8 @@ void RNSPoly::LTdotProductPtBatch(std::vector<RNSPoly*>& out, const std::vector<
                     pts.push_back(nullptr);
             }
 
-            LimbPartition::LTdotProductPtBatch(outs, ins, pts, bStep, gStep, stride, usage, ext);
+            LimbPartition::LTdotProductPtBatch(outs, ins, pts, bStep, gStep, stride, usage, ext, part, limb_begin,
+                                               limb_count);
         }
 
         for (auto i : out) {

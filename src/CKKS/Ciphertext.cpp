@@ -2,10 +2,14 @@
 // Created by carlosad on 24/04/24.
 //
 
+#include "CKKS/Lockstep.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
+#include "CKKS/Discard.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
+#include "CKKS/LevelAdaptiveKS.cuh"
 #include "CKKS/Plaintext.cuh"
+#include "CKKS/SmallInt.cuh"
 #include <omp.h>
 #include <cstdio>
 #include <cstdlib>
@@ -435,6 +439,28 @@ void Ciphertext::modDown(bool free) {
 	}
 }
 
+void Ciphertext::modDownRescale() {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	// keep the special limbs allocated: the next fused relin re-zeroes them in place instead of
+	// re-allocating (alloc/free per relin cost more than the kernels it saved)
+	c0.moddown(true, false, 0, /*rescale2=*/true);
+	c1.moddown(true, false, 1, /*rescale2=*/true);
+	// same end state as rescale(): the pair (q_a, q_b) above the new level was divided out
+	NoiseFactor /= cc.modReduceProduct(c0.getLevel() + cc.compositeDegree());
+	NoiseLevel -= 1;
+	op_count[OPS::RESCALE]++;
+}
+
+void Ciphertext::copyExtend(const Ciphertext& src) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(this != &src);
+	c0.copyScaledByP(src.c0);
+	c1.copyScaledByP(src.c1);
+	this->copyMetadata(src);
+}
+
 void Ciphertext::modUp() {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
@@ -493,9 +519,19 @@ void Ciphertext::multPt(const Plaintext& b, bool rescale) {
 	}
 }
 
+thread_local bool g_rescaleOnePrime = false;
+
 void Ciphertext::rescale() {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
+	if (g_rescaleOnePrime && cc.compositeDegree() > 1) {
+		op_count[OPS::RESCALE]++;
+		c0.rescaleOne();
+		c1.rescaleOne();
+		NoiseFactor /= cc.modReduceFactorAt(c0.getLevel() + 1);
+		NoiseLevel -= 1;
+		return;
+	}
 	// assert(this->NoiseLevel == 2);
 	if (cc.rescaleTechnique != FIXEDMANUAL) {
 		// this wouldn't do anything in OpenFHE
@@ -517,6 +553,12 @@ void Ciphertext::rescale() {
 
 /** "in" needs to have Digit and Gather limbs pre-generated */
 RNSPoly& MGPUkeySwitchCore(RNSPoly& in, const KeySwitchingKey& kskEval, const bool moddown) {
+	// FIDESLIB_LAR=1: the eval key at a level a level-adaptive class covers (LevelAdaptiveKS.cuh)
+	if (moddown && larEnabled()) {
+		RNSPoly& aux2 = in.GPU.at(0).cc.getKeySwitchAux2();
+		if (&aux2 != &in && larTryKeySwitch(in, aux2, kskEval))
+			return aux2;
+	}
 	{
 		RNSPoly& aux = in.modup_ksk_moddown_mgpu(kskEval, moddown);
 
@@ -525,6 +567,7 @@ RNSPoly& MGPUkeySwitchCore(RNSPoly& in, const KeySwitchingKey& kskEval, const bo
 }
 
 void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	assert(keyID == b.keyID);
@@ -719,15 +762,22 @@ void Ciphertext::mult(const Ciphertext& b, bool rescale, const bool moddown) {
 			std::cout << "Init mult" << std::endl;
 		RNSPoly& in = cc.getKeySwitchAux();
 		in.setLevel(c1.getLevel());
-		c0.binomialMult(c1, in, b.c0, b.c1, moddown, &b == this);
+		// Lever A: keep d0/d1 and the key-switch output in the P-extended basis and do ONE
+		// ModDown that also divides out the composite pair (fused rescale) — the "add before
+		// fused ModDown+Rescale" of the disabled branch above.
+		const bool fused = moddown && rescale && fusedRescaleFlag() && cc.compositeDegree() == 2 &&
+		                   cc.GPUid.size() == 1 && c1.getLevel() >= 2;
+		c0.binomialMult(c1, in, b.c0, b.c1, moddown && !fused, &b == this);
 
-		RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, moddown);
+		RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, moddown && !fused);
 		c0.add(aux);
 		c1.add(in);
 
 		// Manage metadata
 		this->multMetadata(*this, b);
-		if (moddown && rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL) {
+		if (fused) {
+			this->modDownRescale();
+		} else if (moddown && rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL) {
 			this->rescale();
 		}
 		if constexpr (PRINT)
@@ -804,7 +854,78 @@ void Ciphertext::multAccumulateBatch(const std::vector<const Ciphertext*>& a, co
 	// same-scale products leaves it unchanged (exactly as the serial inplace_add chain).
 }
 
+bool Ciphertext::multAccumulateChecked(const std::vector<const Ciphertext*>& a, const std::vector<const Ciphertext*>& b) {
+	LockstepGuard lockstepGuard_;  // one relinearizing op, like mult
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(a.size() == b.size());
+	assert(!a.empty());
+	if (NoiseLevel != 2)
+		return false;
+
+	// Mirror serial Ciphertext::mult's head EXACTLY, per lane, on COPIES (the persistent
+	// cache lanes must not change level — graph names embed it): adjustForMult carries the
+	// FLEXIBLEAUTO scalar scale-corrections a plain rescale/drop would miss.
+	std::vector<std::unique_ptr<Ciphertext>> adjusted;
+	std::vector<const Ciphertext*> aa(a), bb(b);
+	for (size_t j = 0; j < aa.size(); ++j) {
+		const Ciphertext* pa = aa[j];
+		const Ciphertext* pb = bb[j];
+		if (pa->NoiseLevel == 1 && pb->NoiseLevel == 1 && pa->getLevel() == getLevel() &&
+		    pb->getLevel() == getLevel())
+			continue;
+		auto ta = std::make_unique<Ciphertext>(cc_);
+		ta->copy(*pa);
+		if (!ta->adjustForMult(*pb)) {
+			auto tb = std::make_unique<Ciphertext>(cc_);
+			tb->copy(*pb);
+			tb->adjustForMult(*ta);
+			ta->adjustForMult(*tb);   // serial mult re-enters and adjusts once more
+			bb[j] = tb.get();
+			adjusted.push_back(std::move(tb));
+		}
+		aa[j] = ta.get();
+		adjusted.push_back(std::move(ta));
+	}
+
+	for (size_t j = 0; j < aa.size(); ++j) {
+		const double nf = aa[j]->NoiseFactor * bb[j]->NoiseFactor;
+		if (aa[j]->NoiseLevel != 1 || bb[j]->NoiseLevel != 1 || aa[j]->getLevel() != getLevel() ||
+		    bb[j]->getLevel() != getLevel() || keyID != aa[j]->keyID || keyID != bb[j]->keyID ||
+		    !(nf > NoiseFactor * (1 - 1e-9) && nf < NoiseFactor * (1 + 1e-9)))
+			return false;
+	}
+	op_count[OPS::MULT] += static_cast<int>(aa.size());
+
+	KeySwitchingKey& kskEval = cc.GetEvalKey(keyID);
+
+	RNSPoly& in = cc.getKeySwitchAux();
+	in.setLevel(c1.getLevel());
+
+	std::vector<const RNSPoly*> a0, a1, b0, b1;
+	a0.reserve(aa.size());
+	a1.reserve(aa.size());
+	b0.reserve(aa.size());
+	b1.reserve(aa.size());
+	for (size_t j = 0; j < aa.size(); ++j) {
+		a0.push_back(&aa[j]->c0);
+		a1.push_back(&aa[j]->c1);
+		b0.push_back(&bb[j]->c0);
+		b1.push_back(&bb[j]->c1);
+	}
+
+	RNSPoly::binomialMultAccumBatch(c0, c1, in, a0, a1, b0, b1);
+
+	RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, /*moddown=*/true);
+	c0.add(aux);
+	c1.add(in);
+	// Metadata: the seed already carries the product NoiseFactor/NoiseLevel/slots; adding
+	// same-scale products leaves it unchanged (exactly as the serial inplace_add chain).
+	return true;
+}
+
 void Ciphertext::square(bool rescale) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
 	Out(KEYSWITCH, " start ");
@@ -1115,6 +1236,32 @@ void Ciphertext::rotate(const Ciphertext& c, const int index) {
 	this->rotate(index, true);
 }
 
+void Ciphertext::rotateFrom(const Ciphertext& c, const int index_) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(this != &c);
+	op_count[OPS::ROTATE]++;
+	c0.dropToLevel(c.c0.getLevel());
+	c1.dropToLevel(c.c1.getLevel());
+	c0.grow(c.c0.getLevel());
+	c1.grow(c.c1.getLevel());
+	this->copyMetadata(c);
+	const int index = normalyzeIndex(index_);
+	assert(index != 0);
+	// rotate(index, true)'s live branch with in0 = c.c0 read in place (the copy only existed because c0 is overwritten)
+	auto& in1 = cc.getKeySwitchAux();
+	in1.copy(c.c1);
+	in1.modup();
+	std::vector<int> index_v{ index };
+	std::vector<RNSPoly*> c0_out{ &c0 };
+	std::vector<RNSPoly*> c1_out{ &c1 };
+	auto& ksk = cc.GetRotationKey(index, c.keyID, slots);
+	std::vector<RNSPoly*> ksk_a{ &ksk.a };
+	std::vector<RNSPoly*> ksk_b{ &ksk.b };
+	in1.hoistedRotationFused(index_v, c0_out, c1_out, ksk_a, ksk_b, c.c0, in1);
+	modDown(false);
+}
+
 void Ciphertext::conjugate(const Ciphertext& c) {
 	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
 	CKKS::SetCurrentContext(cc_);
@@ -1183,13 +1330,13 @@ void Ciphertext::conjugate(const Ciphertext& c) {
 */
 		/*
 		RNSPoly& aux = MGPUkeySwitchCore(in, cc.GetRotationKey(index, c.keyID, slots), true);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
 		for (int i = 0; i < (int)cc.GPUid.size(); ++i) {
 			assert(omp_get_num_threads() == (int)cc.GPUid.size());
 			c1.GPU.at(i).automorph(index, 1, &in.GPU.at(i), c1.isModUp());
 		}
 		c0.add(aux);
-#pragma omp parallel for num_threads(cc.GPUid.size())
+#pragma omp parallel for num_threads(cc.GPUid.size()) if((FIDESlib::ompRegionsOn() || cc.GPUid.size() > 1))
 		for (int i = 0; i < (int)cc.GPUid.size(); ++i) {
 			assert(omp_get_num_threads() == (int)cc.GPUid.size());
 			c0.GPU.at(i).automorph(index, 1, nullptr, c0.isModUp());
@@ -1233,6 +1380,91 @@ void Ciphertext::conjugate(const Ciphertext& c) {
 
 		this->copyMetadata(c);
 	}
+}
+
+void Ciphertext::rotate_hoisted_chunked(const std::vector<int>& indexes_, std::vector<Ciphertext*> results,
+                                        const int chunk,
+                                        const std::function<void(int part, int begin, int count)>& on_chunk) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(hoistRotateFused && cc.GPUid.size() == 1 && chunk > 0);
+	assert(indexes_.size() == results.size());
+	op_count[OPS::HOISTEDROTATE]++;
+	op_count[OPS::HOISTEDROTATEOUTS] += indexes_.size();
+
+	std::vector<int> indexes;
+	for (auto i : indexes_)
+		indexes.push_back(normalyzeIndex(i));
+
+	for (auto& i : results) {
+		i->growToLevel(cc.L);
+		i->dropToLevel(this->c0.getLevel());
+		i->c0.generateSpecialLimbs(false, false);
+		i->c1.generateSpecialLimbs(false, false);
+	}
+
+	RNSPoly& in = cc.getKeySwitchAux();
+	in.setLevel(c1.getLevel());
+	c1.modupInto(in);
+
+	std::vector<int> index;
+	std::vector<RNSPoly*> c0_out, c1_out, ksk_a, ksk_b;
+	for (size_t i = 0; i < indexes.size(); ++i) {
+		if (indexes[i] == 0) {
+			if (pwFuseFlag())
+				results[i]->copyExtend(*this);
+			else {
+				results[i]->copy(*this);
+				results[i]->extend();
+			}
+		} else {
+			c0_out.push_back(&results[i]->c0);
+			c1_out.push_back(&results[i]->c1);
+			auto& ksk = cc.GetRotationKey(indexes[i], keyID, slots);
+			ksk_a.push_back(&ksk.a);
+			ksk_b.push_back(&ksk.b);
+			index.push_back(indexes[i]);
+			results[i]->copyMetadata(*this);
+		}
+	}
+
+	// The hoisted kernel's limb axis is [K special limbs | the level's regular limbs]; the LT dot
+	// addresses the same two sets through its regular / special launches.
+	const int num_special = (int)cc.splitSpecialMeta.at(0).size();
+	const int num_limbs = c0.getLevel() + 1;
+	if (index.empty()) {
+		on_chunk(1, 0, num_special);
+		on_chunk(0, 0, num_limbs);
+		return;
+	}
+	in.hoistedRotationFused(index, c0_out, c1_out, ksk_a, ksk_b, c0, c1, 0, num_special);
+	on_chunk(1, 0, num_special);
+	for (int b = 0; b < num_limbs; b += chunk) {
+		const int n = std::min(chunk, num_limbs - b);
+		in.hoistedRotationFused(index, c0_out, c1_out, ksk_a, ksk_b, c0, c1, num_special + b, n);
+		on_chunk(0, b, n);
+	}
+	if (discardD2Flag())
+		for (size_t j = 0; j < in.GPU.size(); ++j)
+			discardDigitLimbs(in.GPU[j], in.GPU[j].s.ptr());
+}
+
+void Ciphertext::rotateSumHoisted(const std::vector<int>& indexes) {
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	assert(!indexes.empty());
+	std::vector<std::unique_ptr<Ciphertext>> tmp;
+	std::vector<Ciphertext*> res;
+	tmp.reserve(indexes.size());
+	for (size_t i = 0; i < indexes.size(); ++i) {
+		tmp.emplace_back(std::make_unique<Ciphertext>(cc_));
+		res.push_back(tmp.back().get());
+	}
+	rotate_hoisted(indexes, res, true);	 // every rotation left in the extended basis
+	for (size_t i = 1; i < res.size(); ++i)
+		res[0]->add(*res[i]);  // the group's sum, still extended (special limbs included)
+	res[0]->modDown();
+	add(*res[0]);
 }
 
 void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ciphertext*> results, const bool ext) {
@@ -1382,9 +1614,13 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 		std::vector<RNSPoly*> ksk_b;
 		for (size_t i = 0; i < indexes.size(); ++i) {
 			if (indexes[i] == 0) {
-				results[i]->copy(*this);
-				if (ext) {
-					results[i]->extend();
+				if (ext && pwFuseFlag()) {
+					results[i]->copyExtend(*this);  // lever E2: one pass instead of copy + scaleByP
+				} else {
+					results[i]->copy(*this);
+					if (ext) {
+						results[i]->extend();
+					}
 				}
 			} else {
 				c0_out.push_back(&results[i]->c0);
@@ -1399,6 +1635,9 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 		}
 
 		in.hoistedRotationFused(index, c0_out, c1_out, ksk_a, ksk_b, c0, c1);
+		if (discardD2Flag())
+			for (size_t j = 0; j < in.GPU.size(); ++j)  // ModUp digits are dead now: drop them without write-back
+				discardDigitLimbs(in.GPU[j], in.GPU[j].s.ptr());
 
 		if (!ext) {
 			for (size_t i = 0; i < indexes.size(); ++i) {
@@ -1410,7 +1649,165 @@ void Ciphertext::rotate_hoisted(const std::vector<int>& indexes_, std::vector<Ci
 	}
 }
 
+bool Ciphertext::multInto(const Ciphertext& b, const Ciphertext& c) {
+	if (this == &b || this == &c || b.NoiseLevel != 1 || c.NoiseLevel != 1 || b.getLevel() != c.getLevel() ||
+	    b.keyID != c.keyID || cc.GPUid.size() != 1 || fusedRescaleFlag())
+		return false;
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULT]++;
+	KeySwitchingKey& kskEval = cc.GetEvalKey(b.keyID);
+	RNSPoly& in = cc.getKeySwitchAux();
+	in.setLevel(b.c1.getLevel());
+	c0.binomialMultFrom(c1, in, b.c0, b.c1, c.c0, c.c1, &b == &c);
+	RNSPoly& aux = MGPUkeySwitchCore(in, kskEval, true);
+	c0.add(aux);
+	c1.add(in);
+	this->multMetadata(b, c);
+	return true;
+}
+
+bool Ciphertext::addInto(const Ciphertext& a, const Ciphertext& b) {
+	if (this == &a || this == &b || a.keyID != b.keyID || a.getLevel() != b.getLevel() || a.NoiseLevel != b.NoiseLevel ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::ADD]++;
+	c0.dropToLevel(a.getLevel());
+	c1.dropToLevel(a.getLevel());
+	c0.grow(a.getLevel());
+	c1.grow(a.getLevel());
+	c0.add(a.c0, b.c0);
+	c1.add(a.c1, b.c1);
+	this->copyMetadata(a);
+	this->addMetadata(*this, b);
+	return true;
+}
+
+bool Ciphertext::multPtInto(const Ciphertext& c, const Plaintext& pt) {
+	if (this == &c || c.NoiseLevel != 1 || pt.NoiseLevel != 1 || pt.c0.getLevel() != c.getLevel() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULTPT]++;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	c0.multElement(c.c0, pt.c0);
+	c1.multElement(c.c1, pt.c0);
+	this->copyMetadata(c);
+	this->multMetadata(*this, pt);
+	return true;
+}
+
+bool Ciphertext::multPtSumInto(const std::vector<const Ciphertext*>& cs, const std::vector<const Plaintext*>& pts) {
+	const size_t n = cs.size();
+	if (n == 0 || n != pts.size() || n > (size_t)PTDOT_MAX ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	const Ciphertext& c = *cs[0];
+	for (size_t i = 0; i < n; ++i) {
+		const Ciphertext& ci = *cs[i];
+		const Plaintext& pi	 = *pts[i];
+		if (&ci == this || ci.NoiseLevel != 1 || pi.NoiseLevel != 1 || ci.getLevel() != c.getLevel() ||
+		    pi.c0.getLevel() != c.getLevel() || ci.keyID != c.keyID || ci.c0.isModUp() || ci.c1.isModUp())
+			return false;
+	}
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULTPT] += n;
+	op_count[OPS::ADD] += n - 1;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	std::vector<const RNSPoly*> x0(n), x1(n), p(n);
+	for (size_t i = 0; i < n; ++i) {
+		x0[i] = &cs[i]->c0;
+		x1[i] = &cs[i]->c1;
+		p[i]  = &pts[i]->c0;
+	}
+	c0.ptDotFrom(c1, x0, x1, p);
+	// the loop's metadata: the first product's, then each add keeps it and widens the slot count
+	this->copyMetadata(c);
+	this->multMetadata(*this, *pts[0]);
+	for (size_t i = 1; i < n; ++i)
+		this->slots = std::max(this->slots, std::max(cs[i]->slots, pts[i]->slots));
+	return true;
+}
+
+bool Ciphertext::subInto(const Ciphertext& a, const Ciphertext& b) {
+	if (this == &a || this == &b || a.keyID != b.keyID || a.getLevel() != b.getLevel() || a.NoiseLevel != b.NoiseLevel ||
+	    a.c0.isModUp() || a.c1.isModUp() || b.c0.isModUp() || b.c1.isModUp() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::ADD]++;
+	c0.dropToLevel(a.getLevel());
+	c1.dropToLevel(a.getLevel());
+	c0.grow(a.getLevel());
+	c1.grow(a.getLevel());
+	c0.subFrom(a.c0, b.c0);
+	c1.subFrom(a.c1, b.c1);
+	this->copyMetadata(a);
+	this->addMetadata(*this, b);
+	return true;
+}
+
+bool Ciphertext::multScalarInto(const Ciphertext& c, double scalar) {
+	if (this == &c || c.NoiseLevel != 1 || c.c0.isModUp() || c.c1.isModUp() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::MULTSCALAR]++;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	auto elem = cc.ElemForEvalMult(c.c0.getLevel(), scalar);
+	c0.multScalarFrom(c.c0, elem);
+	c1.multScalarFrom(c.c1, elem);
+	this->copyMetadata(c);
+	NoiseLevel += 1;
+	NoiseFactor *= cc.sfAtLimb(c0.getLevel());
+	return true;
+}
+
+bool Ciphertext::addScalarInto(const Ciphertext& c, double scalar) {
+	if (this == &c || scalar == 0.0 || c.c0.isModUp() || c.c1.isModUp() ||
+	    !(cc.rescaleTechnique == FLEXIBLEAUTO || cc.rescaleTechnique == FLEXIBLEAUTOEXT))
+		return false;
+	CudaNvtxRange r(std::string{ sc::current().function_name() }.substr());
+	CKKS::SetCurrentContext(cc_);
+	op_count[OPS::ADDSCALAR]++;
+	c0.dropToLevel(c.getLevel());
+	c1.dropToLevel(c.getLevel());
+	c0.grow(c.getLevel());
+	c1.grow(c.getLevel());
+	auto elem = cc.ElemForEvalAddOrSub(c.c0.getLevel(), std::abs(scalar), c.NoiseLevel);
+	if (scalar < 0.0)
+		for (auto i = 0u; i < elem.size(); ++i)
+			elem[i] = cc.prime[i].p - elem[i];
+	c0.addScalarFrom(c.c0, elem);
+	c1.copy(c.c1);
+	this->copyMetadata(c);
+	return true;
+}
+
 void Ciphertext::mult(const Ciphertext& b, const Ciphertext& c, bool rescale) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
+	// Lever E1: out-of-place relinearised product, no copy of an operand into *this first.
+	if (pwFuseFlag() && multInto(b, c)) {
+		if (rescale && cc.rescaleTechnique == CKKS::FIXEDMANUAL)
+			this->rescale();
+		return;
+	}
 	if (this == &b && this == &c) {
 		this->square(rescale);
 	} else if (this == &b) {
@@ -1429,8 +1826,11 @@ void Ciphertext::mult(const Ciphertext& b, const Ciphertext& c, bool rescale) {
 }
 
 void Ciphertext::square(const Ciphertext& src, bool rescale) {
+	LockstepGuard lockstepGuard_;  // EvalMod Re/Im lockstep: the whole relinearizing op is one turn
 	if (this == &src) {
 		this->square(rescale);
+	} else if (pwFuseFlag() && src.NoiseLevel == 1 && cc.GPUid.size() == 1 && !fusedRescaleFlag()) {
+		this->mult(src, src, rescale);  // lever E1: out-of-place square
 	} else {
 		this->copy(src);
 		this->square(rescale);
@@ -1924,7 +2324,12 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 	const int key = power * 1024 + this->getLevel();
 	if (!cc.precom.monomialCache.contains(key)) {
 		// The build writes into a pooled auxiliary polynomial: wait for work still using it.
-		cudaDeviceSynchronize();
+		// FIDESLIB_MONOMIAL_ASYNC=1: both fences as GPU-side barriers
+		static const bool monoAsync = [] { const char* e = std::getenv("FIDESLIB_MONOMIAL_ASYNC"); return e && std::atoi(e) > 0; }();
+		if (monoAsync)
+			gpuBarrier();
+		else
+			cudaDeviceSynchronize();
 		// TODO compute fully as a GPU function.
 		RNSPoly monomial(cc.getAuxilarPoly());
 		monomial.grow(c0.getLevel());
@@ -1974,7 +2379,10 @@ void Ciphertext::multMonomial(/*Ciphertext& ctxt,*/ int power) {
 		// cudaDeviceSynchronize();
 		monomial.NTT(cc.batch, true);
 		// multElement runs on this ciphertext's streams, which do not wait on the NTT's.
-		cudaDeviceSynchronize();
+		if (monoAsync)
+			gpuBarrier();
+		else
+			cudaDeviceSynchronize();
 
 		cc.precom.monomialCache.emplace(key, std::move(monomial));
 	}

@@ -1,3 +1,5 @@
+#include <functional>
+#include <set>
 //
 // Created by carlos on 6/03/24.
 //
@@ -85,6 +87,12 @@ class ContextData {
     std::unique_ptr<RNSPoly> key_switch_aux;
     std::unique_ptr<RNSPoly> key_switch_aux2;
     std::array<std::unique_ptr<RNSPoly>, 2> moddown_aux = {nullptr};
+    // lanes 1..kKsLanes-1's copies (index 0 unused; ksLane() picks them): FIDESLIB_EVALMOD_LANES puts the EvalMod Im
+    // chain on lane 1, bts.ks_lane spreads independent refreshes over lanes so they do not serialize on one workspace
+    static constexpr int kKsLanes = 4;
+    std::array<std::unique_ptr<RNSPoly>, kKsLanes> key_switch_aux_ln;
+    std::array<std::unique_ptr<RNSPoly>, kKsLanes> key_switch_aux2_ln;
+    std::array<std::array<std::unique_ptr<RNSPoly>, 2>, kKsLanes> moddown_aux_ln;
     std::vector<Stream> top_limb_stream;
     std::vector<uint64_t*> top_limb_buffer;
     std::vector<void*> top_limb_buffer_handle;
@@ -99,6 +107,11 @@ class ContextData {
     std::vector<std::vector<Stream>> digitStream;
     std::vector<std::vector<std::vector<Stream>>> digitStreamForMemcpyPeer;
     std::vector<std::vector<Stream>> digitStream2;
+    // lanes 1..kKsLanes-1's digit streams (index 0 unused): a key switch on lane l forks its digits onto lane l's streams,
+    // so key switches on different lanes do not queue behind each other on shared streams
+    std::array<std::vector<std::vector<Stream>>, 4> digitStreamLn, digitStream2Ln;
+    std::vector<std::vector<Stream>>& digitStreamL() { const int l = ksLane() % 4; return l ? digitStreamLn[l] : digitStream; }
+    std::vector<std::vector<Stream>>& digitStream2L() { const int l = ksLane() % 4; return l ? digitStream2Ln[l] : digitStream2; }
 
     // std::vector<RNSPoly> key_switch_digits;
     bool canP2P = false;
@@ -109,6 +122,9 @@ class ContextData {
     RNSPoly& getKeySwitchAux();
     RNSPoly& getKeySwitchAux2();
     RNSPoly& getModdownAux(const int num);
+    /** The calling thread's keyswitch workspace lane (0 default; the EvalMod lockstep Im thread uses 1 under
+     *  FIDESLIB_EVALMOD_LANES so the Re / Im chains do not serialize on one workspace). */
+    static int& ksLane();
 
     bool isValidPrimeId(const int i) const;
 
@@ -167,6 +183,25 @@ class ContextData {
     void setCorrectionFactorOverride(int cf);
     int getCorrectionFactorOverride() const;
     int correctionFactorOverride = -1;
+    /** Per-site level-aware ModRaise: while > the route's static raise_drop, GetBootPrecomputation(slots) serves the
+     *  route's raise variant for that drop (AddBootstrapRaiseVariant). Set around one planted bootstrap by the
+     *  wrapper (plan 'raise_drop'; the C++ harness sets it from BTS_RAISE_VARIANT). Never read from the env here:
+     *  the precomputation setup itself goes through GetBootPrecomputation before any variant exists. */
+    int btsRaiseDrop = 0;
+    void setBtsRaiseDrop(int drop);
+    int getBtsRaiseDrop() const;
+    int btsRaiseDropEffective() const;
+    BootstrapPrecomputation& GetBootPrecomputationBase(int slots);
+    /** Real-payload bootstrap on the dense route (one EvalMod chain, BootstrapPrecomputation::stcRealA0). Set around
+     *  one planted bootstrap by the wrapper (plan 'real_route'); OUT-OF-LINE ACCESSORS ONLY (see above). */
+    bool btsRealPayload = false;
+    void setBtsRealPayload(bool on);
+    bool getBtsRealPayload() const;
+    // A planned site that must bootstrap in the shipped order although FIDESLIB_BTS_STC_FIRST is on (a payload whose
+    // slot magnitude the StC-first order cannot hold at the planned precision): set around that one call.
+    bool stcFirstForbid = false;
+    void setStcFirstForbid(bool on);   // out-of-line: the wrapper must not touch the field (NCCL offsets, see below)
+    bool getStcFirstForbid() const;
 
     /** Bootstrap input pre-scale (armed per call by the wrapper, same discipline as the
      *  correction-factor override): the next Bootstrap multiplies its input by this
@@ -187,10 +222,28 @@ class ContextData {
     /** Product of the compositeDegree ModReduceFactor entries dropped when rescaling a
      *  ciphertext whose top limb is limbTop (single factor on classic chains). */
     double modReduceProduct(int limbTop) const;
+    /** The single ModReduceFactor of the prime at limb index `limb` (one-prime rescale, RescaleOneScope). */
+    double modReduceFactorAt(int limb) const;
     int GetDoubleAngleIts();
     void AddBootPrecomputation(int slots, BootstrapPrecomputation&& precomp);
     bool HasBootPrecomputation(int slots);
+    /** Drop a route's device tables (and its raise variants). */
+    void RemoveBootPrecomputation(int slots);
     BootstrapPrecomputation& GetBootPrecomputation(int slots);
+    /** Lazy raise variants: the drops a planted bootstrap may ask for (FIDESLIB_BTS_RAISE_DROPS) and the builder
+     *  that makes one from the route's base tables on first use (installed by LoadContext). Each variant is a full
+     *  re-levelled copy of the route's CtS/StC tables, so building them all up front holds memory a plan without
+     *  raise drops never touches. */
+    std::set<int> raiseDropsAllowed;
+    std::function<void(int slots, int drop)> raiseVariantBuilder;
+    /** Entries of the bootstrap last-stage caches (stc_first_last / lt_first_last, every route and raise variant);
+     *  `clear`: drop them too (device plaintexts freed; rebuilt on the next bootstrap that needs them). */
+    size_t BootCacheEntries(bool clear);
+    /** Release the NTT scratch of every bootstrap plaintext table (they are only read once built; see
+     *  Limb::releaseAux). Returns the plaintexts released. */
+    size_t BootReleaseScratch();
+    /** BootReleaseScratch for one precomputation (a lazily built raise variant). */
+    size_t ReleaseScratchOf(BootstrapPrecomputation& p);
     void AddRotationKey(int index, KeySwitchingKey&& ksk);
     KeySwitchingKey& GetRotationKey(int index, const KeyHash& keyID, int slots = -1);
     bool HasRotationKey(int index, const KeyHash& keyID);
@@ -210,6 +263,11 @@ class ContextData {
     void returnAuxilarPoly(RNSPoly&& c);
     void trimAuxilarPoly(size_t size);
     void clearAuxilarPoly();
+    /** Free the recycled polynomials (precom.auxPoly) and their limbs; the pool's reclaim hook calls it when the
+     *  device is full. Returns the polynomials freed. */
+    size_t releaseAuxilarPolys();
+    /** (recycled polynomials, limb bytes they hold). */
+    std::pair<size_t, size_t> auxilarPolyStats();
     void clearAutomorphismKeys(const KeyHash& KeyID = {});
     void clearEvalMultKeys(const KeyHash& KeyID = {});
     void clearBootPrecomputation(int slots = -1);

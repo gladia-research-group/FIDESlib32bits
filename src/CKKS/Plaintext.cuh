@@ -30,6 +30,8 @@ namespace FIDESlib::CKKS {
     double NoiseFactor = 0;
     int NoiseLevel = 1;
     int slots = 0;
+    /** 0xFFFFFFFF: full limbs; else compact (PtCompact.cuh, read through ptCompactIdx). */
+    uint32_t compactMask = 0xFFFFFFFFu;
 
     /**
      * @brief Defaulted move constructor.
@@ -73,6 +75,9 @@ namespace FIDESlib::CKKS {
      * @param cc Reference to the CKKS context that will be used for operations.
      */
     explicit Plaintext(Context& cc);
+    /** @brief As Plaintext(cc), on the partition's own streams when `def_stream` is false (the default constructor
+     *  uses the legacy stream): a plaintext built off the critical path (CryptoContext::PrefetchPlaintext). */
+    Plaintext(Context& cc, bool def_stream);
     /**
      * @brief Construct a plaintext from a raw ciphertext representation.
      *
@@ -112,7 +117,7 @@ namespace FIDESlib::CKKS {
     void loadCoeffExpand(const RawPlainText& meta, const uint8_t* arena,
                          const std::vector<size_t>& off, const std::vector<size_t>& len,
                          int src_limbs, int target_limbs,
-                         cudaStream_t stream, int prescale_log2 = 0);
+                         cudaStream_t stream, int prescale_log2 = 0, bool native = false);
     /**
      * @brief Store this plaintext into a raw representation.
      *
