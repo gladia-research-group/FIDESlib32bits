@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
@@ -81,10 +82,13 @@ __global__ void coeffRowsMac_(CtTables t, int n, const uint32_t* __restrict__ sc
 // memory and accumulates the products in registers. Row groups write partial sums (coeffRowsReduce_).
 namespace cg = cooperative_groups;
 
-__global__ void __cluster_dims__(ntc::CL, 1, 1) __launch_bounds__(ntc::GROUPS* ntc::BD, 2)
+__global__ void FIDESLIB_CLUSTER_DIMS(ntc::CL) __launch_bounds__(ntc::GROUPS* ntc::BD, 2)
     coeffRowsFused_(const Global::Globals* Globals, const float* __restrict__ rows, size_t rowStride, int n, int groups,
                     double scale, int L, CtTables t, void** out0, void** out1, uint32_t* partial, bool accumulate,
                     unsigned long long* overflow) {
+#ifdef FIDESLIB_NO_CLUSTERS
+    __trap();  // unreachable: multCoeffRowsSum refuses a device without clusters
+#else
     using namespace ntc;
     __shared__ __align__(16) T region[REG_I2 * 2];
     __shared__ T psi[BD], psi_sh[BD];
@@ -197,6 +201,7 @@ __global__ void __cluster_dims__(ntc::CL, 1, 1) __launch_bounds__(ntc::GROUPS* n
             p1[q] = make_uint2(a1[2 * i], a1[2 * i + 1]);
         }
     }
+#endif
 }
 
 __global__ void coeffRowsReduce_(const uint32_t* __restrict__ partial, int groups, int L, int N, void** out0, void** out1,
@@ -319,6 +324,10 @@ void multCoeffRowsSum(Ciphertext& out, const std::vector<const Ciphertext*>& cts
                       double scale) {
     if (cts.empty())
         return;
+    // Both paths transform the rows with cluster kernels (the fused one and NTTcluster.cu); there is no
+    // two-pass fallback.
+    if (!clusterCapable())
+        throw std::runtime_error("multCoeffRowsSum: needs thread-block clusters (compute capability 9.0+)");
     ContextData& C = out.cc;
     const int N = C.N;
     const int L = cts[0]->getLevel() + 1;   // limbs 0..level

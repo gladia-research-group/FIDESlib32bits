@@ -1,6 +1,7 @@
 #include "NTTcluster.cuh"
 #include <cooperative_groups.h>
 #include <cstdlib>
+#include <stdexcept>
 #include "AddSub.cuh"
 #include "ConstantsGPU.cuh"
 #include "ModMult.cuh"
@@ -12,25 +13,38 @@ namespace cg = cooperative_groups;
 
 namespace FIDESlib {
 
+bool clusterCapable() {
+    static const bool capable = [] {
+        int device = 0, major = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        return major >= 9;
+    }();
+    return capable;
+}
+
 static int g_ntt_cluster = -1;
 int nttClusterFlag() {
     if (g_ntt_cluster < 0) {
         const char* e = std::getenv("FIDESLIB_NTT_CLUSTER");
-        g_ntt_cluster = e ? std::atoi(e) : 0;
+        g_ntt_cluster = e && clusterCapable() ? std::atoi(e) : 0;
     }
     return g_ntt_cluster;
 }
 void setNttCluster(int v) {
-    g_ntt_cluster = v;
+    g_ntt_cluster = clusterCapable() ? v : 0;
 }
 
 // ---- geometry (mirrors NTT.cu for u32, logN = 16: block 128 threads x M=8 int2 pairs = 2048 elements) ----
 namespace ntc {
 // ---------------------------------------------------------------------------------------------------
 template <bool INVERSE>
-__global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
+__global__ void FIDESLIB_CLUSTER_DIMS(CL) __launch_bounds__(GROUPS* BD, 2)
     ntt_cluster_(const Global::Globals* Globals, void** __restrict__ dat, const int __grid_constant__ primeid_init,
                  void** __restrict__ res, const int __grid_constant__ period) {
+#ifdef FIDESLIB_NO_CLUSTERS
+    __trap();  // unreachable: launchNTTcluster refuses a device without clusters
+#else
     __shared__ __align__(16) T region[REG_I2 * 2];  // 4 tiles x 2048 u32 = 32 KB: pass-1 output / working tiles
     __shared__ T psi[BD], psi_sh[BD];
 
@@ -166,6 +180,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __launch_bounds__(GROUPS* BD, 2)
     } else {
         cluster.sync();  // a hole is a whole limb, so the whole cluster takes this branch: 2 syncs either way
     }
+#endif
 }
 #undef GA
 #undef GAS
@@ -175,6 +190,8 @@ void launchNTTcluster(const Global::Globals* Globals, bool inverse, void** dat, 
                       cudaStream_t s, int period) {
     if (nlimbs <= 0)
         return;
+    if (!clusterCapable())
+        throw std::runtime_error("launchNTTcluster: thread-block clusters need compute capability 9.0+");
     const dim3 grid((unsigned)(ntc::CL * nlimbs)), block((unsigned)(ntc::GROUPS * ntc::BD));
     if (inverse)
         ntc::ntt_cluster_<true><<<grid, block, 0, s>>>(Globals, dat, primeid_init, res, period);

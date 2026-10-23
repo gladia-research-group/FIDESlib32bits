@@ -12,8 +12,21 @@
 #include <cuda_runtime.h>
 #include "ConstantsGPU.cuh"
 
+// Clusters are sm_90+, and nvcc refuses __cluster_dims__ below it. A build that also targets older devices
+// (FHERMA's L40S, sm_89) compiles the cluster kernels there to a trap; at run time clusterCapable() keeps
+// those devices off them.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+#define FIDESLIB_NO_CLUSTERS 1
+#define FIDESLIB_CLUSTER_DIMS(x)
+#else
+#define FIDESLIB_CLUSTER_DIMS(x) __cluster_dims__(x, 1, 1)
+#endif
+
 namespace FIDESlib {
+/// The current device runs thread-block clusters (compute capability 9.0+).
+bool clusterCapable();
 /// FIDESLIB_NTT_CLUSTER (env, default 0) / setNttCluster: route the plain u32 transforms to the cluster kernel.
+/// Always 0 on a device that is not clusterCapable().
 int nttClusterFlag();
 void setNttCluster(int v);
 /// One launch for `nlimbs` limbs: dat[l] -> res[l] (pointer tables, nullptr rows are skipped),
