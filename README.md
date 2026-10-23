@@ -117,8 +117,9 @@ Check docker directory to obtain instructions on running FIDESlib inside a Docke
 
 `docker/Dockerfile.fherma` is the 32-bit stack as an image for [FHERMA](https://fherma.io):
 OpenFHE (`NATIVE_SIZE=32`) and FIDESlib32bits under `/opt/fherma`, CUDA 12.9, compiled for
-sm_89 and sm_120. The `fherma-image` workflow builds it on a `v*` tag and pushes it to
-`ghcr.io/gladia-research-group/fideslib32bits`.
+sm_89 and sm_120. The `fherma-image` workflow pushes it to
+`ghcr.io/gladia-research-group/fideslib32bits` on a `v*` tag (`:<version>`) and on `main`
+(`:main`); pull requests only build it.
 
 ## Credits
 
